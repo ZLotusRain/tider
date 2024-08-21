@@ -62,7 +62,7 @@ class PriorityRedisQueue(BaseQueue):
         return cls(key=key, url=url, **connection_kwargs)
 
     @classmethod
-    def from_crawler(cls, tider):
+    def from_tider(cls, tider):
         settings = tider.settings
         return cls.from_settings(settings, tider)
 
@@ -127,3 +127,5 @@ class PriorityMemoryQueue(BaseQueue):
 
     def close(self):
         self.pop_all()
+        self.queue.queue.clear()
+        self.queue.queue = []

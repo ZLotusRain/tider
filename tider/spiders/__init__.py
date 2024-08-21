@@ -1,6 +1,8 @@
 import logging
-import weakref
 from typing import Optional
+from weakref import proxy, ProxyType
+
+from tider import Response
 
 
 class Spider:
@@ -9,20 +11,14 @@ class Spider:
     custom_settings: Optional[dict] = None
 
     def __init__(self, name=None, **kwargs):
-        if name:
-            self.name = name
+        if name is not None:
+            self.name = name  # only affects node name in control if set here.
         elif not self.name:
             self.name = self.__class__.__name__
 
         self.__dict__.update(kwargs)
         if not hasattr(self, 'start_urls'):
             self.start_urls = []
-
-        if not hasattr(self, 'settings'):
-            self.spider_config = {}
-        else:
-            self.spider_config = self.settings.get("SPIDER_CONFIG", {})
-        self.kwargs = kwargs
 
     @property
     def logger(self):
@@ -39,31 +35,28 @@ class Spider:
         self.logger.log(level, message, **kw)
 
     @classmethod
-    def from_crawler(cls, crawler, *args, **kwargs):
+    def from_tider(cls, tider, *args, **kwargs):
         spider = cls(*args, **kwargs)
-        spider._set_crawler(crawler)
-        spider.initial(*args, **kwargs)
+        spider._set_tider(tider)
+        spider.initialize()
         return spider
 
-    def _set_crawler(self, crawler):
-        if isinstance(crawler, weakref.ProxyType):
-            self.crawler = crawler
-        else:
-            self.crawler = weakref.proxy(crawler)
-        self.settings = crawler.settings
+    def _set_tider(self, tider):
+        self.tider = tider if isinstance(tider, ProxyType) else proxy(tider)
+        self.settings = tider.settings
 
     def start_requests(self, **kwargs):
         from tider.network.request import Request  # avoid conflicts with monkey patch
         for url in self.start_urls:
             yield Request(url, dup_check=False)
 
-    def initial(self, *args, **kwargs):
-        self.on_init(*args, **kwargs)
+    def initialize(self):
+        self.on_init()
 
-    def on_init(self, *args, **kwargs):
+    def on_init(self):
         pass
 
-    def parse(self, response):
+    def parse(self, response: Response):
         raise NotImplementedError(f'{self.__class__.__name__}.parse callback is not defined')
 
     def process(self, message):
@@ -75,7 +68,7 @@ class Spider:
 
     def close(self, reason=None):
         self.on_close(reason)
-        del self.crawler
+        del self.tider
 
     def on_close(self, reason=None):
         pass

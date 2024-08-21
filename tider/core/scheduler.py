@@ -1,9 +1,9 @@
 import logging
 from abc import abstractmethod
+from kombu.utils.objects import cached_property
 
 from tider.dupefilters import BaseDupeFilter
 from tider.structures.pqueues import BaseQueue
-from tider.utils.decorators import cached_property
 from tider.utils.misc import symbol_by_name, create_instance
 
 
@@ -28,7 +28,7 @@ class BaseSchedulerMeta(type):
 class BaseScheduler(metaclass=BaseSchedulerMeta):
 
     @classmethod
-    def from_crawler(cls, tider):
+    def from_tider(cls, tider):
         return cls()
 
     @abstractmethod
@@ -69,10 +69,11 @@ class Scheduler(BaseScheduler):
     def __init__(self, tider, pqclass=None, dfclass=None):
         self.tider = tider
         self.pqclass = pqclass
+        self.pq = None
         self.dfclass = dfclass
 
     @classmethod
-    def from_crawler(cls, tider):
+    def from_tider(cls, tider):
         settings = tider.settings
         return cls(
             tider=tider,
@@ -86,10 +87,11 @@ class Scheduler(BaseScheduler):
     def open(self):
         if self.dupefilter:
             self.dupefilter.open()
+        self.pq = self._pq()
 
-    @cached_property
-    def pq(self):
-        return self._pq()
+    def reset_status(self):
+        self.pq.close()
+        self.pq = self._pq()
 
     def _pq(self):
         """ Create a new priority queue instance, with in-memory storage """
@@ -135,7 +137,7 @@ class Scheduler(BaseScheduler):
         return len(self.pq) > 0
 
     def close(self, reason):
-        self.pq.close()
+        self.pq and self.pq.close()
         if self.dupefilter:
             self.dupefilter.close(reason)
         logger.info(f"Scheduler closed ({reason})")

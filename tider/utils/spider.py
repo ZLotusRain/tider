@@ -1,4 +1,5 @@
 import inspect
+import importlib
 
 
 def get_spider_name(spider_cls, settings=None):
@@ -19,6 +20,7 @@ def iter_spider_classes(module):
     # singleton in tider.spiders.spider
     from tider.spiders import Spider
 
+    importlib.reload(module)  # in case the module has been imported before.
     for obj in vars(module).values():
         if (
             inspect.isclass(obj)

@@ -1,10 +1,18 @@
-import json
+import re
 import copy
-from collections.abc import MutableMapping
+from typing import Mapping
 from importlib import import_module
-from pprint import pformat
+from kombu.utils.url import maybe_sanitize_url
 
+from tider.utils.text import pretty
+from tider.utils.collections import ChainMap, GetsDictMixin
 from tider.settings import default_settings
+from tider.security import maybe_evaluate
+
+HIDDEN_SETTINGS = re.compile(
+    'API|TOKEN|KEY|SECRET|PASS|PROFANITIES_LIST|SIGNATURE|DATABASE',
+    re.IGNORECASE,
+)
 
 SETTINGS_PRIORITIES = {
     'default': 0,
@@ -27,7 +35,37 @@ def get_settings_priority(priority):
         return priority
 
 
-class BaseSettings(MutableMapping):
+class SettingsAttribute:
+
+    """Class for storing data related to settings attributes.
+
+    This class is intended for internal usage, you should try Settings class
+    for settings configuration, not this one.
+    """
+
+    def __init__(self, value, priority):
+        self.value = value
+        if isinstance(self.value, BaseSettings):
+            self.priority = max(self.value.maxpriority(), priority)
+        else:
+            self.priority = priority
+
+    def set(self, value, priority):
+        """Sets value if priority is higher or equal than current priority."""
+        if priority < self.priority:
+            return
+        if isinstance(self.value, BaseSettings):
+            value = BaseSettings(value, priority=priority)
+        self.value = value
+        self.priority = priority
+
+    def __str__(self):
+        return f"<SettingsAttribute value={self.value!r} priority={self.priority}>"
+
+    __repr__ = __str__
+
+
+class BaseSettings(ChainMap, GetsDictMixin):
     """
     Instances of this class behave like dictionaries, but store priorities
     along with their ``(key, value)`` pairs, and can be frozen (i.e. marked
@@ -49,135 +87,64 @@ class BaseSettings(MutableMapping):
     highest priority will be retrieved.
     """
 
-    def __init__(self, values=None, priority='project'):
+    def __init__(self, values=None, priority='project', defaults=None):
+        super().__init__()
         self.frozen = False
-        self.attributes = {}
-        if values:
-            self.update(values, priority)
+        defaults = [{}] if defaults is None else defaults
+        for default in defaults:
+            self.add_defaults(default)
+        self.update(values, priority)
 
-    def __getitem__(self, opt_name):
-        if opt_name not in self:
-            return None
-        return self.attributes[opt_name].value
+    def _assert_mutability(self):
+        if self.frozen:
+            raise TypeError("Trying to modify an immutable Settings object")
 
-    def __contains__(self, name):
-        return name in self.attributes
+    @staticmethod
+    def _evaluate_value(value):
+        if isinstance(value, SettingsAttribute):
+            return value.value
+        return value
 
-    def get(self, name, default=None):
-        """
-        Get a setting value without affecting its original type.
+    def add_defaults(self, d):
+        self._assert_mutability()
+        d = {key: SettingsAttribute(self._evaluate_value(d[key]), 'default') for key in d}
+        super().add_defaults(d)
 
-        :param name: the setting name
-        :type name: str
+    def pop(self, key, *default):
+        self._assert_mutability()
+        return super().pop(key, *default)
 
-        :param default: the value to return if no setting is found
-        :type default: object
-        """
-        return self[name] if self[name] is not None else default
+    def __setitem__(self, key, value):
+        self._assert_mutability()
+        self.set(key, value)
 
-    def getbool(self, name, default=False):
-        """
-        Get a setting value as a boolean.
+    def __delitem__(self, key):
+        self._assert_mutability()
+        super().__delitem__(key)
 
-        ``1``, ``'1'``, `True`` and ``'True'`` return ``True``,
-        while ``0``, ``'0'``, ``False``, ``'False'`` and ``None`` return ``False``.
+    def clear(self):
+        self._assert_mutability()
+        super().clear()
 
-        For example, settings populated through environment variables set to
-        ``'0'`` will return ``False`` when using this method.
+    def setdefault(self, key, default=None):
+        self._assert_mutability()
+        super().setdefault(key, default)
 
-        :param name: the setting name
-        :type name: str
+    def __getitem__(self, key):
+        for mapping in self.maps:
+            try:
+                return maybe_evaluate(mapping[key].value)
+            except KeyError:
+                pass
+        return self.__missing__(key)
 
-        :param default: the value to return if no setting is found
-        :type default: object
-        """
-        got = self.get(name, default)
-        try:
-            return bool(int(got))
-        except ValueError:
-            if got in ("True", "true"):
-                return True
-            if got in ("False", "false"):
-                return False
-            raise ValueError("Supported values for boolean settings "
-                             "are 0/1, True/False, '0'/'1', "
-                             "'True'/'False' and 'true'/'false'")
-
-    def getint(self, name, default=0):
-        """
-        Get a setting value as an int.
-
-        :param name: the setting name
-        :type name: str
-
-        :param default: the value to return if no setting is found
-        :type default: object
-        """
-        return int(self.get(name, default))
-
-    def getfloat(self, name, default=0.0):
-        """
-        Get a setting value as a float.
-
-        :param name: the setting name
-        :type name: str
-
-        :param default: the value to return if no setting is found
-        :type default: object
-        """
-        return float(self.get(name, default))
-
-    def getlist(self, name, default=None):
-        """
-        Get a setting value as a list. If the setting original type is a list, a
-        copy of it will be returned. If it's a string it will be split by ",".
-
-        For example, settings populated through environment variables set to
-        ``'one,two'`` will return a list ['one', 'two'] when using this method.
-
-        :param name: the setting name
-        :type name: str
-
-        :param default: the value to return if no setting is found
-        :type default: object
-        """
-        value = self.get(name, default or [])
-        if isinstance(value, str):
-            value = value.split(',')
-        return list(value)
-
-    def getdict(self, name, default=None):
-        """
-        Get a setting value as a dictionary. If the setting original type is a
-        dictionary, a copy of it will be returned. If it is a string it will be
-        evaluated as a JSON dictionary. In the case that it is a
-        :class:`~tider.settings.BaseSettings` instance itself, it will be
-        converted to a dictionary, containing all its current settings values
-        as they would be returned by :meth:`~tider.settings.BaseSettings.get`,
-        and losing all information about priority and mutability.
-
-        :param name: the setting name
-        :type name: str
-
-        :param default: the value to return if no setting is found
-        :type default: object
-        """
-        value = self.get(name, default or {})
-        if isinstance(value, str):
-            value = json.loads(value)
-        return dict(value)
-
-    def getwithbase(self, name):
-        """Get a composition of a dictionary-like setting and its `_BASE`
-        counterpart.
-
-        :param name: name of the dictionary-like setting
-        :type name: str
-        """
-        compbs = BaseSettings()
-        compbs.update(self[name + '_BASE'])
-        compbs.update(self[name])
-        return compbs
+    def get_with_unevaluated(self, key, default=None):
+        for mapping in self.maps:
+            try:
+                return mapping[key].value
+            except KeyError:
+                pass
+        return default
 
     def getpriority(self, name):
         """
@@ -187,9 +154,12 @@ class BaseSettings(MutableMapping):
         :param name: the setting name
         :type name: str
         """
-        if name not in self:
-            return None
-        return self.attributes[name].priority
+        for mapping in self.maps:
+            try:
+                return mapping[name].priority
+            except KeyError:
+                pass
+        return None
 
     def maxpriority(self):
         """
@@ -199,40 +169,34 @@ class BaseSettings(MutableMapping):
         stored.
         """
         if len(self) > 0:
-            return max(self.getpriority(name) for name in self)
+            return max(self.getpriority(name) for name in self.changes)
         else:
             return get_settings_priority('default')
-
-    def __setitem__(self, name, value):
-        self.set(name, value)
 
     def set(self, name, value, priority='project'):
         """
         Store a key/value attribute with a given priority.
 
-        Settings should be populated *before* configuring the Crawler object
-        (through the :meth:`~tider.crawler.Crawler.configure` method),
+        Settings should be populated *before* configuring the Tider object,
         otherwise they won't have any effect.
 
-        :param name: the setting name
-        :type name: str
-
-        :param value: the value to associate with the setting
-        :type value: object
-
-        :param priority: the priority of the setting. Should be a key of
-            :attr:`~tider.settings.SETTINGS_PRIORITIES` or an integer
-        :type priority: str or int
+        If ``value`` is a :class:`~tider.settings.SettingsAttribute` instance,
+        the attribute priority will be used and the ``priority`` parameter ignored.
         """
         self._assert_mutability()
         priority = get_settings_priority(priority)
-        if name not in self:
-            if isinstance(value, SettingsAttribute):
-                self.attributes[name] = value
-            else:
-                self.attributes[name] = SettingsAttribute(value, priority)
+
+        if priority == 'default':
+            updating = self.defaults[0]
         else:
-            self.attributes[name].set(value, priority)
+            updating = self.changes
+        if name not in updating:
+            if isinstance(value, SettingsAttribute):
+                updating[name] = value
+            else:
+                updating[name] = SettingsAttribute(value, priority)
+        else:
+            updating[name].set(value, priority)
 
     def setdict(self, values, priority='project'):
         self.update(values, priority)
@@ -240,10 +204,6 @@ class BaseSettings(MutableMapping):
     def setmodule(self, module, priority='project'):
         """
         Store settings from a module with a given priority.
-
-        This is a helper function that calls
-        :meth:`~tider.settings.BaseSettings.set` for every globally declared
-        uppercase variable of ``module`` with the provided ``priority``.
 
         :param module: the module or the path of the module
         :type module: types.ModuleType or str
@@ -255,26 +215,19 @@ class BaseSettings(MutableMapping):
         self._assert_mutability()
         if isinstance(module, str):
             module = import_module(module)
-        for key in dir(module):
-            if key.isupper():
-                self.set(key, getattr(module, key), priority)
+        values = {key: getattr(module, key) for key in dir(module) if key.isupper()}
+        self.setdict(values, priority)
 
     def update(self, values, priority='project'):
         """
         Store key/value pairs with a given priority.
 
-        This is a helper function that calls
-        :meth:`~tider.settings.BaseSettings.set` for every item of ``values``
-        with the provided ``priority``.
-
-        If ``values`` is a string, it is assumed to be JSON-encoded and parsed
-        into a dict with ``json.loads()`` first. If it is a
-        :class:`~tider.settings.BaseSettings` instance, the per-key priorities
-        will be used and the ``priority`` parameter ignored. This allows
+        If ``values`` is a :class:`~tider.settings.BaseSettings` instance,
+        the per-key priorities will be used and the ``priority`` parameter ignored. This allows
         inserting/updating settings with different priorities with a single
         command.
 
-        :param values: the settings names and values
+        :param values: key-value pairs
         :type values: dict or string or :class:`~tider.settings.BaseSettings`
 
         :param priority: the priority of the settings. Should be a key of
@@ -282,41 +235,35 @@ class BaseSettings(MutableMapping):
         :type priority: str or int
         """
         self._assert_mutability()
-        if isinstance(values, str):
-            values = json.loads(values)
-        if values is not None:
-            if isinstance(values, BaseSettings):
-                for name, value in values.items():
-                    self.set(name, value, values.getpriority(name))
-            else:
-                for name, value in values.items():
-                    self.set(name, value, priority)
+        values = values or {}
+        if isinstance(values, BaseSettings):
+            default = {}
+            for d in values.defaults[::-1]:
+                # reverse to keep order
+                default.update(d)
+            self.add_defaults(default)
+            for name, value in values.changes:
+                self.set(name, value, value.priority)
+        elif isinstance(values, Mapping):
+            if priority == 'default':
+                self.add_defaults(values)
+            for name, value in values.items():
+                self.set(name, value, priority)
+        else:
+            raise TypeError(f"Incorrect type: expected Mapping, "
+                            f"got {type(values)}: {values!r}")
+        for callback in self._observers:
+            callback(**values)
 
     def delete(self, name, priority='project'):
         self._assert_mutability()
         priority = get_settings_priority(priority)
         if priority >= self.getpriority(name):
-            del self.attributes[name]
-
-    def __delitem__(self, name):
-        self._assert_mutability()
-        del self.attributes[name]
-
-    def _assert_mutability(self):
-        if self.frozen:
-            raise TypeError("Trying to modify an immutable Settings object")
-
-    def copy(self):
-        """
-        Make a deep copy of current settings.
-
-        This method returns a new instance of the :class:`Settings` class,
-        populated with the same values and their priorities.
-
-        Modifications to the new object won't be reflected on the original
-        settings.
-        """
-        return copy.deepcopy(self)
+            for mapping in self.maps:
+                try:
+                    del mapping[name]
+                except KeyError:
+                    pass
 
     def freeze(self):
         """
@@ -338,12 +285,6 @@ class BaseSettings(MutableMapping):
         copy_settings.freeze()
         return copy_settings
 
-    def __iter__(self):
-        return iter(self.attributes)
-
-    def __len__(self):
-        return len(self.attributes)
-
     def _to_dict(self):
         return {k: (v._to_dict() if isinstance(v, BaseSettings) else v)
                 for k, v in self.items()}
@@ -359,45 +300,35 @@ class BaseSettings(MutableMapping):
         settings.
 
         This method can be useful for example for printing settings
-        in Scrapy shell.
+        in Tider shell.
         """
         settings = self.copy()
         return settings._to_dict()
 
-    def _repr_pretty_(self, p, cycle):
-        if cycle:
-            p.text(repr(self))
-        else:
-            p.text(pformat(self.copy_to_dict()))
+    def copy(self):
+        # type: () -> 'BaseSettings'
+        # priority has no effect here
+        return copy.deepcopy(self)
 
+    def without_defaults(self):
+        """Return the current configuration, but without defaults."""
+        # the last stash is the default settings, so just skip that
+        return BaseSettings({}, 'default', self.maps[:-1])
 
-class SettingsAttribute:
+    def table(self, with_defaults=False, censored=True):
+        filt = filter_hidden_settings if censored else lambda v: v
+        dict_members = dir(dict)
+        settings = self if with_defaults else self.without_defaults()
+        return filt({
+            k: settings.get_with_unevaluated(k) for k in settings.keys()
+            if not k.startswith('_') and k not in dict_members
+        })
 
-    """Class for storing data related to settings attributes.
-
-    This class is intended for internal usage, you should try Settings class
-    for settings configuration, not this one.
-    """
-
-    def __init__(self, value, priority):
-        self.value = value
-        if isinstance(self.value, BaseSettings):
-            self.priority = max(self.value.maxpriority(), priority)
-        else:
-            self.priority = priority
-
-    def set(self, value, priority):
-        """Sets value if priority is higher or equal than current priority."""
-        if priority >= self.priority:
-            if isinstance(self.value, BaseSettings):
-                value = BaseSettings(value, priority=priority)
-            self.value = value
-            self.priority = priority
-
-    def __str__(self):
-        return f"<SettingsAttribute value={self.value!r} priority={self.priority}>"
-
-    __repr__ = __str__
+    def humanize(self, with_defaults=False, censored=True):
+        """Return a human readable text showing configuration changes."""
+        return '\n'.join(
+            f'{key}: {pretty(value, width=50)}'
+            for key, value in self.table(with_defaults, censored).items())
 
 
 class Settings(BaseSettings):
@@ -410,24 +341,41 @@ class Settings(BaseSettings):
     of this class, the new object will have the global default settings
     """
 
-    def __init__(self, values=None, priority='project'):
+    def __init__(self, values=None, priority='project', defaults=None):
         # Do not pass kwarg values here. We don't want to promote user-defined
         # dicts, and we want to update, not replace, default dicts with the
         # values given by the user
-        super().__init__()
-        self.setmodule(default_settings, 'default')
-        # Promote default dictionaries to BaseSettings instances for per-key
-        # priorities
-        for name, val in self.items():
-            if isinstance(val, dict):
-                self.set(name, BaseSettings(val, 'default'), 'default')
+        default = {key: getattr(default_settings, key) for key in dir(default_settings) if key.isupper()}
+        defaults = [] if defaults is None else defaults
+        defaults.append(default)
+        super().__init__(values, priority, defaults)
         self.update(values, priority)
+
+
+def filter_hidden_settings(conf):
+    """Filter sensitive settings."""
+    def maybe_censor(key, value, mask='*' * 8):
+        if isinstance(value, Mapping):
+            return filter_hidden_settings(value)
+        if isinstance(key, str):
+            if HIDDEN_SETTINGS.search(key):
+                return mask
+            elif 'control_url' in key.lower():
+                from kombu import Connection
+                return Connection(value).as_uri(mask=mask)
+            elif 'backend' in key.lower() or 'url' in key.lower():
+                return maybe_sanitize_url(value, mask=mask)
+
+        return value
+
+    return {k: maybe_censor(k, v) for k, v in conf.items()}
 
 
 def iter_default_settings():
     """Return the default settings as an iterator of (name, value) tuples"""
+    dict_members = dir(dict)
     for name in dir(default_settings):
-        if name.isupper():
+        if not name.startswith('_') and name not in dict_members:
             yield name, getattr(default_settings, name)
 
 

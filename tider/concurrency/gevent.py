@@ -22,17 +22,17 @@ def apply_timeout(target, args=(), kwargs=None, callback=None, cb_kwargs=None, t
             return apply_target(target, args, kwargs,
                                 callback, cb_kwargs,
                                 propagate=(Timeout,), **rest)
-    except Timeout as e:
+    except Timeout:
         if timeout_callback:
             return timeout_callback(timeout, **cb_kwargs)
-        else:
-            raise e
+        raise
 
 
 class TaskPool(BasePool, ABC):
     """GEvent Pool."""
 
     name = "gevent"
+
     signal_safe = False
     is_green = True
     task_join_will_block = False
@@ -57,6 +57,18 @@ class TaskPool(BasePool, ABC):
         return self._quick_put(apply_timeout if timeout else apply_target,
                                target, args, kwargs, callback, cb_kwargs,
                                timeout=timeout, timeout_callback=timeout_callback)
+
+    def grow(self, n=1):
+        self._pool._semaphore.counter += n
+        self._pool.size += n
+
+    def shrink(self, n=1):
+        self._pool._semaphore.counter -= n
+        self._pool.size -= n
+
+    @property
+    def num_processes(self):
+        return len(self._pool)
 
     def on_stop(self):
         self._pool.join()

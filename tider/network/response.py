@@ -1,14 +1,28 @@
-import os
 import re
 import json
 import charset_normalizer
 from bs4 import BeautifulSoup
-from contextlib import suppress
 from urllib.parse import urljoin, unquote
+from urllib3.exceptions import (
+    DecodeError,
+    ProtocolError,
+    ReadTimeoutError,
+    SSLError,
+)
+from requests.models import REDIRECT_STATI
+from requests.cookies import cookiejar_from_dict
 from requests.structures import CaseInsensitiveDict
-from requests.utils import iter_slices, stream_decode_response_unicode
+from requests.exceptions import (
+    ChunkedEncodingError,
+    ConnectionError,
+    ContentDecodingError,
+    StreamConsumedError,
+    HTTPError
+)
+from requests.exceptions import SSLError as RequestsSSLError
+from requests.utils import iter_slices, stream_decode_response_unicode, guess_json_utf
 
-from tider.network.request import Request
+from tider import Request
 
 
 SPACE_CHARACTERS = ["&nbsp;", "&ensp;", "&emsp;", "&thinsp;",
@@ -25,40 +39,99 @@ CONTENT_CHUNK_SIZE = 10 * 1024
 class Response:
 
     __slots__ = (
-        'request', 'status_code', 'url', 'headers',
-        'encoding', 'cookies', 'reason', 'raw', 'elapsed', '_success',
-        '_cached_soup', '_cached_content', '_cached_text', '_cached_selector',
-
+        'request', 'status_code', 'url', 'headers', 'encoding',
+        'cookies', 'reason', 'raw', 'version', 'elapsed', 'history', '_next',
+        '_redirect_target', '_success', '_content', '_content_consumed',
+        '_cached_text', '_cached_selector'
     )
 
     def __init__(self, request=None):
+        # bound request
         self.request = request
+
         self.status_code = None
-        self.url = ''
+
+        # Final URL location of Response.
+        self.url = None
         self.headers = CaseInsensitiveDict()
         self.encoding = None
-        self.cookies = None
+        self.cookies = cookiejar_from_dict({})
         self.reason = None
-        self.raw = None
+        self.version = None
 
         self.elapsed = 0
+        self.history = []
+        self._next = None
+
+        self._redirect_target = None
         self._success = True
-        self._cached_content = None
+        self._content = False
+        self._content_consumed = False
         self._cached_text = None
         self._cached_selector = None
 
-    def _charset_from_content_type(self):
-        content_type = self.headers.get("Content-Type", "")
-        charset = list(filter(lambda x: "charset" in x, content_type.split(";")))
-        return charset[0].split("=")[-1] if charset else None
+        self.raw = None
 
     @classmethod
     def dummy(cls, text, request=None, **kwargs):
         resp = cls(request)
+        kwargs.setdefault('encoding', 'utf-8')
         resp._cached_text = text
         for key, value in kwargs.items():
             setattr(resp, key, value)
         return resp
+
+    @property
+    def is_redirect(self):
+        """True if this Response is a well-formed HTTP redirect that could have
+        been processed automatically (by :meth:`Session.resolve_redirects`).
+        """
+        return "location" in self.headers and self.status_code in REDIRECT_STATI
+
+    @property
+    def redirect_target(self):
+        if not self.is_redirect:
+            return None
+        if not self._redirect_target:
+            location = self.headers["location"]
+            # Currently the underlying http module on py3 decode headers
+            # in latin1, but empirical evidence suggests that latin1 is very
+            # rarely used with non-ASCII characters in HTTP headers.
+            # It is more likely to get UTF8 header rather than latin1.
+            # This causes incorrect handling of UTF8 encoded location headers.
+            # To solve this, we re-encode the location in latin1.
+            location = location.encode("latin1")
+            self._redirect_target = location.decode("utf8")
+        return self._redirect_target
+
+    def raise_for_status(self):
+        """Raises :class:`HTTPError`, if one occurred."""
+
+        http_error_msg = ""
+        if isinstance(self.reason, bytes):
+            # We attempt to decode utf-8 first because some servers
+            # choose to localize their reason strings. If the string
+            # isn't utf-8, we fall back to iso-8859-1 for all other
+            # encodings. (See PR #3538)
+            try:
+                reason = self.reason.decode("utf-8")
+            except UnicodeDecodeError:
+                reason = self.reason.decode("iso-8859-1")
+        else:
+            reason = self.reason
+
+        if 400 <= self.status_code < 500:
+            http_error_msg = (
+                f"{self.status_code} Client Error: {reason} for url: {self.url}"
+            )
+
+        elif 500 <= self.status_code < 600:
+            http_error_msg = (
+                f"{self.status_code} Server Error: {reason} for url: {self.url}"
+            )
+
+        if http_error_msg:
+            raise HTTPError(http_error_msg)
 
     def __iter__(self):
         """Allows you to use a response as an iterator."""
@@ -71,15 +144,14 @@ class Response:
         self.close()
 
     def __repr__(self):
-        return '<Response [%s]>' % self.status_code
+        if self.ok:
+            return '<Response [%s]>' % self.status_code
+        else:
+            return '<Failure [%s]>' % self.reason
 
     @property
     def ok(self):
         return self._success
-
-    @property
-    def stored(self):
-        return self.path and os.path.exists(self.path)
 
     @property
     def cb_kwargs(self):
@@ -102,10 +174,6 @@ class Response:
             )
 
     @property
-    def path(self):
-        return self.meta.get('download_path', '')
-
-    @property
     def is_html(self):
         return "text/html" in self.headers.get("Content-Type", "")
 
@@ -125,7 +193,7 @@ class Response:
             filename = list(filter(lambda x: "file" in x, content_disposition.split(";")))
             filename = filename[0] if filename else ""
             filename = unquote(filename.split("=")[-1].replace("utf-8'zh_cn'", '')).strip('"').strip("'")
-        return filename
+        return filename.strip()
 
     @property
     def filetype(self):
@@ -147,43 +215,82 @@ class Response:
 
     def fail(self, reason):
         self.reason = reason
-        if self.raw is not None:
-            self.raw.content
         self._success = False
 
     @property
     def apparent_encoding(self):
         return charset_normalizer.detect(self.content)["encoding"]
 
+    def read(self) -> bytes:
+        """
+        Read and return the response content.
+        """
+        return self.content
+
     def iter_content(self, chunk_size=1, decode_unicode=False):
-        if chunk_size is not None and not isinstance(chunk_size, int):
+        def generate():
+            # Special case for urllib3.
+            if hasattr(self.raw, "stream"):
+                try:
+                    yield from self.raw.stream(chunk_size, decode_content=True)
+                except ProtocolError as e:
+                    raise ChunkedEncodingError(e)
+                except DecodeError as e:
+                    raise ContentDecodingError(e)
+                except ReadTimeoutError as e:
+                    raise ConnectionError(e)
+                except SSLError as e:
+                    raise RequestsSSLError(e)
+            elif self.raw is not None:
+                # Standard file-like object.
+                while True:
+                    chunk = self.raw.read(chunk_size)
+                    if not chunk:
+                        break
+                    yield chunk
+
+            self._content_consumed = True
+
+        if self._content_consumed and isinstance(self._content, bool):
+            raise StreamConsumedError()
+        elif chunk_size is not None and not isinstance(chunk_size, int):
             raise TypeError("chunk_size must be an int, it is instead a %s." % type(chunk_size))
-        chunks = iter([])
-        if self.stored or self._cached_content is not None:
-            chunks = iter_slices(self.content, chunk_size)
-            if decode_unicode:
-                chunks = stream_decode_response_unicode(chunks, self)
-        elif self.raw is not None:
-            chunks = self.raw.iter_content(chunk_size, decode_unicode)
+
+        # simulate reading small chunks of the content
+        reused_chunks = iter_slices(self._content, chunk_size)
+
+        stream_chunks = generate()
+
+        chunks = reused_chunks if self._content_consumed else stream_chunks
+
+        if decode_unicode:
+            chunks = stream_decode_response_unicode(chunks, self)
+
         return chunks
 
     @property
     def content(self):
         """Content of the response, in bytes."""
-        if self._cached_content is None:
-            if self.stored:
-                with open(self.path, "rb+") as fo:
-                    self._cached_content = fo.read()
-            elif self.raw is not None:
-                self._cached_content = self.raw.content
+        if self._content is False:
+            # Read the contents.
+            if self._content_consumed:
+                raise RuntimeError("The content for this response was already consumed")
+            if self.status_code == 0 or self.raw is None:
+                self._content = None
             else:
-                self._cached_content = b''
-        return self._cached_content
+                self._content = b"".join(self.iter_content(CONTENT_CHUNK_SIZE)) or b""
+        self._content_consumed = True
+        # don't need to release the connection; that's been handled by urllib3
+        # since we exhausted the data.
+        return self._content
 
     @property
     def text(self):
         if self._cached_text is not None:
             return self._cached_text
+
+        if not self.content:
+            return ""
 
         encoding = self.encoding or self.apparent_encoding
         # Decode unicode from given encoding.
@@ -204,6 +311,17 @@ class Response:
         return self._cached_text
 
     def json(self, **kwargs):
+        if not self.encoding and self.content and len(self.content) > 3:
+            encoding = guess_json_utf(self.content)
+            if encoding is not None:
+                try:
+                    return json.loads(self.content.decode(encoding), **kwargs)
+                except UnicodeDecodeError:
+                    # Wrong UTF codec detected; usually because it's not UTF-8
+                    # but some other 8-bit codec.  This is an RFC violation,
+                    # and the server didn't bother to tell us what codec *was*
+                    # used.
+                    pass
         return json.loads(self.text, **kwargs)
 
     @property
@@ -225,7 +343,7 @@ class Response:
     def re(self, regex, replace_entities=True, flags=re.S):
         return self.selector.re(regex, replace_entities, flags)
 
-    def retry(self, **kwargs):
+    def retry(self, reset_proxy=True, **kwargs):
         # old version error:
         # callback must be specified if using retry in promise,
         # otherwise the callback maybe `Promise._then` which will
@@ -236,9 +354,11 @@ class Response:
         meta = dict(self.meta)
         meta.pop('promise_node', None)
         meta.pop('promise_then', None)
-        meta.update(retry_times=0, parse_times=parse_times, reset_proxy=True)
+        meta.update(retry_times=0, parse_times=parse_times)
+        if reset_proxy:
+            self.request.forbid_proxy()
         request = self.request.replace(priority=self.request.priority+1,
-                                       meta=meta, dup_check=False)
+                                       meta=meta, dup_check=False, **kwargs)
         return request
 
     def follow(self, url, callback=None, cb_kwargs=None, **kwargs):
@@ -264,10 +384,6 @@ class Response:
         )
 
     def _clear_caches(self):
-        if self.stored:
-            with suppress(Exception):
-                os.remove(self.path)
-        self._cached_content = None
         self._cached_text = None
         self._cached_selector = None
 
@@ -275,11 +391,11 @@ class Response:
         raw, self.raw = self.raw, None
         if raw is not None:
             raw.close()
+        if getattr(raw, "release_conn", None):
+            raw.release_conn()
         self._clear_caches()
         self.request and self.request.close()
-        self.headers = None
-        self.cookies = None
-        del self.request, raw
+        self.request = None
 
 
 class DummyResponse:

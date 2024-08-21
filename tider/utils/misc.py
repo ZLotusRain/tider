@@ -1,8 +1,9 @@
 import hashlib
 import logging
+import importlib
+
 from typing import Iterable
 from pkgutil import iter_modules
-from importlib import import_module
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,14 @@ def evaluate_callable(callback):
     return callback
 
 
+def try_copy(obj):
+    if isinstance(obj, (dict, list)):
+        return type(obj)(obj)
+    elif hasattr(obj, 'copy'):
+        return obj.copy()
+    return obj
+
+
 def load_object(path):
     """Load an object given its absolute object path, and return it.
 
@@ -82,7 +91,7 @@ def load_object(path):
         raise ValueError(f"Error loading object '{path}': not a full path")
 
     module, name = path[:dot], path[dot + 1:]
-    mod = import_module(module)
+    mod = importlib.import_module(module)
 
     try:
         obj = getattr(mod, name)
@@ -92,7 +101,7 @@ def load_object(path):
     return obj
 
 
-def symbol_by_name(name, aliases=None, package=None, sep='.', default=None):
+def symbol_by_name(name, aliases=None, imp=None, package=None, sep='.', default=None):
     """Get symbol by qualified name.
 
     The name should be the full dot-separated path to the class::
@@ -101,21 +110,23 @@ def symbol_by_name(name, aliases=None, package=None, sep='.', default=None):
 
     Example::
 
-        celery.concurrency.processes.TaskPool
+        tider.concurrency.processes.TaskPool
                                     ^- class name
 
     or using ':' to separate module and symbol::
 
-        celery.concurrency.processes:TaskPool
+        tider.concurrency.processes:TaskPool
 
     If `aliases` is provided, a dict containing short name/long name
     mappings, the name is looked up in the aliases first.
 
     """
     aliases = {} if not aliases else aliases
+    if imp is None:
+        imp = importlib.import_module
 
     if not isinstance(name, str):
-        return name                                 # already a class
+        return name  # already a class
 
     name = aliases.get(name) or name
     sep = ':' if ':' in name else sep
@@ -124,7 +135,7 @@ def symbol_by_name(name, aliases=None, package=None, sep='.', default=None):
         cls_name, module_name = None, package if package else cls_name
     try:
         try:
-            module = import_module(module_name, package=package)
+            module = imp(module_name, package=package)
         except ValueError as exc:
             logger.error(f"Couldn't import {name!r}: {exc}")
         else:
@@ -141,24 +152,24 @@ def try_import(module, default=None):
     Returns None if the module does not exist.
     """
     try:
-        return import_module(module)
+        return importlib.import_module(module)
     except ImportError:
         return default
 
 
-def create_instance(objcls, settings=None, crawler=None, *args, **kwargs):
+def create_instance(objcls, settings=None, tider=None, *args, **kwargs):
     """Construct a class instance using its ``from_settings`` constructors, if available.
 
     ``*args`` and ``**kwargs`` are forwarded to the constructors.
 
-    Raises ``ValueError`` if both ``settings`` and ``crawler`` are ``None``.
+    Raises ``ValueError`` if both ``settings`` and ``tider`` are ``None``.
 
     Raises ``TypeError`` if the resulting instance is ``None`` (e.g. if an
     extension has not been implemented correctly).
     """
-    if crawler and hasattr(objcls, 'from_crawler'):
-        instance = objcls.from_crawler(crawler, *args, **kwargs)
-        method_name = 'from_crawler'
+    if tider and hasattr(objcls, 'from_tider'):
+        instance = objcls.from_tider(tider, *args, **kwargs)
+        method_name = 'from_tider'
     elif settings and hasattr(objcls, 'from_settings'):
         instance = objcls.from_settings(settings, *args, **kwargs)
         method_name = 'from_settings'
@@ -179,7 +190,7 @@ def walk_modules(path):
     """
 
     mods = []
-    mod = import_module(path)
+    mod = importlib.import_module(path)
     mods.append(mod)
     if hasattr(mod, '__path__'):
         for _, subpath, ispkg in iter_modules(mod.__path__):
@@ -187,7 +198,7 @@ def walk_modules(path):
             if ispkg:
                 mods += walk_modules(fullpath)
             else:
-                submod = import_module(fullpath)
+                submod = importlib.import_module(fullpath)
                 mods.append(submod)
     return mods
 

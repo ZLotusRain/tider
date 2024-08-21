@@ -16,19 +16,19 @@ class ItemPipelineManager:
             self._add_pipeline(pipeline)
 
     @classmethod
-    def from_settings(cls, settings, crawler=None):
+    def from_settings(cls, settings, tider=None):
         pipelines = []
         pipeline_setting = settings.get("ITEM_PIPELINES")
         cls_paths = [k for k, v in sorted(pipeline_setting.items(), key=itemgetter(1))]
         for cls_path in cls_paths:
             pipeline_cls = symbol_by_name(cls_path)
-            pipeline = create_instance(pipeline_cls, settings=settings, crawler=crawler)
+            pipeline = create_instance(pipeline_cls, settings, tider)
             pipelines.append(pipeline)
         return cls(*pipelines)
 
     @classmethod
-    def from_crawler(cls, crawler):
-        return cls.from_settings(crawler.settings, crawler)
+    def from_tider(cls, tider):
+        return cls.from_settings(tider.settings, tider)
 
     def _add_pipeline(self, pipeline):
         if hasattr(pipeline, 'close'):

@@ -82,7 +82,7 @@ class LinkExtractor:
                 continue  # skipping bogus links
             else:
                 url = self.callback(attr_val)
-                if url is None:
+                if url is None or 'javascript:void(0)' in url:
                     continue
             url = safe_url_string(url, encoding=response_encoding)
             url = urljoin(response_url, url)

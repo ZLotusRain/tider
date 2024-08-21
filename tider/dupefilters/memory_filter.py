@@ -22,7 +22,7 @@ class MemoryDupeFilter(BaseDupeFilter):
         return cls(path=path)
 
     def request_seen(self, request) -> bool:
-        fp = request.fingerprint
+        fp = request.fingerprint()
         if fp in self.fingerprints:
             return True
         self.fingerprints.add(fp)

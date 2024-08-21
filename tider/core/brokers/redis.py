@@ -1,10 +1,10 @@
-import logging
 import time
 import json
+import logging
+from kombu.utils import cached_property
 
 from .base import Broker
 from tider.backends.redis import RedisBackend
-from tider.utils.decorators import cached_property
 
 logger = logging.getLogger(__name__)
 
@@ -13,10 +13,9 @@ class RedisBroker(Broker):
 
     @cached_property
     def client(self):
-        broker_url = self.crawler.settings.get('BROKER_URL')
-        conn_kwargs = self.crawler.settings.getdict('BROKER_CONN_KWARGS').copy()
-        concurrency = self.crawler.settings['CONCURRENCY']
-        return RedisBackend(url=broker_url, max_connections=concurrency, **conn_kwargs)
+        broker_url = self.tider.settings.get('BROKER_URL')
+        conn_kwargs = self.tider.settings.getdict('BROKER_CONN_KWARGS').copy()
+        return RedisBackend(url=broker_url, **conn_kwargs)
 
     def produce(self, request):
         queue_name = request.meta.get('queue_name') or self.queue_name
@@ -33,16 +32,21 @@ class RedisBroker(Broker):
         logger.info(f'Publish to broker successfully, queue: {queue_name}, '
                     f'message: {message}')
 
-    def consume(self, queue=None):
-        queue_name = queue or self.queue_name
-        try:
-            result = self.client.lpop(queue_name, count=1)
-            result = json.loads(result[0].decode())
-            if 'body' in result:
+    def consume(self, key=None, count=1, validate=True):
+        queue_name = key or self.queue_name
+        result = self.client.lpop(queue_name, count=count)
+        if not isinstance(result, list):
+            result = [result]
+        result = result[0]
+        if result:
+            result = result.decode()
+            try:
+                result = json.loads(result)
+            except json.JSONDecodeError:
+                result = result
+            if validate:
                 result = result['body']
-            return result
-        except IndexError:
-            return None
+        return result
 
     def close(self):
         self.client.close()

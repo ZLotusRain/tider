@@ -117,7 +117,8 @@ class PromiseNode:
             promise_node = request.meta.get('promise_node')
             node = promise_node.root
             if not node.parent:
-                node.parent = weakref.proxy(self)  # add parent promise
+                node.parent = self  # add parent promise, do not use proxy here
+            promise_node.request = request  # copy request state to avoid lose cb_kwargs
             promise_node.reset()  # SCHEDULED to PENDING
         else:
             node = PromiseNode(request=request, parent=weakref.proxy(self), promise=self.promise)
@@ -143,15 +144,15 @@ class PromiseNode:
         self.state = PENDING
 
     def clear(self):
+        # do not clear parent and promise here if is root
+        # to avoid break conn with parent promise.
         request, self.request = self.request, None
         request and request.close()
-        self.parent = None
-        del self.promise
         self.children.clear()
         self.invalid_children.clear()
 
     def __str__(self):
-        if self.request:
+        if self._is_root:
             return f'<Promise root at 0x{id(self):0x}>'
         else:
             return f'<Promise node {self.request} at 0x{id(self):0x}>'
@@ -216,10 +217,10 @@ class Promise:
         self.root.state = REJECTED
 
     def clear(self):
+        self.root.clear()
+        del self.callback
         self.cb_kwargs.clear()
         self.values.clear()
-        del self.cb_kwargs, self.values
-        del self.callback,  self.root
 
     def then(self):
         """
@@ -265,7 +266,47 @@ class Promise:
                 self.reject()
             if hasattr(results, 'close'):
                 results.close()
-            del results, kwargs
+        if self.root.parent is not None:
+            yield from self.root.parent.then()
+        else:
+            self.clear()
+
+
+def dummy_validator(**kwargs):
+    return True
+
+
+class AntiCrawlPromise(Promise):
+
+    def __init__(self, reqs, validator, max_retries=None, **kwargs):
+        super().__init__(reqs=reqs, **kwargs)
+
+        self.reqs = [req.replace() for req in reqs]
+        self.validator = evaluate_callable(validator) or dummy_validator
+        self.max_retries = max_retries
+        self.retry_times = 0
+
+    def recreate_root(self):
+        reqs = [req.replace() for req in self.reqs]
+        root = PromiseNode(request=None, promise=self)
+        for idx, req in enumerate(reqs):
+            req.meta['promise_order'] = idx
+            root.add_child(req)  # the address of reqs can't be the same.
+        self.root = root
+
+    def on_resolved(self):
+        try:
+            self._unresolved.pop()  # avoid multi nodes resolving
+        except IndexError:
+            return
+        if self.state == RESOLVED:
+            if not self.validator(**self.values):
+                if self.max_retries is None or self.retry_times < self.max_retries:
+                    self.recreate_root()
+                    self.retry_times += 1
+                    yield from self.then()
+            else:
+                super().on_resolved()
         if self.root.parent is not None:
             yield from self.root.parent.then()
         self.clear()

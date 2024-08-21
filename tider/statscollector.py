@@ -8,8 +8,8 @@ logger = logging.getLogger(__name__)
 
 
 class StatsCollector:
-    def __init__(self, crawler):
-        self._dump = crawler.settings.getbool('STATS_DUMP')
+    def __init__(self, tider):
+        self._dump = tider.settings.getbool('STATS_DUMP')
         self._stats = {}
 
     def get_value(self, key, default=None):
@@ -50,8 +50,8 @@ class StatsCollector:
 
 class MemoryStatsCollector(StatsCollector):
 
-    def __init__(self, crawler):
-        super().__init__(crawler)
+    def __init__(self, tider):
+        super().__init__(tider)
         self.spider_stats = {}
 
     def _persist_stats(self, stats, spider):

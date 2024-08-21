@@ -1,5 +1,4 @@
 import re
-import six
 from lxml import etree
 from parsel import Selector as ParselSelector
 from parsel import SelectorList as ParselSelectorList
@@ -12,7 +11,7 @@ def extract_regex(regex, text, replace_entities=True, flags=0):
     * if the regex contains multiple numbered groups, all those will be returned (flattened)
     * if the regex doesn't contain any group the entire regex matching is returned
     """
-    if isinstance(regex, six.string_types):
+    if isinstance(regex, str):
         regex = re.compile(regex, flags=flags)
 
     if "extract" in regex.groupindex:
