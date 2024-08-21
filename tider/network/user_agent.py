@@ -1,8 +1,9 @@
 import random
 
-DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " \
-                     "AppleWebKit/537.36 (KHTML, like Gecko) " \
-                     "Chrome/97.0.4692.99 Safari/537.36"
+__all__ = ('get_random_ua', 'set_default_ua', 'default_user_agent')
+
+DEFAULT_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/118.0.0.0 Safari/537.36")
 
 USER_AGENTS = {
     "chrome": [
@@ -381,3 +382,13 @@ def get_random_ua(ua_type: str = None):
         )
 
     return random.choice(USER_AGENTS[ua_type])
+
+
+def set_default_ua(ua=None):
+    if ua:
+        global DEFAULT_USER_AGENT
+        DEFAULT_USER_AGENT = ua
+
+
+def default_user_agent():
+    return DEFAULT_USER_AGENT

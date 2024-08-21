@@ -1,7 +1,8 @@
 import re
+import parsel
 from lxml import etree
-from parsel import Selector as ParselSelector
-from parsel import SelectorList as ParselSelectorList
+from parsel import selector
+from parsel import Selector as _ParselSelector
 from w3lib.html import replace_entities as w3lib_replace_entities
 
 
@@ -53,7 +54,11 @@ def create_root_node(text, parser_cls, base_url=None):
     return root
 
 
-class SelectorList(ParselSelectorList):
+if parsel.__version__ < "1.7.0":
+    selector.create_root_node = create_root_node
+
+
+class SelectorList(_ParselSelector.selectorlist_cls):
     """
     The :class:`SelectorList` class is a subclass of the builtin ``list``
     class, which provides a few additional methods.
@@ -91,7 +96,7 @@ class SelectorList(ParselSelectorList):
         return datas[0] if len(datas) == 1 else datas
 
 
-class Selector(ParselSelector):
+class Selector(_ParselSelector):
 
     selectorlist_cls = SelectorList
 
@@ -140,6 +145,3 @@ class Selector(ParselSelector):
         return "<%s xpath=%r data=%s>" % (type(self).__name__, self._expr, data)
 
     __repr__ = __str__
-
-    def _get_root(self, text, base_url=None):
-        return create_root_node(text, self._parser, base_url=base_url)

@@ -1,10 +1,14 @@
 import os
-import oss2
 import logging
+from contextlib import contextmanager
+from typing import Union
+
+import oss2
+from oss2 import Bucket, Service
 from oss2.models import PartInfo
 from oss2 import determine_part_size, SizedFileAdapter
 
-from tider import Response
+from tider.network import Response
 
 logger = logging.getLogger(__name__)
 
@@ -12,74 +16,87 @@ logger = logging.getLogger(__name__)
 class AliOSSFilesStore:
 
     def __init__(self, access_key_id, access_key_secret, endpoint,
-                 bucket_name=None, timeout=None, domain=""):
-        auth = oss2.Auth(access_key_id, access_key_secret)
-        self.auth = auth
-        self.timeout = timeout
-        self.service = oss2.Service(auth, endpoint, connect_timeout=self.timeout)
-
-        self._bucket_name = bucket_name
+                 timeout=None, domain="", bucket_name=None):
+        self.auth = oss2.Auth(access_key_id, access_key_secret)
         self._endpoint = endpoint
+        self.timeout = timeout
+
         self._domain = domain
-        self._buckets = {}
+        self._bucket_name = bucket_name
 
     @classmethod
     def from_settings(cls, settings):
-        return cls(access_key_id=settings["OSS_ACCESS_KEY_ID"],
-                   access_key_secret=settings["OSS_ACCESS_KEY_SECRET"],
-                   endpoint=settings["OSS_ENDPOINT"],
-                   bucket_name=settings["OSS_BUCKET_NAME"],
-                   timeout=settings["OSS_DEFAULT_TIMEOUT"],
-                   domain=settings["OSS_DOMAIN"])
+        return cls(
+            access_key_id=settings["OSS_ACCESS_KEY_ID"],
+            access_key_secret=settings["OSS_ACCESS_KEY_SECRET"],
+            endpoint=settings["OSS_ENDPOINT"],
+            bucket_name=settings["OSS_BUCKET_NAME"],
+            timeout=settings["OSS_DEFAULT_TIMEOUT"],
+            domain=settings["OSS_DOMAIN"]
+        )
 
-    def list_buckets(self):
-        return oss2.BucketIterator(self.service)
+    @contextmanager
+    def _close_session(self, bos: Union[Bucket, Service]):
+        try:
+            yield
+        finally:
+            bos.session.session.close()
 
     def get_bucket(self, bucket_name):
         bucket_name = bucket_name or self._bucket_name
-        if not self._buckets.get(bucket_name):
-            self._buckets[bucket_name] = oss2.Bucket(auth=self.auth, endpoint=self._endpoint, bucket_name=bucket_name)
-        return self._buckets[bucket_name]
+        return oss2.Bucket(auth=self.auth, endpoint=self._endpoint, bucket_name=bucket_name)
 
-    def new_bucket(self, bucket_name=None, root=None):
+    def list_buckets(self):
+        service = oss2.Service(self.auth, self._endpoint, connect_timeout=self.timeout)
+        with self._close_session(service):
+            buckets = oss2.BucketIterator(service)
+            return buckets
+
+    def new_bucket(self, bucket_name, root=None):
         bucket = self.get_bucket(bucket_name)
-        if root is None:
-            bucket.create_bucket()
-        else:
-            # set bucket authority
+        with self._close_session(bucket):
+            if root is None:
+                bucket.create_bucket()
+            else:
+                # set bucket authority
+                root = eval("oss2.%s" % root)
+                bucket.create_bucket(root)
+
+    def delete_bucket(self, bucket_name):
+        bucket = self.get_bucket(bucket_name)
+        with self._close_session(bucket):
+            try:
+                # delete an empty bucket
+                bucket.delete_bucket()
+            except oss2.exceptions.BucketNotEmpty:
+                logger.exception('bucket is not empty.')
+            except oss2.exceptions.NoSuchBucket:
+                logger.exception('bucket does not exist')
+
+    def view_bucket_root(self, bucket_name):
+        bucket = self.get_bucket(bucket_name)
+        with self._close_session(bucket):
+            root = bucket.get_bucket_acl().acl
+            return root
+
+    def set_bucket_root(self, root, bucket_name):
+        bucket = self.get_bucket(bucket_name)
+        with self._close_session(bucket):
             root = eval("oss2.%s" % root)
-            bucket.create_bucket(root)
+            bucket.put_bucket_acl(root)
 
-    def delete_bucket(self, bucket_name=None):
+    def delete_object(self, filename, bucket_name):
         bucket = self.get_bucket(bucket_name)
-        try:
-            # delete an empty bucket
-            bucket.delete_bucket()
-        except oss2.exceptions.BucketNotEmpty:
-            logger.exception('bucket is not empty.')
-        except oss2.exceptions.NoSuchBucket:
-            logger.exception('bucket does not exist')
+        with self._close_session(bucket):
+            return bucket.delete_object(filename)
 
-    def view_bucket_root(self, bucket_name=None):
+    def upload_resume(self, key, filename, bucket_name):
         bucket = self.get_bucket(bucket_name)
-        root = bucket.get_bucket_acl().acl
-        return root
-
-    def set_bucket_root(self, root, bucket_name=None):
-        bucket = self.get_bucket(bucket_name)
-        root = eval("oss2.%s" % root)
-        bucket.put_bucket_acl(root)
-
-    def delete_object(self, filename, bucket_name=None):
-        bucket = self.get_bucket(bucket_name)
-        return bucket.delete_object(filename)
-
-    def upload_resume(self, key, filename, bucket_name=None):
-        bucket = self.get_bucket(bucket_name)
-        oss2.resumable_upload(
-            bucket, key, filename, store=oss2.ResumableStore(root='/tmp'), multipart_threshold=100*1024,
-            part_size=100*1024, num_threads=4
-        )
+        with self._close_session(bucket):
+            oss2.resumable_upload(
+                bucket, key, filename, store=oss2.ResumableStore(root='/tmp'), multipart_threshold=100*1024,
+                part_size=100*1024, num_threads=4
+            )
 
     @staticmethod
     def upload_local_file(bucket, filename, buf):
@@ -132,26 +149,26 @@ class AliOSSFilesStore:
 
     def persist_file(self, path, buf, bucket_name=None, **_):
         bucket = self.get_bucket(bucket_name)
-        if isinstance(buf, Response):
-            self.upload_response_content(bucket, path, buf)
-        elif isinstance(buf, bytes):
-            bucket.put_object(path, buf)
-        elif isinstance(buf, str) and os.path.exists(buf):
-            # bucket.put_object_from_file(key=path, filename=buf)
-            self.upload_local_file(bucket, path, buf)
-        else:
-            raise ValueError(f"Unsupported buffer type: {type(buf)}")
-        return "%s/%s" % (self._domain, path)
+        with self._close_session(bucket):
+            if isinstance(buf, Response):
+                self.upload_response_content(bucket, path, buf)
+            elif isinstance(buf, bytes):
+                bucket.put_object(path, buf)
+            elif isinstance(buf, str) and os.path.exists(buf):
+                # bucket.put_object_from_file(key=path, filename=buf)
+                self.upload_local_file(bucket, path, buf)
+            else:
+                raise ValueError(f"Unsupported buffer type: {type(buf)}")
+            return "%s/%s" % (self._domain, path)
 
     def stat_file(self, path, bucket_name=None, **_):
         bucket = self.get_bucket(bucket_name)
-        try:
-            meta_info = bucket.get_object_meta(path)
-            return {'last_modified': meta_info.headers["Last-Modified"], 'checksum': meta_info.headers["ETag"]}
-        except oss2.exceptions.OssError:
-            return {}
+        with self._close_session(bucket):
+            try:
+                meta_info = bucket.get_object_meta(path)
+                return {'last_modified': meta_info.headers["Last-Modified"], 'checksum': meta_info.headers["ETag"]}
+            except oss2.exceptions.OssError:
+                return {}
 
     def close(self):
-        for name in self._buckets:
-            self._buckets[name].session.session.close()
-        self.service.session.session.close()
+        pass

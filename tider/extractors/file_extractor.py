@@ -108,6 +108,11 @@ class FileExtExtractor:
                 return each
         if not self.guess or not splits:
             return ""
+        if "." not in source:
+            if source in self.valid_extensions:
+                return source
+            else:
+                return ""
         # don't consider extensions like 'tar.gz'
         ext = ""
         suffix = source.split(".")[-1]
@@ -132,7 +137,7 @@ class FileExtractor(LinkExtractor):
     :param ignore_untrusted: (bool) ignore UNTRUSTED_EXTENSIONS if set to True
     """
     def __init__(self, allow_untrusted=False, guess=True, update_online=False,
-                 includes=(), excludes=(), hints=('附件', '下载', '文件', 'download', 'file'),
+                 includes=(), excludes=(), hints=('附件', '下载', '文件', 'download', 'file', '附件下载'),
                  unique=True, **kwargs):
         super().__init__(unique=unique, **kwargs)
 
@@ -143,11 +148,11 @@ class FileExtractor(LinkExtractor):
         title, url = link['title'], link['url']
         ext_from_title = self.ext_extractor.extract(title, 'text')
         ext_from_url = self.ext_extractor.extract(url, 'url')
+        link['ext'] = ext_from_title or ext_from_url
         if not ext_from_url and not ext_from_title:
-            if title in self.hints and not url.endswith(tuple(self.ext_extractor.NETWORK_RELATED)):
+            if title.strip() in self.hints and not url.endswith(tuple(self.ext_extractor.NETWORK_RELATED)):
                 return True
             return False
-        link['ext'] = ext_from_title or ext_from_url
         return True
 
     def _process_links(self, links):

@@ -105,6 +105,10 @@ class Parser:
         while self.running:
             try:
                 response = self.queue.popleft()
+                if isinstance(response, Item):
+                    self.tider.stats.inc_value(f"item/{response.__class__.__name__}/count")
+                    self.itemproc.process_item(response)
+                    continue
                 response.meta['elapsed'] = time.time()
                 # response.request or response(request)
                 request = getattr(response, 'request', response)
@@ -136,14 +140,16 @@ class Parser:
                 self.tider.stats.inc_value("request/count/failed")
             spider_outputs = spider_outputs or []
             order = 0
-            for output in spider_outputs:
+            for output in spider_outputs:  # always happens in child promises.
                 if self._spider_output_filter(output, response):
                     if (node and isinstance(output, Request) and
                             (not output.broadcast or self.tider.spider_type != 'publisher')):
                         if not output.meta.get('promise_order'):
                             output.meta['promise_order'] = order
                             order += 1
-                        node.add_child(output)
+                        node.add_child(output)  # already SCHEDULED
+                        if output.meta.get('promise_node'):
+                            self._process_spider_output(output, request)
                     else:
                         self._process_spider_output(output, request)
         except Exception as e:
@@ -190,7 +196,7 @@ class Parser:
             if max_parse_times != -1 and parse_times > max_parse_times:
                 logger.debug(
                     "Ignoring link (parse_times > %(max_parse_times)d): %(requrl)s ",
-                    {'max_parse_times': self.max_depth, 'requrl': request.url},
+                    {'max_parse_times': max_parse_times, 'requrl': request.url},
                 )
                 return False
         return True
@@ -199,6 +205,7 @@ class Parser:
         if isinstance(output, Request):
             self.tider.engine.schedule_request(output)
         elif isinstance(output, Item):
+            self.tider.stats.inc_value(f"item/count")
             self.tider.stats.inc_value(f"item/{output.__class__.__name__}/count")
             self.itemproc.process_item(output)
         elif output is None:

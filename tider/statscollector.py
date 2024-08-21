@@ -85,7 +85,3 @@ class InfluxStatsCollector:
 
 class PrometheusStatsCollector:
     pass
-
-
-class MongoStatsCollector:
-    pass

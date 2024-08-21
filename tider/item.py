@@ -60,11 +60,10 @@ class Item(MutableMapping, metaclass=ItemMeta):
     def _set_default(self):
         # self.fields = self.__class__.fields
         for field in self.fields:
-            default = self.fields[field].get("default")
             datatype = self.fields[field].get("datatype")
-            if default:
-                self[field] = default
-            elif type(datatype).__name__ == 'classobj':
+            if "default" in self.fields[field]:
+                self[field] = self.fields[field]['default']
+            elif type(datatype).__name__ in ('classobj', 'type'):
                 self[field] = datatype()
 
     def discard(self):

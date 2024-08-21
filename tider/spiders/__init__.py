@@ -1,4 +1,5 @@
 import logging
+import warnings
 from typing import Optional
 from weakref import proxy, ProxyType
 
@@ -13,7 +14,8 @@ class Spider:
     def __init__(self, name=None, **kwargs):
         if name is not None:
             self.name = name  # only affects node name in control if set here.
-        elif not self.name:
+        elif not getattr(self, "name", None):
+            warnings.warn(f"{type(self).__name__} doesn't have a name, use class name instead.")
             self.name = self.__class__.__name__
 
         self.__dict__.update(kwargs)

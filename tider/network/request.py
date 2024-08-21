@@ -55,7 +55,7 @@ class Request:
     def __init__(self, url, callback=None, cb_kwargs=None, errback=None, priority=1, encoding=None,
                  meta=None, dup_check=False, raise_for_status=True, ignored_status_codes=(400, 521),
                  proxy_schema=0, proxy_params=None, max_retries=5, max_parse_times=1, delay=0,
-                 broadcast=False, **kwargs):
+                 broadcast=False, impersonate=None, **kwargs):
 
         self.url = url
         self.callback = callback
@@ -79,6 +79,7 @@ class Request:
         self.max_parse_times = max_parse_times
         self.delay = delay
         self.broadcast = broadcast
+        self.impersonate = impersonate
 
         self.request_kwargs = {}
         self.init_request_kwargs(**kwargs)
