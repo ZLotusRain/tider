@@ -117,6 +117,10 @@ class Inspect:
         """Return statistics of spider."""
         return self._request('engine')
 
+    def sse(self):
+        """Return statistics of spider."""
+        return self._request('sse')
+
     def ping(self, destination=None):
         if destination:
             self.destination = destination
@@ -150,7 +154,7 @@ class Control:
                   connection=None, reply=False, timeout=1.0, limit=None,
                   callback=None, channel=None, pattern=None, matcher=None,
                   **extra_kwargs):
-        with connection or self.tider.connection_for_control() as conn:
+        with connection or self.tider.connection_for_control(body_encoding=None) as conn:
             arguments = dict(arguments or {}, **extra_kwargs)
             if pattern and matcher:
                 # tests pass easier without requiring pattern/matcher to

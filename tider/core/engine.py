@@ -46,7 +46,7 @@ class HeartEngine:
         self.async_parse = tider.settings.getbool('ASYNC_PARSE')
 
         self.pidbox = Pidbox(self.tider)
-        self.connection = tider.connection_for_control()
+        self.connection = tider.connection_for_control(body_encoding=None)
         create_fsm(tider)
 
         self.pid = os.getpid()
@@ -132,6 +132,7 @@ class HeartEngine:
                 yield from start_requests
                 if hasattr(start_requests, 'close'):
                     start_requests.close()
+                del start_requests
             time.sleep(0.5)
 
     def start(self):
@@ -186,6 +187,9 @@ class HeartEngine:
         return len(self.explorer.queue) + len(self.parser.queue) >= limit
 
     def schedule_request(self, request):
+        from tider import Item
+        if isinstance(request, Item):
+            return self.parser.enqueue_parser(request)
         if request.broadcast and self.tider.spider_type == 'publisher':
             self.broker.produce(request)
             self.tider.stats.inc_value("request/published")

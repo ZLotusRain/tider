@@ -23,6 +23,10 @@ if sys.version_info < (3, 6):
     print(f"Tider {__version__} requires Python 3.6+")
     sys.exit(1)
 
+# https://github.com/gevent/gevent/issues/1909
+# https://github.com/gevent/gevent/issues/1957
+# os.environ.setdefault('PURE_PYTHON', '1')
+
 # This is never executed, but tricks static analyzers (PyDev, PyCharm,
 # pylint, etc.) into knowing the types of these symbols, and what
 # they contain.
@@ -71,8 +75,12 @@ def _patch_eventlet():
 def _patch_gevent():
     import gevent.monkey
     import gevent.signal
+    from gevent.queue import LifoQueue
 
     gevent.monkey.patch_all()
+
+    from urllib3.connectionpool import ConnectionPool
+    ConnectionPool.QueueCls = LifoQueue
 
 
 def maybe_patch_concurrency(argv=None, short_opts=None,

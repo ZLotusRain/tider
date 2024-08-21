@@ -20,6 +20,7 @@ Examples
 import os
 import sys
 import click
+import json
 import logging
 
 from tider.platforms import EX_OK, EX_FAILURE, detached
@@ -57,13 +58,21 @@ def detach(path, argv, logfile=None, pidfile=None, uid=None,
               '--name',
               type=str,
               help='Unique spider name.')
+@click.option('-d',
+              '--data',
+              type=str,
+              help='File which stores kwargs for crawling.')
+@click.option('--delete',
+              is_flag=True,
+              default=False,
+              help="Whether to delete the data file.")
 @click.option('-D',
               '--detach',
               is_flag=True,
               default=False,
               help="Start tider as a background process.")
 @click.pass_context
-def crawl(ctx, name, uid=None, gid=None, pidfile=None, **kwargs):
+def crawl(ctx, name, data, delete, uid=None, gid=None, pidfile=None, **kwargs):
     if kwargs.get('detach', False):
         argv = ['-m', 'tider'] + sys.argv[1:]
         if '--detach' in argv:
@@ -85,5 +94,15 @@ def crawl(ctx, name, uid=None, gid=None, pidfile=None, **kwargs):
                       workdir=kwargs.get('workdir', None),
                       executable=kwargs.get('executable', None),
                       )
-    spider_kwargs = dict(x.split("=", 1) for x in ctx.args)
+
+    spider_kwargs = {}
+    if data:
+        with open(data, encoding='utf-8') as fo:
+            spider_kwargs.update(json.load(fo))
+        if delete:
+            os.remove(data)
+    spider_kwargs.update(dict(x.split("=", 1) for x in ctx.args))
+    if 'name' in spider_kwargs:
+        spider_kwargs['name_'] = spider_kwargs.pop('name')
+
     ctx.obj.tider.crawl(name=name, **spider_kwargs)

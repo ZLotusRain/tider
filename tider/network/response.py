@@ -295,7 +295,8 @@ class Response:
         encoding = self.encoding or self.apparent_encoding
         # Decode unicode from given encoding.
         try:
-            text = self.content.decode(encoding, errors="replace")
+            # text = self.content.decode(encoding, errors="replace")
+            text = str(self.content, encoding, errors="replace")
         except (LookupError, TypeError):
             # A LookupError is raised if the encoding was not found which could
             # indicate a misspelling or similar mistake.
@@ -305,10 +306,15 @@ class Response:
             # So we try blindly encoding.
             text = str(self.content, errors='replace')
 
-        for special_character_pattern in SPECIAL_CHARACTER_PATTERNS:
-            text = special_character_pattern.sub("", text)
         self._cached_text = text
         return self._cached_text
+
+    @property
+    def trimmed_text(self):
+        text = self.text
+        for special_character_pattern in SPECIAL_CHARACTER_PATTERNS:
+            text = special_character_pattern.sub("", text)
+        return text
 
     def json(self, **kwargs):
         if not self.encoding and self.content and len(self.content) > 3:
@@ -322,7 +328,7 @@ class Response:
                     # and the server didn't bother to tell us what codec *was*
                     # used.
                     pass
-        return json.loads(self.text, **kwargs)
+        return json.loads(self.trimmed_text, **kwargs)
 
     @property
     def selector(self):
@@ -390,7 +396,15 @@ class Response:
     def close(self):
         raw, self.raw = self.raw, None
         if raw is not None:
-            raw.close()
+            if getattr(raw, "drain_conn", None):
+                # special for urllib3.
+                # if connection pool is closed, the connection will be closed.
+                raw.drain_conn()
+            elif getattr(raw, "close", None):
+                try:
+                    raw.close()
+                except AttributeError:
+                    pass
         if getattr(raw, "release_conn", None):
             raw.release_conn()
         self._clear_caches()

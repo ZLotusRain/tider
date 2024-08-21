@@ -79,7 +79,8 @@ def stats(state, **kwargs):
     return s
 
 
-def exploring(state):
+@inspect_command(default_timeout=5)
+def exploring(state, **kwargs):
     results = []
     requests = state.tider.engine.explorer.transferring
     for request in requests:
@@ -98,7 +99,8 @@ def exploring(state):
     return results
 
 
-def parsing(state):
+@inspect_command(default_timeout=5)
+def parsing(state, **kwargs):
     results = []
     requests = state.tider.engine.parser.parsing
     for request in requests:
@@ -124,10 +126,30 @@ def engine(state, **kwargs):
         'len(tider.engine.parser.queue)': len(state.tider.engine.parser.queue),
         'len(tider.engine.explorer.transferring)': len(state.tider.engine.explorer.transferring),
         'len(tider.engine.parser.parsing)': len(state.tider.engine.parser.parsing),
-        'tider.engine.explorer.transferring': exploring(state),
-        'tider.engine.parser.parsing': parsing(state),
     }
     return result
+
+
+@inspect_command(default_timeout=3)
+def sse(state, **kwargs):
+    s1 = state.tider.settings.table(with_defaults=True, censored=True)
+    s2 = state.tider.stats.get_stats().copy()
+    e = {
+        'time()-tider.engine.start_time': time.time() - state.tider.engine.start_time,
+        'tider.engine.active()': state.tider.engine.active(),
+        'tider.engine._overload()': state.tider.engine._overload(),
+        'tider.engine.explorer.needs_backout()': state.tider.engine.explorer.needs_backout(),
+        'len(state.tider.engine.scheduler)': len(state.tider.engine.scheduler),
+        'len(tider.engine.explorer.queue)': len(state.tider.engine.explorer.queue),
+        'len(tider.engine.parser.queue)': len(state.tider.engine.parser.queue),
+        'len(tider.engine.explorer.transferring)': len(state.tider.engine.explorer.transferring),
+        'len(tider.engine.parser.parsing)': len(state.tider.engine.parser.parsing),
+    }
+    return {
+        'settings': s1,
+        'stats': s2,
+        'engine': e
+    }
 
 
 @inspect_command(default_timeout=60.0)

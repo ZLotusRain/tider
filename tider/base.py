@@ -291,24 +291,24 @@ class Tider:
 
         return type(name or Class.__name__, (Class,), attrs)
 
-    def connection_for_control(self, url=None, heartbeat=120):
+    def connection_for_control(self, url=None, heartbeat=120, body_encoding='base64'):
         """Establish connection used for controlling.
 
          Returns:
             kombu.Connection: the lazy connection instance.
         """
         url = url or self.settings.get('CONTROL_URL') or self.control_url
-        return self._connection(url, heartbeat=heartbeat)
+        return self._connection(url, heartbeat=heartbeat, body_encoding=body_encoding)
 
     @staticmethod
-    def _connection(url, heartbeat=None):
+    def _connection(url, heartbeat=None, body_encoding='base64'):
         return Connection(
             hostname=url,
             ssl=False,
             heartbeat=heartbeat,
             login_method=None,
             failover_strategy=None,
-            transport_options={},
+            transport_options={'body_encoding': body_encoding},
             connect_timeout=4
         )
 

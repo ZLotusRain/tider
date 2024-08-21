@@ -43,6 +43,10 @@ class TiderException(Exception):
     """Base class for all Tider errors."""
 
 
+class ImproperlyConfigured(TiderException):
+    """Tider is somehow improperly configured."""
+
+
 class UnSupportedMethod(TiderException):
     """Raised when use the unsupported method in class."""
 

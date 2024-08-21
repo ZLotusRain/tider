@@ -3,21 +3,48 @@
 import time
 import logging
 import requests
+import warnings
 import tempfile
-import subprocess
 from threading import Event
 from collections import deque
-from subprocess import DEVNULL
+from types import MethodType
 
 from tider.session import Session
 from tider.network import ProxyPoolManager, Response
 from tider.platforms import IS_WINDOWS
 from tider.utils.decorators import inthread
-from tider.utils.misc import symbol_by_name, create_instance
+from tider.utils.misc import symbol_by_name, create_instance, try_import
 
 logger = logging.getLogger(__name__)
 
 PLATFORM_SUPPORTS_WGET = not IS_WINDOWS
+
+
+def _curl_stream(self, chunk_size=None, **_):
+    """
+    iterate streaming content chunk by chunk in bytes.
+    """
+    if chunk_size:
+        warnings.warn("chunk_size is ignored, there is no way to tell curl that.")
+    RequestsError = try_import('curl_cffi.requests.errors.RequestsError')
+    while True:
+        if getattr(self, 'queue', None) is not None:
+            chunk = self.queue.get()  # type: ignore
+
+            # re-raise the exception if something wrong happened.
+            if isinstance(chunk, RequestsError):
+                self.curl.reset()  # type: ignore
+                raise chunk
+
+            # end of stream.
+            if chunk is None:
+                self.curl.reset()  # type: ignore
+                return
+
+            yield chunk
+        else:
+            yield self.content
+            return
 
 
 def _transport(queue, processor, output_handler=None, shutdown_event=None):
@@ -211,9 +238,17 @@ class Explorer:
         request.fetch_proxies()  # to increase used_times
         timeout = request.request_kwargs.get("timeout") or 60
         timeout = max(timeout, 100)
+
+        if self.pool.is_green:
+            from gevent import subprocess
+        else:
+            import subprocess
+
         try:
-            subprocess.run(cmd, timeout=timeout, check=True, stdout=DEVNULL, stderr=DEVNULL)
+            subprocess.check_output(cmd, timeout=timeout)
             response = self.build_response(request)
+            ntf.flush()
+            ntf.seek(0)
             response.raw = ntf
             response.url = request.url
             response.status_code = 200
@@ -235,7 +270,11 @@ class Explorer:
         session = request.meta.get("session")
         resp = None
         try:
-            if session:
+            if request.impersonate:
+                curl = try_import('curl_cffi.requests')
+                resp = curl.request(url=url, **kwargs)
+                resp.stream = MethodType(_curl_stream, resp)  # hijack stream
+            elif session:
                 resp = session.request(url=url, **kwargs)
             else:
                 with Session() as session:
@@ -272,10 +311,14 @@ class Explorer:
 
     @staticmethod
     def build_response(request, resp=None):
-        if resp is not None:
+        if resp is not None and isinstance(resp, Response):
             resp.request = request
         else:
-            resp = Response(request)
+            result = Response(request)
+            result.raw = resp
+            if resp:
+                result.status_code = resp.status_code
+            resp = result
         response = resp
         return response
 

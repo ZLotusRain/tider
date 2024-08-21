@@ -1,5 +1,6 @@
 """Thread execution pool."""
 
+import os
 import queue
 import weakref
 from abc import ABC
@@ -21,9 +22,18 @@ class ApplyResult:
 
 class ThreadPoolExecutor(_ThreadPoolExecutor):
 
-    def __init__(self, **kwargs):
-        super(ThreadPoolExecutor, self).__init__(**kwargs)
-        self._work_queue = queue.Queue(maxsize=self._max_workers * 2)
+    def __init__(self, max_workers=None, **kwargs):
+        if max_workers is None:
+            # ThreadPoolExecutor is often used to:
+            # * CPU bound task which releases GIL
+            # * I/O bound task (which releases GIL, of course)
+            #
+            # We use cpu_count + 4 for both types of tasks.
+            # But we limit it to 32 to avoid consuming surprisingly large resource
+            # on many core machine.
+            max_workers = min(32, (os.cpu_count() or 1) + 4)
+        super(ThreadPoolExecutor, self).__init__(max_workers=max_workers * 2, **kwargs)
+        self._work_queue = queue.Queue(maxsize=self._max_workers)
         self._threads = weakref.WeakSet()
 
 
