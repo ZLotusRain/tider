@@ -6,9 +6,11 @@ import os
 import sys
 import pkgutil
 
+from . import local
 
 __all__ = (
-    '__version__', 'version_info'
+    'Tider', 'Item', 'Field', 'Promise', 'Transformer',
+    'Request', 'Response', '__version__', 'version_info'
 )
 
 
@@ -17,9 +19,25 @@ version_info = tuple(int(v) if v.isdigit() else v for v in __version__.split('.'
 
 
 # Check minimum required Python version
-if sys.version_info < (3, 3):
-    print(f"Tider {__version__} requires Python 3.3+")
+if sys.version_info < (3, 6):
+    print(f"Tider {__version__} requires Python 3.6+")
     sys.exit(1)
+
+# This is never executed, but tricks static analyzers (PyDev, PyCharm,
+# pylint, etc.) into knowing the types of these symbols, and what
+# they contain.
+STATICA_HACK = True
+globals()['kcah_acitats'[::-1].upper()] = False
+if STATICA_HACK:  # pragma: no cover
+    from tider.base import Tider
+    from tider.promise import Promise
+    from tider.item import Item, Field
+    from tider.network import Request, Response
+    from tider.security import Transformer
+
+
+# Eventlet/gevent patching must happen before importing
+# anything else, so these tools must be at top-level.
 
 
 def _find_option_with_arg(argv, short_opts=None, long_opts=None):
@@ -89,4 +107,20 @@ def maybe_patch_concurrency(argv=None, short_opts=None,
             concurrency.get_implementation(pool)
 
 
-del pkgutil
+# this just creates a new module, that imports stuff on first attribute
+# access.  This makes the library faster to use.
+old_module, new_module = local.recreate_module(  # pragma: no cover
+    __name__,
+    by_module={
+        'tider.base': ['Tider'],
+        'tider.item': ['Item', 'Field'],
+        'tider.promise': ['Promise'],
+        'tider.network': ['Request', 'Response'],
+        'tider.security': ['Transformer'],
+    },
+    __package__='tider', __file__=__file__,
+    __path__=__path__, __doc__=__doc__, __version__=__version__,
+    local=local, version_info=version_info,
+    maybe_patch_concurrency=maybe_patch_concurrency,
+    _find_option_with_arg=_find_option_with_arg,
+)

@@ -27,7 +27,7 @@ class ItemMeta(ABCMeta):
         fields = getattr(_class, 'fields', {})
         slots = getattr(_class, '__slots__', ())
         for slot in slots:
-            fields[slot] = Field()
+            fields[slot] = Field(default=None)
         for n in dir(_class):
             v = getattr(_class, n)
             if isinstance(v, Field):
@@ -66,8 +66,6 @@ class Item(MutableMapping, metaclass=ItemMeta):
                 self[field] = default
             elif type(datatype).__name__ == 'classobj':
                 self[field] = datatype()
-            else:
-                self[field] = None
 
     def discard(self):
         self._values.clear()

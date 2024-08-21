@@ -5,10 +5,11 @@ import hashlib
 from weakref import WeakKeyDictionary
 from w3lib.url import canonicalize_url
 
+from tider.network.proxy import Proxy
 from tider.network.user_agent import get_random_ua
-from tider.utils.misc import symbol_by_name, to_bytes
+from tider.utils.serialize import pickle_loads
 from tider.utils.curl import curl_to_request_kwargs
-from tider.utils.serialize import pickle_loads, pickle_dumps
+from tider.utils.misc import symbol_by_name, to_bytes
 
 
 logger = logging.getLogger(__name__)
@@ -32,16 +33,28 @@ def request_from_dict(d, spider=None):
     return request_cls(**d)
 
 
+def get_multipart_boundary_from_content_type(content_type):
+    if not content_type or not content_type.startswith(b"multipart/form-data"):
+        return None
+    # parse boundary according to
+    # https://www.rfc-editor.org/rfc/rfc2046#section-5.1.1
+    if b";" in content_type:
+        for section in content_type.split(b";"):
+            if section.strip().lower().startswith(b"boundary="):
+                return section.strip()[len(b"boundary="):].strip(b'"')
+    return None
+
+
 class Request:
     """Represents an HTTP request."""
 
-    _REQUEST_KWARGS = ("method", "params", "data", "json", "headers", "cookies",
-                       "files", "auth", "timeout", "allow_redirects", "proxies",
-                       "hooks", "stream", "verify", "cert")
+    _REQUEST_KWARGS = ("method", "params", "headers", "cookies", "data", "json",
+                       "files", "content", "auth", "timeout", "allow_redirects",
+                       "proxies", "stream", "verify", "cert")
 
     def __init__(self, url, callback=None, cb_kwargs=None, errback=None, priority=1, encoding=None,
                  meta=None, dup_check=False, raise_for_status=True, ignored_status_codes=(400, 521),
-                 proxy_schema=0, proxy_params=None, max_retry_times=5, max_parse_times=1, delay=0,
+                 proxy_schema=0, proxy_params=None, max_retries=5, max_parse_times=1, delay=0,
                  broadcast=False, **kwargs):
 
         self.url = url
@@ -60,8 +73,9 @@ class Request:
         self.priority = priority
         self.proxy_schema = proxy_schema
         self.proxy_params = dict(proxy_params) if proxy_params else {}
+        self.proxy = Proxy(**kwargs.pop('proxies', {}))
 
-        self.max_retry_times = max_retry_times
+        self.max_retry_times = kwargs.pop("max_retry_times", None) or max_retries
         self.max_parse_times = max_parse_times
         self.delay = delay
         self.broadcast = broadcast
@@ -70,6 +84,7 @@ class Request:
         self.init_request_kwargs(**kwargs)
 
     def init_request_kwargs(self, **kwargs):
+        self.proxy.active()
         # deepcopy may optimize memory
         self.request_kwargs = {k: kwargs[k] for k in kwargs if k in self._REQUEST_KWARGS}
         if 'data' in kwargs or 'json' in kwargs:
@@ -77,11 +92,28 @@ class Request:
         else:
             default_method = "GET"
         self.request_kwargs.setdefault("method", default_method)
+        self.request_kwargs['method'] = str(self.request_kwargs['method']).upper()
         if self.meta.get('random_ua'):
             headers = self.request_kwargs.get("headers", {})
             headers["User-Agent"] = get_random_ua()
             self.request_kwargs["headers"] = headers
         self.request_kwargs.setdefault("timeout", 10)
+
+    def fetch_proxies(self):
+        """
+        Call this method will increase the proxy's used_times.
+        """
+        return self.proxy.fetch()
+
+    def update_proxy(self, proxy):
+        if proxy:
+            self.request_kwargs.setdefault('verify', False)
+        proxy.activate()
+        self.proxy and self.proxy.maybe_discard()
+        self.proxy = proxy
+
+    def forbid_proxy(self):
+        self.proxy and self.proxy.forbid()
 
     @classmethod
     def from_curl(cls, curl_command: str, ignore_unknown_options: bool = True, **kwargs):
@@ -109,31 +141,6 @@ class Request:
     @property
     def method(self):
         return self.request_kwargs.get("method")
-
-    @property
-    def proxies(self):
-        """
-        Returns `{"https": "https://ip:port", "http": "http://ip:port"}`
-        """
-        return self.request_kwargs.get("proxies", {})
-
-    @proxies.setter
-    def proxies(self, val):
-        val = dict(val) if val else {}
-        self.request_kwargs.update({"proxies": val})
-
-    @property
-    def proxy(self):
-        """
-        Returns`ip:port`
-        """
-        proxy = None
-        if self.proxies.get("http"):
-            proxy = self.proxies["http"].replace("http://", "")
-        elif self.proxies.get("https"):
-            # urllib3 >= 1.26.0
-            proxy = self.proxies["https"].replace("https://", "").replace("http://", "")
-        return proxy
 
     def __str__(self):
         return "<Request [{0} {1}]>".format(self.method, self.url)
@@ -164,19 +171,17 @@ class Request:
         cls = kwargs.pop('cls', self.__class__)
         return cls(*args, **kwargs)
 
-    @property
     def fingerprint(self, include_headers=None, keep_fragments=False):
-        include_headers = include_headers or {}
-        include_headers = tuple(to_bytes(h.lower()) for h in sorted(include_headers))
+        headers = dict(include_headers or {})
+        headers = tuple(to_bytes(h.lower()) for h in sorted(headers))
 
         cache = _fingerprint_cache.setdefault(self, {})
-        cache_key = (include_headers, keep_fragments)
+        cache_key = (headers, keep_fragments)
         if cache_key not in cache:
             fp = hashlib.sha1()
             fp.update(to_bytes(canonicalize_url(self.url, keep_fragments=keep_fragments)))
-            headers = self.request_kwargs.get("headers")
-            for hdr in include_headers:
-                if hdr not in headers:
+            for hdr in headers:
+                if hdr not in self.request_kwargs.get('headers', {}):
                     continue
                 fp.update(to_bytes(hdr))
                 fp.update(to_bytes(headers[hdr]))
@@ -189,15 +194,10 @@ class Request:
 
     def to_dict(self, spider=None) -> dict:
         """Return a dictionary containing the Request's data."""
-        if spider:
-            callback = _find_method(spider, self.callback) if callable(self.callback) else self.callback
-            errback = _find_method(spider, self.errback) if callable(self.errback) else self.errback
-        else:
-            callback = pickle_dumps(self.callback)
-            errback = pickle_dumps(self.errback)
+        # callback or errback either be a string or None object or must be bound to a spider
         d = {
-            "callback": callback,
-            "errback": errback
+            "callback": _find_method(spider, self.callback) if callable(self.callback) else self.callback,
+            "errback": _find_method(spider, self.errback) if callable(self.errback) else self.errback
         }
         for attr in self.__dict__:
             value = getattr(self, attr)
@@ -209,7 +209,7 @@ class Request:
             d["_class"] = self.__module__ + '.' + self.__class__.__name__
         return d
 
-    def to_wget(self, quiet=True):
+    def to_wget(self, output, quiet=True):
         wget_cmd = 'wget'
         if quiet:
             wget_cmd += ' -q'
@@ -229,16 +229,20 @@ class Request:
         ua = self.request_kwargs.get("headers", {}).get('User-Agent')
         if ua:
             wget_cmd += f' -U "{ua}"'
-        if self.proxies.get('http'):
-            wget_cmd += f' -e "http_proxy={self.proxies["http"]}"'
-        if self.proxies.get('https'):
-            wget_cmd += f' -e "https_proxy={self.proxies["https"]}"'
-        wget_cmd += f' -O {self.meta.get("download_path")} {self.url}'
+        if self.proxy.get('http'):
+            wget_cmd += f' -e "http_proxy={self.proxy["http"]}"'
+        if self.proxy.get('https'):
+            wget_cmd += f' -e "https_proxy={self.proxy["https"]}"'
+        wget_cmd += f' -O {output} {self.url}'
         return shlex.split(wget_cmd)
 
     def close(self):
+        self.proxy and self.proxy.maybe_discard()
+        # don't use clear to avoid break cb_kwargs in promise
+        self.cb_kwargs = {}
+        self.meta = {}
         self.request_kwargs.clear()
-        del self.callback, self.errback, self.cb_kwargs, self.meta
+        del self.callback, self.errback
 
 
 def _find_method(obj, func):
@@ -254,6 +258,8 @@ def _find_method(obj, func):
             # https://docs.python.org/3/reference/datamodel.html
             if obj_func.__func__ is func.__func__:
                 return name
+    elif _is_static_method(obj.__class__, getattr(func, '__name__', str(func))):
+        return getattr(func, '__name__', str(func))
     raise ValueError(f"Function {func} is not an instance method in: {obj}")
 
 
@@ -264,3 +270,27 @@ def _get_method(obj, name):
         return getattr(obj, name)
     except AttributeError:
         raise ValueError(f"Method {name!r} not found in: {obj}")
+
+
+def _is_static_method(klass, attr, value=None):
+    """Test if a value of a class is static method.
+    example::
+        class MyClass(object):
+            @staticmethod
+            def method():
+                ...
+    :param klass: the class
+    :param attr: attribute name
+    :param value: attribute value
+    """
+    if value is None:
+        value = getattr(klass, attr)
+    assert getattr(klass, attr) == value
+
+    for cls in inspect.getmro(klass):
+        if inspect.isroutine(value):
+            if attr in cls.__dict__:
+                binded_value = cls.__dict__[attr]
+                if isinstance(binded_value, staticmethod):
+                    return True
+    return False

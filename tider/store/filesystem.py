@@ -2,11 +2,10 @@ import os
 from io import BytesIO
 from collections import defaultdict
 
-from tider.store import FilesStore
 from tider.utils.misc import md5sum
 
 
-class FSFilesStore(FilesStore):
+class FSFilesStore:
     def __init__(self, basedir):
         if '://' in basedir:
             basedir = basedir.split('://', 1)[1]
@@ -16,8 +15,7 @@ class FSFilesStore(FilesStore):
 
     @classmethod
     def from_settings(cls, settings):
-        store_settings = settings.get("STORE_SETTINGS")
-        basedir = store_settings.get("basedir", "")
+        basedir = settings["FS_BASEDIR"]
         return cls(basedir)
 
     def persist_file(self, path, buf, **kwargs):

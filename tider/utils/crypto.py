@@ -1,12 +1,23 @@
+import sys
+import html
+import re
 import logging
 import base64
 import hashlib
+import urllib.parse
 
 from Crypto.Cipher import AES, DES
 from Crypto.Util.Padding import pad, unpad
 from binascii import b2a_hex, a2b_hex
 
 logger = logging.getLogger(__name__)
+
+
+def unescape(string):
+    string = urllib.parse.unquote(string)
+    quoted = html.unescape(string).encode(sys.getfilesystemencoding()).decode('utf-8')
+    # turn to chinese
+    return re.sub(r'%u([a-fA-F0-9]{4}|[a-fA-F0-9]{2})', lambda m: chr(int(m.group(1), 16)), quoted)
 
 
 def encrypt(source, key, method, mode="ECB", iv=None, block_size=16, style="pkcs7", encoding="base64"):

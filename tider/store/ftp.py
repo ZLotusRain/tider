@@ -1,12 +1,13 @@
 import hashlib
+from io import BytesIO
 from ftplib import FTP
 from urllib.parse import urlparse
 
-from tider.store import FilesStore
+from tider import Response
 from tider.utils.ftp import ftp_store_file
 
 
-class FTPFilesStore(FilesStore):
+class FTPFilesStore:
 
     FTP_USERNAME = None
     FTP_PASSWORD = None
@@ -25,12 +26,15 @@ class FTPFilesStore(FilesStore):
 
     @classmethod
     def from_settings(cls, settings):
-        store_settings = settings.get("STORE_SETTINGS")
-        uri = store_settings.get("uri", "")
+        uri = settings['FTP_URI']
         return cls(uri)
 
     def persist_file(self, path, buf, **_):
         path = f'{self.basedir}/{path}'
+        if isinstance(buf, Response):
+            buf = buf.content
+        elif isinstance(buf, bytes):
+            buf = BytesIO(buf)
         return ftp_store_file(
             path=path, file=buf,
             host=self.host, port=self.port, username=self.username,

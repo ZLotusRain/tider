@@ -1,24 +1,9 @@
 import warnings
+import traceback
 from collections import defaultdict
 
-from tider.settings import BaseSettings
-from tider.utils.misc import symbol_by_name, walk_modules
-from tider.utils.spider import iter_spider_classes, get_spider_name
-
-
-class SpiderSettings(BaseSettings):
-
-    def __init__(self, values=None, priority='project'):
-        # Do not pass kwarg values here. We don't want to promote user-defined
-        # dicts, and we want to update, not replace, default dicts with the
-        # values given by the user
-        super().__init__()
-        # Promote default dictionaries to BaseSettings instances for per-key
-        # priorities
-        for name, val in self.items():
-            if isinstance(val, dict):
-                self.set(name, BaseSettings(val, 'default'), 'default')
-        self.update(values, priority)
+from tider.utils.spider import iter_spider_classes
+from tider.utils.misc import walk_modules, symbol_by_name
 
 
 class SpiderLoader:
@@ -27,18 +12,36 @@ class SpiderLoader:
     in a Tider project.
     """
     def __init__(self, settings, schema=None):
-        self.settings = settings
-        self._schema = []
-        schemas = self.settings.get('SPIDER_SCHEMAS', {})
-        schemas and self.settings.pop('SPIDER_SCHEMAS')
-        if not schema:
-            for schema in schemas.values():
-                self._schema.extend(schema)  # spider specific settings
-        else:
-            self._schema = schemas[schema]
+        self.schema = schema
+        self.warn_only = settings.getbool('SPIDER_LOADER_WARN_ONLY')
+        self.spider_settings = []
+        self._extract_spider_settings(settings)
+
         self._spiders = {}
         self._found = defaultdict(list)
         self._load_all_spiders()
+
+    def _extract_spider_settings(self, settings):
+        spider_schemas = settings.getdict('SPIDER_SCHEMAS')
+        spider_modules = settings.getlist('SPIDER_MODULES')
+        spider = settings.get('SPIDER')
+        if not self.schema:
+            # load all spiders
+            for spider_schema in spider_schemas.values():
+                self.spider_settings.extend(spider_schema)  # spider custom settings
+            self.spider_settings.append({'SPIDER_MODULES': spider_modules})
+            self.spider_settings.append({'SPIDER': spider})
+        else:
+            try:
+                # load spider settings in specific schema
+                self.spider_settings = spider_schemas[self.schema]
+            except KeyError:
+                # load spiders in base settings when no schema provided
+                self.spider_settings.append({'SPIDER_MODULES': spider_modules})
+                self.spider_settings.append({'SPIDER': spider})
+        spider_schemas and settings.pop('SPIDER_SCHEMAS')
+        spider_modules and settings.pop('SPIDER_MODULES')
+        spider and settings.pop('SPIDER')
 
     def _check_name_duplicates(self):
         dupes = []
@@ -52,31 +55,45 @@ class SpiderLoader:
         if dupes:
             dupes_string = "\n\n".join(dupes)
             warnings.warn(
-                "There are several spiders with the same name:\n\n"
+                f"There are several spiders with the same name in schema {self.schema}:\n\n"
                 f"{dupes_string}\n\n  This can cause unexpected behavior.",
                 category=UserWarning,
             )
 
     def _load_spiders(self, module, settings):
         for spider_cls in iter_spider_classes(module):
-            spider_name = get_spider_name(spider_cls, settings)
-            self._found[spider_name].append((module.__name__, spider_cls.__name__))
-            self._spiders[spider_name] = (spider_cls, settings)
+            spider_cls.name = spider_cls.name or spider_cls.__name__
+            spider_cls.custom_settings = spider_cls.custom_settings or {}
+            spider_cls.custom_settings.update(settings)
+            self._found[spider_cls.name].append((module.__name__, spider_cls.__name__))
+            self._spiders[spider_cls.name] = spider_cls
 
     def _load_all_spiders(self):
-        if not self._schema:
-            self._schema.append(self.settings.copy())
-        for spider_settings in self._schema:
-            settings = SpiderSettings(spider_settings, priority='project')
-            spider_module = spider_settings.get("SPIDER_MODULE")
-            if spider_module:
-                for module in walk_modules(spider_module):
-                    self._load_spiders(module, settings)
-            elif spider_settings.get("SPIDER"):
-                spider_cls = symbol_by_name(spider_settings["SPIDER"])
-                spider_name = get_spider_name(spider_cls, settings)
-                self._found[spider_name].append((spider_cls.__module__, spider_cls.__name__))
-                self._spiders[spider_name] = (spider_cls, settings)
+        for spider_setting in self.spider_settings:
+            names = spider_setting.get('SPIDER_MODULES')
+            if isinstance(names, str):
+                names = names.split(',')
+            for name in names or []:
+                try:
+                    for module in walk_modules(name):
+                        self._load_spiders(module, spider_setting)
+                except ImportError:
+                    if self.warn_only:
+                        warnings.warn(
+                            f"\n{traceback.format_exc()}Could not load spiders "
+                            f"from module '{name}'. "
+                            "See above traceback for details.",
+                            category=RuntimeWarning,
+                        )
+                    else:
+                        raise
+            if spider_setting.get('SPIDER'):
+                spider_cls = symbol_by_name(spider_setting.get('SPIDER'))
+                spider_cls.name = spider_cls.name or spider_cls.__name__
+                spider_cls.custom_settings = spider_cls.custom_settings or {}
+                spider_cls.custom_settings.update(spider_setting)
+                self._found[spider_cls.name].append((spider_cls.__module__, spider_cls.__name__))
+                self._spiders[spider_cls.name] = spider_cls
         self._check_name_duplicates()
 
     def load(self, spider_name):
@@ -86,12 +103,6 @@ class SpiderLoader:
         """
         try:
             return self._spiders[spider_name]
-        except KeyError:
-            raise KeyError(f"Spider not found: {spider_name}")
-
-    def load_settings(self, spider_name):
-        try:
-            return self._spiders[spider_name][1]
         except KeyError:
             raise KeyError(f"Spider not found: {spider_name}")
 

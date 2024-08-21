@@ -1,89 +1,153 @@
 import re
-from typing import Optional, List
-from functools import partial
+import logging
 
 from tider.extractors.link_extractor import LinkExtractor
-from tider.utils.misc import arg_to_iter
-from tider.utils.url import url_has_any_extension
+
+logger = logging.getLogger(__name__)
 
 
-IGNORED_EXTENSIONS = ['exe', 'bin', 'rss', 'dmg', 'iso', 'apk']
-IGNORED_EXTENSIONS.extend([ext.upper() for ext in IGNORED_EXTENSIONS])
+class FileExtExtractor:
 
-COMMON_EXTENSIONS = [
-    # archives
-    '7z', '7zip', 'bz2', 'rar', 'tar', 'tar.gz', 'xz', 'zip',
-    # images
-    'mng', 'pct', 'bmp', 'gif', 'jpg', 'jpeg', 'png', 'pst', 'psp', 'tif',
-    'tiff', 'ai', 'drw', 'dxf', 'eps', 'ps', 'svg', 'cdr', 'ico',
-    # audio
-    'mp3', 'wma', 'ogg', 'wav', 'ra', 'aac', 'mid', 'au', 'aiff',
-    # video
-    '3gp', 'asf', 'asx', 'avi', 'mov', 'mp4', 'mpg', 'qt', 'rm', 'swf', 'wmv',
-    'm4a', 'm4v', 'flv', 'webm',
-    # office suites
-    'xls', 'xlsx', 'ppt', 'pptx', 'pps', 'doc', 'docx', 'odt', 'ods', 'odg',
-    'odp',
-    # other
-    'pdf', "txt", "csv", "fyzf", "qdncf", "qdnzb", "xml", "gzzf",
-    "gef", "zbqd", 'zbj', 'jszs'
-]
-COMMON_EXTENSIONS.extend([ext.upper() for ext in COMMON_EXTENSIONS])
+    # https://support.microsoft.com/en-us/windows/common-file-name-extensions-in-windows-da4a4430-8e76-89c5-59f7-1cdbbc75cb01
+    URL = "https://www.file-extensions.org"
 
-NETWORK_EXTENSIONS = ["cn", "com", "net", "xyz", "info", "icu", "top", "cc", "de", "app", "pub", "org",
-                      "htm", "html", "jhtml", "shtml", "asp", "aspx", "jsp", "jspx", "php", 'css', "js",
-                      "do", "action", "sg"]
-NETWORK_EXTENSIONS.extend([ext.upper() for ext in NETWORK_EXTENSIONS])
+    COMMON_EXTENSIONS = {
+        'Archives': {
+            '7z', '7zip', 'bz2', 'rar', 'tar', 'tar.gz', 'xz', 'zip'
+        },
+        'Bitmap images': {
+            'bmp', 'cpt', 'dds', 'dib', 'dng', 'gif', 'ico', 'icon',
+            'jpeg', 'jpg', 'pcx', 'pic', 'png', 'psd', 'psdx', 'raw',
+            'tif', 'tiff', 'webp'
+        },
+        'Digital camera RAW photos': {
+            'arw', 'crw', 'dcr', 'dng', 'pcd', 'ptx', 'rw2'
+        },
+        'Vector graphics': {
+            'ai', 'cdr', 'csh', 'cls', 'drw', 'odg',
+            'svg', 'svgz', 'swf'
+        },
+        'Font files': {
+            'eot', 'otf', 'ttc', 'ttf', 'woff'
+        },
+        'Audio files': {
+            'mp3', 'wma', 'ogg', 'wav', 'ra', 'aac', 'mid', 'au', 'aiff',
+        },
+        'Video files': {
+            '264', '3g2', '3gp', 'asf', 'asx', 'avi',
+            'bik', 'dat', 'h264', 'mov', 'mp4', 'mpg', 'qt', 'rm', 'swf', 'wmv',
+            'm4a', 'm4v', 'flv', 'webm', 'mpeg', 'f4v', 'rmvb', 'vob', 'mkv',
+        },
+        'Microsoft Office files': {
+            'xls', 'xlsx', 'ppt', 'pptx', 'pps', 'doc', 'docx',
+            'odt', 'ods', 'odg', 'odp',
+        },
+        'Documents': {
+            'abw', 'pdf', 'djvu ', 'dotm', 'epub', 'mht', 'pages', 'vsd', 'xps'
+        },
+        'Simple text files': {
+            'txt', 'csv', 'xml'
+        },
+        'Possibly dangerous files': {
+            'exe', 'sys', 'com', 'bat', 'bin', 'rss',
+            'dmg', 'iso', 'apk', 'ipa', 'chm', 'class',
+            'dll', 'drv', 'jar', 'js', 'lnk', 'ocx',
+            'pcx', 'scr', 'shs', 'vbs', 'vxd', 'wmf'
+        },
+    }
 
-MEDIA_EXTENSIONS = ['avi', 'mp4', 'wmv', 'mpeg', 'm4v', 'mov', 'asf', 'flv', 'f4v',
-                    'rmvb', 'rm', '3gp', 'vob', 'mkv']
+    NETWORK_RELATED = {
+        'com', 'org', 'net', 'int', 'edu', 'gov', 'mil', 'arpa',
+        'cn', 'xyz', 'info', 'icu', 'top', 'cc', 'de', 'app',
+        'pub', 'do', 'action', 'sg', 'htm', 'html', 'jhtml', 'shtml', 'asp',
+        'aspx', 'jsp', 'jspx', 'php', 'css', 'js'
+    }
 
+    def __init__(self, allow_untrusted=False, guess=True, update_online=False, includes=(), excludes=()):
+        self.untrusted_categories = ('Possibly dangerous files', )
+        self.allow_untrusted = allow_untrusted
+        self.guess = guess
+        if update_online:
+            self._update_online()
+        self._excludes = set(excludes)
+        self._includes = set(includes)
 
-def is_common_filetype(s: str):
-    extensions = COMMON_EXTENSIONS + IGNORED_EXTENSIONS
-    return s.endswith(tuple(extensions))
+    @property
+    def valid_extensions(self):
+        common_extensions = self.COMMON_EXTENSIONS.copy()
+        if not self.allow_untrusted:
+            [common_extensions.pop(key) for key in self.untrusted_categories]
+        valids = set()
+        for each in common_extensions.values():
+            valids = valids | each
+        valids = valids | self._includes
+        for ex in list(self._excludes):
+            valids.discard(ex)
+        return valids
 
+    @property
+    def categories(self):
+        return list(self.COMMON_EXTENSIONS.keys())
 
-def maybe_valid_ext(text: str = "", suffix: str = "", ignored: Optional[List] = None):
-    """return valid file extension if exists"""
-    ext = ""
-    suffix = suffix.strip() or text.strip().split(".")[-1] if "." in text else suffix
-    suffix = suffix.lower()
-    if ignored and suffix in ignored:
+    def _update_online(self):
+        pass
+
+    def get_extensions(self, category=None):
+        return self.COMMON_EXTENSIONS.get(category, set())
+
+    def extract(self, source, source_type='text'):
+        # source_type: text | url
+        source = source.strip().lower()
+        dots_num = source.count('.')
+        splits = []
+        # whether dot in extension
+        for num in range(dots_num + 1):
+            splits.append(source.split('.', maxsplit=num)[-1])
+        for each in splits:
+            if each in self.valid_extensions:
+                return each
+        if not self.guess or not splits:
+            return ""
+        # don't consider extensions like 'tar.gz'
         ext = ""
-    elif suffix in NETWORK_EXTENSIONS:
-        ext = ""
-    elif suffix.isdigit():
-        ext = ""
-    elif re.findall(r"[\u4e00-\u9fa5 \\/\[\]-_]+", suffix):
-        ext = ""
-    elif (len(suffix) <= 7 and suffix.isalnum()) or is_common_filetype(suffix):
-        ext = suffix
-    return ext
-
-
-def maybe_file_description(text, desc=("附件", "下载")):
-    return any(map(lambda x: x in text, desc))
+        suffix = source.split(".")[-1]
+        if suffix in self._excludes:
+            ext = ""
+        elif (source_type.lower() == 'url' or source.startswith(('http', 'www'))) and suffix in self.NETWORK_RELATED:
+            ext = ""
+        elif suffix.isdigit():
+            ext = ""
+        elif re.findall(r"[\u4e00-\u9fa5 \\/\[\]-_]+", suffix):
+            ext = ""
+        elif len(suffix) <= 7 and suffix.isalnum():
+            ext = suffix
+        return ext
 
 
 class FileExtractor(LinkExtractor):
-    def __init__(self, deny_extensions=(), append=True, **kwargs):
-        if append:
-            deny_extensions = deny_extensions + tuple(IGNORED_EXTENSIONS)
-        self.deny_extensions = {'.' + e for e in arg_to_iter(deny_extensions)}
-        kwargs.setdefault('unique', True)
-        super().__init__(**kwargs)
+    """Extract file links from response.
+
+    :param deny_extensions: (tuple) a list of strings containing extensions that
+                            should be ignored when extracting links
+    :param ignore_untrusted: (bool) ignore UNTRUSTED_EXTENSIONS if set to True
+    """
+    def __init__(self, allow_untrusted=False, guess=True, update_online=False,
+                 includes=(), excludes=(), hints=('附件', '下载', '文件', 'download', 'file'),
+                 unique=True, **kwargs):
+        super().__init__(unique=unique, **kwargs)
+
+        self.ext_extractor = FileExtExtractor(allow_untrusted, guess, update_online, includes, excludes)
+        self.hints = hints
 
     def _extension_allowed(self, link):
-        if url_has_any_extension(link["url"], self.deny_extensions):
-            return False
-        if url_has_any_extension(link["title"], self.deny_extensions):
-            return False
-        _maybe_valid_ext = partial(maybe_valid_ext, suffix="")
-        if not any(map(_maybe_valid_ext, (link["title"], link["url"]))):
-            if maybe_file_description(link['title']):
+        title, url = link['title'], link['url']
+        ext_from_title = self.ext_extractor.extract(title, 'text')
+        ext_from_url = self.ext_extractor.extract(url, 'url')
+        if not ext_from_url and not ext_from_title:
+            if title in self.hints and not url.endswith(tuple(self.ext_extractor.NETWORK_RELATED)):
                 return True
             return False
+        link['ext'] = ext_from_title or ext_from_url
         return True
 
     def _process_links(self, links):
@@ -92,9 +156,4 @@ class FileExtractor(LinkExtractor):
         The subclass should override it if necessary
         """
         links = [x for x in links if self._link_allowed(x) and self._extension_allowed(x)]
-        _maybe_valid_ext = partial(maybe_valid_ext, suffix="")
-        for idx, link in enumerate(links):
-            ext = _maybe_valid_ext(link["url"]) or _maybe_valid_ext(link["title"])
-            file_name = link["title"] or f"附件{idx}"
-            link.update({"file_name": file_name, "ext": ext})
         return self._deduplicate_if_needed(links)

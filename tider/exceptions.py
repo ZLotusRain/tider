@@ -1,4 +1,5 @@
 from click import ClickException
+from requests import RequestException, Timeout
 
 
 def reraise(tp, value, tb=None):
@@ -9,7 +10,7 @@ def reraise(tp, value, tb=None):
 
 
 class SpiderShutdown(SystemExit):
-    """Signals that the crawler should perform a warm shutdown."""
+    """Signals that the worker should perform a warm shutdown."""
 
 
 class TiderDeprecationWarning(Warning):
@@ -26,8 +27,38 @@ class DuplicateSpiderWarning(TiderWarning):
     """Multiple spiders are using the same name."""
 
 
+class SecurityWarning(TiderWarning):
+    """Potential security issue found."""
+
+
+class TiderCommandException(ClickException):
+    """A general command exception which stores an exit code."""
+
+    def __init__(self, message, exit_code):
+        super().__init__(message=message)
+        self.exit_code = exit_code
+
+
 class TiderException(Exception):
     """Base class for all Tider errors."""
+
+
+class UnSupportedMethod(TiderException):
+    """Raised when use the unsupported method in class."""
+
+
+class SecurityError(TiderException):
+    """Security related exception."""
+
+
+class ExplorerTimeoutError(TiderException):
+    """Raised when timeout parameter is invalid."""
+
+
+class ContentDecodingError(TiderException):
+    """
+    Decoding of the response failed, due to a malformed encoding.
+    """
 
 
 class WgetError(TiderException):
@@ -58,9 +89,55 @@ class WgetError(TiderException):
         self.output = value
 
 
-class TiderCommandException(ClickException):
-    """A general command exception which stores an exit code."""
+class ReadError(RequestException):
+    """
+    compat for `httpcore.ReadError`
+    """
 
-    def __init__(self, message, exit_code):
-        super().__init__(message=message)
-        self.exit_code = exit_code
+
+class WriteError(RequestException):
+    """
+    compat for `httpcore.WriteError`
+    """
+
+
+class NetworkError(RequestException):
+    """
+    compat for `httpcore.NetworkError`
+    """
+
+
+class UnsupportedProtocol(RequestException):
+    """
+    compat for `httpcore.UnsupportedProtocol`
+    """
+
+
+class ProtocolError(RequestException):
+    """
+    compat for `httpcore.ProtocolError`
+    """
+
+
+class LocalProtocolError(RequestException):
+    """
+    compat for `httpcore.LocalProtocolError`
+    """
+
+
+class RemoteProtocolError(RequestException):
+    """
+    compat for `httpcore.RemoteProtocolError`
+    """
+
+
+class PoolTimeout(Timeout):
+    """
+    compat for `httpcore.PoolTimeout`
+    """
+
+
+class WriteTimeout(Timeout):
+    """
+     compat for `httpcore.WriteError`
+     """

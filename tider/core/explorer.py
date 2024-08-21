@@ -2,69 +2,97 @@
 
 import time
 import logging
-import urllib3
 import requests
-import platform
+import tempfile
 import subprocess
+from threading import Event
 from collections import deque
-from requests.utils import get_encoding_from_headers
+from subprocess import DEVNULL
 
-from tider.concurrency.base import worker
-from tider.concurrency import get_implementation
-from tider.network import ProxyManager, Response
+from tider.session import Session
+from tider.network import ProxyPoolManager, Response
+from tider.platforms import IS_WINDOWS
 from tider.utils.decorators import inthread
 from tider.utils.misc import symbol_by_name, create_instance
 
-urllib3.disable_warnings()
 logger = logging.getLogger(__name__)
 
-PLATFORM_SUPPORTS_WGET = platform.system().upper() == 'LINUX'
-URLLIB3_SUPPORTS_HTTPS = tuple(urllib3.__version__.split('.')) > ('1', '26')
-del platform, urllib3
+PLATFORM_SUPPORTS_WGET = not IS_WINDOWS
+
+
+def _transport(queue, processor, output_handler=None, shutdown_event=None):
+    shutdown_event = shutdown_event or Event()
+    while not shutdown_event.is_set():
+        try:
+            request = queue.popleft()
+            response = processor(request)
+            # don't use thread lock in handler if possible.
+            output_handler and output_handler(response)
+        except IndexError:
+            # switch greenlet if using gevent
+            # when the active one can't get the next request
+            # to avoid keeping loop.
+            time.sleep(0.1)
 
 
 class Explorer:
 
-    def __init__(self, pool=None, concurrency=1, priority_adjust=1, proxy_args=None):
+    def __init__(self, tider, pool=None, concurrency=1, priority_adjust=1,
+                 wget_output_dir="", proxy_args=None):
+        # self.session = Session()
         self.pool = pool
         self.concurrency = concurrency
 
-        self.pm = ProxyManager(proxy_args=proxy_args)
         self.priority_adjust = priority_adjust
+        self.pm = ProxyPoolManager(proxypool_kw=proxy_args, stats=tider.stats)  # proxy_key
+
+        self._wget_output_dir = wget_output_dir
         self.queue = deque()
         self.transferring = set()
         self.running = False
-        self._started = False
+        self._shutdown = Event()
+        self._pool_started = False
 
     @classmethod
-    def from_crawler(cls, crawler):
-        settings = crawler.settings
-        concurrency = settings['CONCURRENCY']
-        pool_cls = get_implementation(settings['POOL'])
-        pool = pool_cls(limit=concurrency, thread_name_prefix="ExplorerWorker")
+    def from_tider(cls, tider):
+        settings = tider.settings
         explorer = cls(
-            pool=pool,
-            concurrency=concurrency,
-            priority_adjust=settings.getint('RETRY_PRIORITY_ADJUST'),
-            proxy_args=settings.getdict('PROXY_PARAMS')
+            tider=tider,
+            pool=tider.create_pool(thread_name_prefix="ExplorerWorker"),
+            concurrency=tider.concurrency,
+            priority_adjust=settings.getint('EXPLORER_RETRY_PRIORITY_ADJUST'),
+            wget_output_dir=settings["WGET_OUTPUT_DIR"],
+            proxy_args=settings.getdict('PROXY_PARAMS'),
         )
         proxy_schemas = settings.getdict('PROXY_SCHEMAS')
         for schema in proxy_schemas:
             proxy_cls = symbol_by_name(proxy_schemas[schema])
-            proxy_ins = create_instance(proxy_cls, settings=settings, crawler=crawler)
-            explorer.pm.register(schema, proxy_ins)
-        explorer.pm.stats = crawler.stats
+            proxy_ins = create_instance(proxy_cls, settings, tider)
+            explorer.register_proxy(schema, proxy_ins)
         return explorer
 
     def active(self):
         return len(self.transferring) + len(self.queue) > 0
 
+    def reset_status(self):
+        """
+        Should not be used in other cases except for broker.
+        """
+        self.queue.clear()
+        # self.queue = deque()  # reference may be changed
+        self.transferring.clear()
+        # self.transferring = set()
+        self.pm.clear()
+
     def close(self, reason):
         self.running = False
-        self.pool.stop()
+        self._shutdown.set()
         self.queue.clear()
+        self.pool.stop()
+        self._pool_started = False
         self.transferring.clear()
         self.pm.close()
+        # self.session.close()
         logger.info("Explorer closed (%(reason)s)", {'reason': reason})
 
     def __enter__(self):
@@ -73,61 +101,92 @@ class Explorer:
     def __exit__(self, *args):
         self.close(reason="finished")
 
+    def register_proxy(self, schema, proxy_ins):
+        self.pm.register(schema, proxy_ins)
+
     def fetch(self, request):
         self.queue.append(request)
 
     def needs_backout(self):
         return len(self.queue) >= self.concurrency * 3
 
-    def reset_proxy(self, request, force=False):
-        reset_proxy = force or request.meta.pop('reset_proxy', False)
-        if reset_proxy and not request.meta.get('new_proxy'):
-            old_proxies = request.proxies.copy() if request.proxies else {}
-            self.pm.reset_proxy(schema=request.proxy_schema, old_proxies=old_proxies)
+    def on_proxy_discard(self, proxy):
+        for each in proxy.values():
+            self.session.evict_manager_for(each)
 
     def build_proxies(self, request):
-        self.reset_proxy(request)  # retry from response
+        # if getattr(request.proxy, '_on_discard') is None:
+        #     # compat for user customized proxies
+        #     setattr(request.proxy, '_on_discard', self.on_proxy_discard)
         new_proxy = request.meta.get('new_proxy', False)
-        proxies = self.pm.get_proxy(request.proxy_schema, request.proxy_params, new_proxy)
-        if proxies:
-            request.request_kwargs.setdefault('verify', False)
-        request.proxies = proxies
+        schema = request.proxy_schema
+        proxypool_kw = request.proxy_params
+        proxy = self.pm.get_proxy(
+            schema=schema,
+            proxy_args=proxypool_kw,
+            disposable=new_proxy,
+            # on_discard=self.on_proxy_discard
+        )
+        request.update_proxy(proxy)
 
     @inthread(name='explorer')
     def async_explore_in_thread(self, output_handler=None):
-        return self.async_explore(output_handler=output_handler)
+        if self.running:
+            raise RuntimeError("Explorer already running")
+        self.running = True
+        if not self._pool_started:
+            self.pool.start()
+        self._pool_started = True
+        self._blocking_transport(output_handler)
+
+    def _blocking_transport(self, output_handler=None):
+        while self.running:
+            while len(self.transferring) < self.concurrency:
+                try:
+                    request = self.queue.popleft()
+                except IndexError:
+                    break
+                self.transferring.add(request)
+                self.pool.apply_async(
+                    target=self.explore, args=(request,),
+                    callback=lambda resp: output_handler and output_handler(resp)
+                )
+            time.sleep(0.01)
 
     def async_explore(self, output_handler=None):
         if self.running:
             raise RuntimeError("Explorer already running")
         self.running = True
-        if not self._started:
+        if not self._pool_started:
             self.pool.start()
-            self._started = True
+        self._pool_started = True
+        # By just passing a reference to the object allows the garbage collector
+        # to free self if nobody else has a reference to it.
+        queue = self.queue
+        processor = self.explore
+        shutdown_event = self._shutdown
         for _ in range(self.concurrency):
             self.pool.apply_async(
-                worker,
-                (self.queue, self.explore, output_handler,
-                 lambda: not self.running)
+                _transport,
+                (queue, processor, output_handler, shutdown_event)
             )
 
-    def _transport(self, request, output_handler=None):
-        response = self.explore(request)
-        self.transferring.remove(request)
-        if output_handler:
-            output_handler(response)
-
-    def try_explore(self, request):
-        while True:
-            response = self.explore(request)
-            if isinstance(response, Response):
-                return response
-            else:
-                request = response
+    def _transport(self, output_handler=None):
+        while self.running:
+            try:
+                request = self.queue.popleft()
+                response = self.explore(request)
+                # don't use thread lock in handler if possible.
+                output_handler and output_handler(response)
+            except IndexError:
+                # switch greenlet if using gevent
+                # when the active one can't get the next request
+                # to avoid keeping loop.
+                time.sleep(0.1)
 
     def explore(self, request):
         self.transferring.add(request)
-        request.meta['elapsed'] = time.perf_counter()
+        request.meta['elapsed'] = time.time()
         if request.delay:
             time.sleep(request.delay)
         self.build_proxies(request)
@@ -142,18 +201,27 @@ class Explorer:
                 "%(reason)s",
                 {'request': request, 'retry_times': retry_times, 'reason': response.reason}
             )
-        self.transferring.remove(request)
+        self.transferring.discard(request)
         response.meta.pop('elapsed', None)
         return response
 
     def _wget_download(self, request):
-        cmd = request.to_wget()
-        timeout = request.request_kwargs.get("timeout", 50)
+        ntf = tempfile.NamedTemporaryFile(dir=self._wget_output_dir)
+        cmd = request.to_wget(output=ntf.name)
+        request.fetch_proxies()  # to increase used_times
+        timeout = request.request_kwargs.get("timeout") or 60
+        timeout = max(timeout, 100)
         try:
-            subprocess.run(cmd, timeout=timeout, check=True)
+            subprocess.run(cmd, timeout=timeout, check=True, stdout=DEVNULL, stderr=DEVNULL)
             response = self.build_response(request)
+            response.raw = ntf
+            response.url = request.url
             response.status_code = 200
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            returncode = getattr(e, 'returncode', None)
+            if returncode in (1, 4, 5, 7, 8) or isinstance(e, subprocess.TimeoutExpired):
+                request.forbid_proxy()
+            ntf.close()
             response = self.get_retry_request(request, None, str(e))
         return response
 
@@ -161,13 +229,17 @@ class Explorer:
         url = request.url
         # use `request.request_kwargs` directly may lead memory leak on CentOS.
         kwargs = request.request_kwargs.copy()
+        proxies = request.fetch_proxies()
+        kwargs.update(proxies=proxies)
+
         session = request.meta.get("session")
         resp = None
         try:
             if session:
                 resp = session.request(url=url, **kwargs)
             else:
-                resp = requests.request(url=url, **kwargs)
+                with Session() as session:
+                    resp = session.request(url=url, **kwargs)
             if request.raise_for_status:
                 resp.raise_for_status()
             response = self.build_response(request, resp)
@@ -175,49 +247,37 @@ class Explorer:
             ignored_status_code = request.ignored_status_codes
             status_code = resp.status_code
             if str(status_code).startswith("4"):
-                self.reset_proxy(request, force=True)
+                request.forbid_proxy()
             if status_code not in ignored_status_code:
                 response = self.get_retry_request(request, resp, reason=str(e))
-                if str(status_code).startswith("5"):
+                if str(status_code) == "500":
+                    time.sleep(2)
+                elif str(status_code).startswith("5"):
                     time.sleep(1)
             else:
                 response = self.build_response(request, resp)
         except (requests.ConnectionError, requests.Timeout,
-                requests.exceptions.ChunkedEncodingError) as e:
-            self.reset_proxy(request, force=True)
+                requests.exceptions.ChunkedEncodingError, requests.TooManyRedirects) as e:
+            if isinstance(e, (requests.ConnectionError, requests.Timeout)):
+                request.forbid_proxy()
+            resp = getattr(e, 'response', resp)
             response = self.get_retry_request(request, resp, reason=str(e))
         except Exception as e:
+            resp = getattr(e, 'response', resp)
             response = self.build_response(request, resp)
             reason = response.reason or str(e)
             response.fail(reason=reason)
         del kwargs
         return response
 
-    def build_response(self, request, resp=None):
-        response = Response(request)
-        if resp is not None:
-            response.status_code = resp.status_code
-            response.url = resp.url
-            response.headers = resp.headers
-            response.cookies = resp.cookies
-            response.raw = resp
-            response.reason = resp.reason
-        response.elapsed = time.perf_counter() - request.meta['elapsed']
-        response.encoding = request.encoding or self._encoding_from_content_type(response.headers)
-        return response
-
     @staticmethod
-    def _encoding_from_content_type(headers):
-        content_type = headers.get("Content-Type", "")
-        charset = list(filter(lambda x: "charset" in x, content_type.split(";")))
-
-        if not charset:
-            encoding = get_encoding_from_headers(headers)
-            if "text" in content_type:
-                encoding = None  # maybe "ISO-8859-1" or 'UTF-8'
+    def build_response(request, resp=None):
+        if resp is not None:
+            resp.request = request
         else:
-            encoding = charset[0].split("=")[-1]
-        return encoding
+            resp = Response(request)
+        response = resp
+        return response
 
     def get_retry_request(self, request, resp, reason):
         retry_times = request.meta.get('retry_times', 0) + 1

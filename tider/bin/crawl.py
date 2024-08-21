@@ -21,7 +21,9 @@ import os
 import sys
 import click
 import logging
-from tider.platforms import detached
+
+from tider.platforms import EX_OK, EX_FAILURE, detached
+from tider.bin.base import TiderDaemonCommand
 
 
 logger = logging.getLogger(__name__)
@@ -42,57 +44,46 @@ def detach(path, argv, logfile=None, pidfile=None, uid=None,
             if executable is not None:
                 path = executable
             os.execv(path, [path] + argv)
+            return EX_OK
         except Exception:  # pylint: disable=broad-except
             logger.critical("Can't exec %r", ' '.join([path] + argv),
                             exc_info=True)
+            return EX_FAILURE
 
 
-@click.command(context_settings={'allow_extra_args': True})
-@click.option('-s',
-              '--spider')
-@click.option('--producer',
-              is_flag=True)
-@click.option('--worker',
-              is_flag=True)
-@click.option('--worker-concurrency',
-              type=int,
-              default=1,
-              help="Number of workers to consume from message queue")
+@click.command(cls=TiderDaemonCommand,
+               context_settings={'allow_extra_args': True})
+@click.option('-n',
+              '--name',
+              type=str,
+              help='Unique spider name.')
 @click.option('-D',
               '--detach',
               is_flag=True,
               default=False,
-              help="Start crawler as a background process.")
+              help="Start tider as a background process.")
 @click.pass_context
-def crawl(ctx, spider, uid=None, gid=None, pidfile=None, **kwargs):
-    if not spider:
-        raise click.UsageError("Unable to detect valid spider")
-
-    is_worker = kwargs.get('worker')
-    is_producer = kwargs.get('producer')
-    if is_worker and is_producer:
-        raise click.UsageError("Can not assign crawler different roles")
-
-    crawler_role = 'crawler'
-    if is_worker:
-        crawler_role = 'worker'
-    elif is_producer:
-        crawler_role = 'producer'
-    ctx.obj.update_setting('CRAWLER_ROLE', crawler_role, 'cmdline')
-    ctx.obj.update_setting('WORKER_CONCURRENCY', kwargs['worker_concurrency'], 'cmdline')
-
+def crawl(ctx, name, uid=None, gid=None, pidfile=None, **kwargs):
     if kwargs.get('detach', False):
         argv = ['-m', 'tider'] + sys.argv[1:]
         if '--detach' in argv:
             argv.remove('--detach')
         if '-D' in argv:
             argv.remove('-D')
+        if ctx.obj.tider.settings.getbool('LOG_FILE_ENABLED'):
+            logfile = ctx.obj.tider.settings.get('LOG_FILE')
+            logdir = ctx.obj.tider.settings.get('LOG_DIRECTORY', '/')
+            logfile = os.path.join(logdir, logfile)
+        else:
+            logfile = None
         return detach(sys.executable,
                       argv,
+                      logfile=logfile,
                       pidfile=pidfile,
                       uid=uid, gid=gid,
                       umask=kwargs.get('umask', None),
                       workdir=kwargs.get('workdir', None),
                       executable=kwargs.get('executable', None),
                       )
-    ctx.obj.crawl(spider)
+    spider_kwargs = dict(x.split("=", 1) for x in ctx.args)
+    ctx.obj.tider.crawl(name=name, **spider_kwargs)
