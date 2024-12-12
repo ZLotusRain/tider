@@ -275,7 +275,7 @@ class Promise:
         Schedule every pending child.
         If every node is resolved, then the promise is resolved.
         """
-        for node in self.root.next_nodes:
+        for node in iter_generator(self.root.next_nodes):
             if not isinstance(node, PromiseNode):
                 yield node  # invalid child
                 continue

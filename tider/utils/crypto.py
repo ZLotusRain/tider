@@ -5,13 +5,23 @@ import base64
 import hashlib
 import urllib.parse
 
-from Crypto.Cipher import AES, DES
+from Crypto.PublicKey import RSA
+from Crypto.Cipher import AES, DES, PKCS1_v1_5
 from Crypto.Util.Padding import pad, unpad
 from binascii import b2a_hex, a2b_hex
 
 from tider.utils.log import get_logger
 
 logger = get_logger(__name__)
+
+
+def rsa_encrypt(public_key, message):
+    if "-----BEGIN PUBLIC KEY-----\n" not in public_key:
+        public_key = '-----BEGIN PUBLIC KEY-----\n' + public_key + '\n-----END PUBLIC KEY-----'
+    key = RSA.importKey(public_key)
+    cipher = PKCS1_v1_5.new(key)
+    encrypted_message = cipher.encrypt(message.encode())
+    return base64.b64encode(encrypted_message).decode()
 
 
 def unescape(string):
@@ -52,7 +62,7 @@ def encrypt(source, key, method, mode="ECB", iv=None, block_size=16, style="pkcs
             result = b2a_hex(result).decode()
             # result = result.hex()
     except ValueError as e:
-        logger.error(f">>> {method}加密失败[{e}]")
+        logger.error(f"Failed to encrypt message by {method}, reason: {e}")
     return result
 
 
@@ -87,7 +97,7 @@ def decrypt(source, key, method, mode="ECB", iv=None, block_size=16, style="pkcs
         result = unpad(result, block_size, style)
         result = result.decode("utf-8")
     except ValueError as e:
-        logger.error(f">>> {method}加密失败[{e}]")
+        logger.error(f"Failed to decrypt message by {method}, reason: {e}")
     return result
 
 

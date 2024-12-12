@@ -43,6 +43,10 @@ class Broker(threading.Thread):
         self.daemon = True
         self.name = name or self.__class__.__name__
 
+    @property
+    def transport_id(self):
+        return None
+
     def on_crash(self, msg, *fmt, **kwargs):
         print(msg.format(*fmt), file=sys.stderr)
         traceback.print_exc(None, sys.stderr)

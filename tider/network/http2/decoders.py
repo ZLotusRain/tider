@@ -126,7 +126,6 @@ class BrotliDecoder(ContentDecoder):
             raise ImportError(
                 "Using 'BrotliDecoder', but neither of the 'brotlicffi' or 'brotli' "
                 "packages have been installed. "
-                "Make sure to install httpx using `pip install httpx[brotli]`."
             ) from None
 
         self.decompressor = brotli.Decompressor()

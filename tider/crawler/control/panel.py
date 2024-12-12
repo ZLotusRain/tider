@@ -99,7 +99,7 @@ def settings(state, **kwargs):
 
 @inspect_command(default_timeout=1)
 def stats(state, **kwargs):
-    s = state.crawler.stats.get_stats().copy()
+    s = state.crawler.dump_stats()
     return s
 
 
@@ -150,8 +150,6 @@ def engine(state, **kwargs):
         'len(crawler.engine.parser.queue)': len(state.crawler.engine.parser.queue),
         'len(crawler.engine.explorer.transferring)': len(state.crawler.engine.explorer.transferring),
         'len(crawler.engine.parser.parsing)': len(state.crawler.engine.parser.parsing),
-        'crawler.engine.explorer.transferring': exploring(state),
-        'crawler.engine.parser.parsing': parsing(state),
     }
     return result
 
@@ -159,7 +157,7 @@ def engine(state, **kwargs):
 @inspect_command(default_timeout=3)
 def sse(state, **kwargs):
     s1 = state.crawler.settings.table(with_defaults=True, censored=True)
-    s2 = state.crawler.stats.get_stats().copy()
+    s2 = state.crawler.dump_stats()
     e = {
         'time()-crawler.engine.start_time': time.time() - state.crawler.engine.start_time,
         'crawler.engine.active()': state.crawler.engine.active(),
@@ -225,4 +223,4 @@ def objgraph(state, num=200, max_depth=10, type='Request'):  # pragma: no cover
 @control_command()
 def shutdown(state, msg='Got shutdown from remote', **kwargs):
     logger.warning(msg)
-    raise SpiderShutdown(msg)
+    raise SpiderShutdown(0)

@@ -1,3 +1,4 @@
+import time
 import random
 import inspect
 import urllib3
@@ -75,7 +76,7 @@ class ProxyContainer:
         if isinstance(result, dict):
             self.newed += 1
             self.stats and self.stats.inc_value('proxy/count')
-            return Proxy(proxies=result, disposable=disposable, on_discard=on_discard)
+            return Proxy(proxies=result, disposable=disposable, on_discard=on_discard, keepalive_expiry=60)
         typename = type(result).__name__
         raise TypeError(f"Received unexpected type {typename!r} from "
                         f"{self._proxypool.__class__.__name__}.get_proxy")
@@ -176,7 +177,7 @@ class ProxyPoolManager:
 class Proxy:
 
     def __init__(self, proxies=None, disposable=False, on_discard=None,
-                 timeout=None, max_used_times=None):
+                 keepalive_expiry=None, max_used_times=None):
         proxies = dict(proxies) if proxies else {}
         for proxy_key in proxies:
             proxy = proxies[proxy_key]
@@ -196,7 +197,8 @@ class Proxy:
         self._actives = 0  # nums of requests bound to this proxy.
         self._invalid = False
         self._discarded = False
-        self._timeout = timeout
+        self._expire_at = None
+        self._keepalive_expiry = keepalive_expiry
         self._used_times = 0
         if disposable:
             max_used_times = 1
@@ -229,6 +231,7 @@ class Proxy:
     def connect(self):
         with self._lock:
             self._used_times += 1
+            self._expire_at = None
             if not self.valid:
                 raise ProxyError("Can't connect to the invalid proxy.")
             self._actives += 1
@@ -238,6 +241,9 @@ class Proxy:
             self._actives -= 1
             if invalidate or self.disposable:
                 self.invalidate()
+            if self._keepalive_expiry is not None and self._actives <= 0:
+                now = time.monotonic()
+                self._expire_at = now + self._keepalive_expiry
         self.discard()
 
     def invalidate(self):
@@ -281,8 +287,10 @@ class Proxy:
         we consider it as invalid.
         """
         valid = not (self._invalid or self._discarded)
-        if self._timeout is not None:
-            valid = valid and self.elapsed < self._timeout
+        if self._expire_at is not None:
+            now = time.monotonic()
+            # if we don't use lock here, `_expire_at` will be None anytime.
+            valid = valid and now <= (self._expire_at or now)
         if self._max_used_times is not None and self._max_used_times > 0:
             valid = valid and self._used_times <= self._max_used_times
         return valid

@@ -5,6 +5,7 @@ class BrokersManager:
 
     transports = {
         'default': 'tider.brokers:DummyBroker',
+        'files': 'tider.brokers.files:FilesBroker',
         'redis': 'tider.brokers.amqp:AMQPBroker',
         'amqp': 'tider.brokers.amqp:AMQPBroker',
         'amqps': 'tider.brokers.amqp:AMQPBroker',

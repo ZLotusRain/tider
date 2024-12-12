@@ -139,6 +139,7 @@ def _redis_brpop_read(self, **options):
 
 
 def qos_append(self, message, delivery_tag):
+    """append message to unacked_key if using ack after consumed from queues."""
     delivery = message.delivery_info
     EX, RK = delivery['exchange'], delivery['routing_key']
 
@@ -164,10 +165,14 @@ def qos_append(self, message, delivery_tag):
 
 def qos_restore_by_tag(self, tag, client=None, leftmost=False):
 
-    def restore_transaction(pipe):
+    def restore_transaction(pipe, use_client=False):
         p = pipe.hget(self.unacked_key, tag)
-        pipe.multi()
-        self._remove_from_indices(tag, pipe)
+        if not use_client:
+            pipe.multi()
+            self._remove_from_indices(tag, pipe)
+        else:
+            client.zrem(self.unacked_index_key, tag)
+            client.hdel(self.unacked_key, tag)
         if p:
             M, EX, RK = loads(bytes_to_str(p))  # json is unicode
             self.channel._do_restore_message(M, EX, RK, pipe, leftmost)
@@ -178,12 +183,7 @@ def qos_restore_by_tag(self, tag, client=None, leftmost=False):
         except redis.ResponseError as e:
             warn(f'Restoring unacked in-memory message failed by redis pipeline, '
                  f'try using redis client directly instead, reason: {e}')
-            p = client.hget(self.unacked_key, tag)
-            client.zrem(self.unacked_index_key, tag)
-            client.hdel(self.unacked_key, tag)
-            if p:
-                M, EX, RK = loads(bytes_to_str(p))  # json is unicode
-                self.channel._do_restore_message(M, EX, RK, client, leftmost)
+            restore_transaction(pipe=client, use_client=True)
 
 
 def create_channel(self, connection, raw_create_channel):
@@ -627,32 +627,40 @@ class AMQPBroker(Broker):
     def _restore_messages(self, consumer):
         chan = consumer.channel
 
-        if hasattr(chan, '_do_restore_message'):
-            def restore_transaction(pipe):
-                data = pipe.hgetall(chan.unacked_key)
-                # don't use multi here to avoid keys of command in MULTI calls must be in same slot.
-                # pipe.multi()
-                count = 0
-                for tag, P in data.items():
-                    tag = bytes_to_str(tag)
-                    if not P:
-                        continue
-                    M, EX, RK = loads(bytes_to_str(P))  # json is unicode
-                    if RK:
-                        count += 1
-                        # delete after successfully restore.
-                        # lpush if leftmost else rpush.
-                        chan._do_restore_message(M, EX, RK, pipe, leftmost=False)
+        if not hasattr(chan, '_do_restore_message'):
+            return
+
+        def restore_transaction(pipe, use_client=False):
+            data = pipe.hgetall(chan.unacked_key)
+            pipe.multi()
+            # don't use multi here to avoid keys of command in MULTI calls must be in same slot.
+            # pipe.multi()
+            count = 0
+            for tag, P in data.items():
+                tag = bytes_to_str(tag)
+                if not P:
+                    continue
+                M, EX, RK = loads(bytes_to_str(P))  # json is unicode
+                if RK:
+                    count += 1
+                    # delete after successfully restore.
+                    # lpush if leftmost else rpush.
+                    chan._do_restore_message(M, EX, RK, pipe, leftmost=False)
+                    if not use_client:
+                        pipe.zrem(chan.unacked_index_key, tag).hdel(chan.unacked_key, tag)
+                    else:
                         pipe.zrem(chan.unacked_index_key, tag)
                         pipe.hdel(chan.unacked_key, tag)
-                logger.info(f'Restored {count} messages from {chan.unacked_key}')
+            logger.info(f'Restored {count}/{len(data)} message(s) from {chan.unacked_key}')
 
-            # restore at start.
-            with chan.conn_or_acquire() as client:
-                try:
-                    client.transaction(restore_transaction, chan.unacked_key)
-                except Exception as e:
-                    logger.exception(f"Restoring messages from {chan.unacked_key} failed, reason: {e}")
+        # restore at start.
+        with chan.conn_or_acquire() as client:
+            try:
+                client.transaction(restore_transaction, chan.unacked_key)
+            except Exception as e:
+                logger.warning(f'Restoring messages from {chan.unacked_key} failed by redis pipeline, '
+                               f'try using redis client directly instead, reason: {e}')
+                restore_transaction(pipe=client, use_client=True)
 
     def consume(self, queues=None, on_message=None, on_message_consumed=None):
         on_decode_error = self.on_decode_error
@@ -681,10 +689,11 @@ class AMQPBroker(Broker):
         try:
             while not self._stopped.is_set():
                 try:
-                    on_message_consumed()
                     connection.drain_events(timeout=2.0)
+                    on_message_consumed()
                     logged = False
                 except socket.timeout:
+                    on_message_consumed()
                     if not logged:
                         logger.info(f"Waiting for messages from {','.join([queue.name for queue in consumer.queues])}")
                     logged = True
@@ -699,12 +708,13 @@ class AMQPBroker(Broker):
                     consumer.on_message = on_message
                     consumer.consume()
                     self._restore_messages(consumer)
+                    on_message_consumed()
                 except OSError:
                     if self.crawler.crawling:
                         raise
         finally:
             ignore_errors(connection, consumer.close)
-            connection.release()
+            connection.close()
 
     def stop(self):
         self._stopped.set()

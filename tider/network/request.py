@@ -1,4 +1,5 @@
 import copy
+import time
 import hashlib
 import inspect
 from http.cookiejar import CookieJar
@@ -112,6 +113,7 @@ class PreparedRequest(_PreparedRequest):
         if cookies is not None:
             if isinstance(cookies, CookieJar):
                 cookies = copy_cookie_jar(cookies)
+            p.headers.pop('Cookie', None)  # avoid cookies can't be updated to empty.
             p.prepare_cookies(cookies)
 
         if p.body is None:
@@ -154,7 +156,7 @@ class Request:
 
     def __init__(self, url, callback=None, cb_kwargs=None, errback=None, encoding=None, priority=0,
                  meta=None, dup_check=False, allow_redirects=True, timeout=None, raise_for_status=True,
-                 ignored_status_codes=(400, 521), stream=None, verify=None, cert=None, http2=False,
+                 ignored_status_codes=(400, 412, 521), stream=None, verify=None, cert=None, http2=False,
                  proxies=None, proxy_schema=0, proxy_params=None, max_retries=5, max_parse_times=1,
                  impersonate=None, delay=0, downloader=None, prepared=None, session_cookies=None, **request_kwargs):
 
@@ -162,7 +164,7 @@ class Request:
         if prepared is not None:
             self._prepared = prepared.copy()
         else:
-            self._prepared = self._prepare(url=url, **request_kwargs)
+            self._prepared = self._prepare(url=url.strip(), **request_kwargs)
 
         if not isinstance(session_cookies, CookieJar):
             session_cookies = cookiejar_from_dict(session_cookies)
@@ -195,6 +197,8 @@ class Request:
 
         self.impersonate = impersonate
         self.delay = delay
+        if delay:
+            self.meta["explore_after"] = time.monotonic() + delay  # add or update when using replace.
         self.max_retries = max_retries
         self.max_parse_times = max_parse_times
 

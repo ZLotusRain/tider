@@ -57,7 +57,7 @@ class Pidbox:
     def start(self):
         self.node.channel = self.crawler.connection.channel()
         self.consumer = self.node.listen(callback=self.on_message)
-        self.consumer.consume()  # if needed
+        # self.consumer.consume()  # already consumed in listen
         self.consumer.on_decode_error = self.on_decode_error
 
     @staticmethod

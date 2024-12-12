@@ -1,4 +1,3 @@
-import gc
 import time
 import socket
 from threading import Event
@@ -107,7 +106,8 @@ class HeartEngine:
                     break
 
                 while (
-                    not self._needs_backout()
+                    self.active()  # double check to make sure terminate immediately.
+                    and not self._needs_backout()
                     and not self._overload()
                     and self._next_request_from_scheduler() is not None
                 ):
@@ -118,10 +118,11 @@ class HeartEngine:
                     try:
                         request = next(start_requests)
                     except StopIteration:
-                        start_requests = None
-                    except Exception:
                         if hasattr(start_requests, 'close'):
-                            start_requests.close()
+                            start_requests = start_requests.close()
+                    except BaseException:
+                        if hasattr(start_requests, 'close'):
+                            start_requests = start_requests.close()
                         logger.error('Error while obtaining start requests', exc_info=True)
                     else:
                         request and self.schedule_request(request)
@@ -138,6 +139,8 @@ class HeartEngine:
                     and not self._overload()
                     and self._next_request_from_scheduler() is not None
             ):
+                # don't judge spider_closed event because the spider_closed
+                # event will be set after start_requests iterated in dummy broker.
                 pass
             first_loop = False
             # maybe switch greenlet
@@ -196,7 +199,6 @@ class HeartEngine:
                 return self.close_spider(spider, reason='shutdown')
             if self.explorer.session:
                 self.explorer.session.close_expired_connections()
-            gc.collect()
         self.close_spider(spider, reason='finished')
 
     def _needs_backout(self):
@@ -240,6 +242,10 @@ class HeartEngine:
 
         return on_response
 
+    def force_clean(self):
+        self.explorer.queue.clear()
+        self.parser.queue.clear()
+
     def close(self):
         """Gracefully close the engine."""
         if self.running:
@@ -257,10 +263,10 @@ class HeartEngine:
 
         if self.spider is not None:
             self.close_spider(self.spider, reason="shutdown")
-
-        self.explorer.close(reason='shutdown')
-        self.parser.close(reason='shutdown')
-        self.scheduler.close(reason='shutdown')
+        else:
+            self.explorer.close(reason='shutdown')
+            self.parser.close(reason='shutdown')
+            self.scheduler.close(reason='shutdown')
         signals.engine_stopped.send(sender=self.crawler.hostname)
 
     def close_spider(self, spider, reason="cancelled"):
@@ -276,9 +282,10 @@ class HeartEngine:
         consumed_time = int(end_time - self.crawler.stats.get_value('time/start_time', end_time))
         self.crawler.stats.set_value("time/consumed_time", consumed_time)
 
+        # keep the order
+        self.parser.close(reason=reason)
         self.broker.stop()
         self.explorer.close(reason=reason)
-        self.parser.close(reason=reason)
         self.scheduler.close(reason=reason)
 
         self.spider.close(reason=reason)

@@ -1,17 +1,51 @@
 import os
-from contextlib import contextmanager
+import logging
 from typing import Union
+from contextlib import contextmanager
 
 import oss2
-from oss2 import Bucket, Service
+from oss2.compat import to_string
 from oss2.models import PartInfo
 from oss2 import determine_part_size, SizedFileAdapter
-
+from oss2 import http, exceptions, models, Bucket, Service
 
 from tider.network import Response
 from tider.utils.log import get_logger
+from tider.exceptions import ResponseReadError
 
 logger = get_logger(__name__)
+oss_logger = logging.getLogger('oss2.api')
+
+
+class DoBucket(Bucket):
+
+    def _do(self, method, bucket_name, key, **kwargs):
+        key = to_string(key)
+        req = http.Request(method, self._make_url(bucket_name, key),
+                           app_name=self.app_name,
+                           proxies=self.proxies,
+                           region=self.region,
+                           product=self.product,
+                           cloudbox_id=self.cloudbox_id,
+                           **kwargs)
+        self.auth._sign_request(req, bucket_name, key)
+
+        resp = self.session.do_request(req, timeout=self.timeout)
+        if resp.status // 100 != 2:
+            e = exceptions.make_exception(resp)  # only consumed 4090 bytes here.
+            resp.read()
+            resp.response.close()
+            oss_logger.info("Exception: {0}".format(e))
+            raise e
+
+        # Note that connections are only released back to the pool for reuse once all body data has been read;
+        # be sure to either set stream to False or read the content property of the Response object.
+        # For more details, please refer to http://docs.python-requests.org/en/master/user/advanced/#keep-alive.
+        content_length = models._hget(resp.headers, 'content-length', int)
+        if content_length is not None and content_length == 0:
+            resp.read()
+
+        return resp
 
 
 class AliOSSFilesStore:
@@ -45,7 +79,7 @@ class AliOSSFilesStore:
 
     def get_bucket(self, bucket_name):
         bucket_name = bucket_name or self._bucket_name
-        return oss2.Bucket(auth=self.auth, endpoint=self._endpoint, bucket_name=bucket_name)
+        return DoBucket(auth=self.auth, endpoint=self._endpoint, bucket_name=bucket_name)
 
     def list_buckets(self):
         service = oss2.Service(self.auth, self._endpoint, connect_timeout=self.timeout)
@@ -68,7 +102,7 @@ class AliOSSFilesStore:
         with self._close_session(bucket):
             try:
                 # delete an empty bucket
-                bucket.delete_bucket()
+                bucket.delete_bucket().resp.response.close()
             except oss2.exceptions.BucketNotEmpty:
                 logger.exception('bucket is not empty.')
             except oss2.exceptions.NoSuchBucket:
@@ -84,12 +118,14 @@ class AliOSSFilesStore:
         bucket = self.get_bucket(bucket_name)
         with self._close_session(bucket):
             root = eval("oss2.%s" % root)
-            bucket.put_bucket_acl(root)
+            bucket.put_bucket_acl(root).resp.response.close()
 
     def delete_object(self, filename, bucket_name):
         bucket = self.get_bucket(bucket_name)
         with self._close_session(bucket):
-            return bucket.delete_object(filename)
+            res = bucket.delete_object(filename)
+            res.resp.response.close()
+            return res
 
     def upload_resume(self, key, filename, bucket_name):
         bucket = self.get_bucket(bucket_name)
@@ -117,7 +153,9 @@ class AliOSSFilesStore:
                 parts.append(PartInfo(part_number, result.etag))
                 offset += num_to_upload
                 part_number += 1
-        bucket.complete_multipart_upload(filename, upload_id, parts)
+                result.resp.response.close()
+        res = bucket.complete_multipart_upload(filename, upload_id, parts)
+        res.resp.response.close()
         parts.clear()
 
     @staticmethod
@@ -127,26 +165,31 @@ class AliOSSFilesStore:
         parts = []
         part_number = 1
         upload_id = bucket.init_multipart_upload(filename).upload_id
-        for chunk in buf.iter_content(chunk_size=1024 * 100):
-            # max chunk size = 8*1024
-            upload_chunk.append(chunk)
-            upload_chunk_length += len(chunk)
-            # chunk size not equal to upload_chunk_length
-            if upload_chunk_length < 1024 * 100:
-                continue
-            upload_chunk = b''.join(upload_chunk)
-            result = bucket.upload_part(filename, upload_id, part_number, upload_chunk)
-            parts.append(PartInfo(part_number, result.etag, size=len(upload_chunk)))
-            part_number += 1
-            # reset
-            upload_chunk = []
-            upload_chunk_length = 0
-        if upload_chunk:
-            upload_chunk = b''.join(upload_chunk)
-            result = bucket.upload_part(filename, upload_id, part_number, upload_chunk)
-            parts.append(PartInfo(part_number, result.etag, size=len(upload_chunk)))
-        upload_chunk.clear()
-        bucket.complete_multipart_upload(filename, upload_id, parts)
+        try:
+            for chunk in buf.iter_content(chunk_size=1024 * 100):
+                # max chunk size = 8*1024
+                upload_chunk.append(chunk)
+                upload_chunk_length += len(chunk)
+                # chunk size not equal to upload_chunk_length
+                if upload_chunk_length < 1024 * 100:
+                    continue
+                upload_chunk = b''.join(upload_chunk)
+                result = bucket.upload_part(filename, upload_id, part_number, upload_chunk)
+                parts.append(PartInfo(part_number, result.etag, size=len(upload_chunk)))
+                part_number += 1
+                # reset
+                upload_chunk = []
+                upload_chunk_length = 0
+                result.resp.response.close()
+            if upload_chunk:
+                upload_chunk = b''.join(upload_chunk)
+                result = bucket.upload_part(filename, upload_id, part_number, upload_chunk)
+                parts.append(PartInfo(part_number, result.etag, size=len(upload_chunk)))
+                result.resp.response.close()
+            res = bucket.complete_multipart_upload(filename, upload_id, parts)
+            res.resp.response.close()
+        except ResponseReadError as e:
+            logger.error(f"Failed to upload response content to oss, reason: {e}")
 
     def persist_file(self, path, buf, bucket_name=None, **_):
         bucket = self.get_bucket(bucket_name)
@@ -154,7 +197,8 @@ class AliOSSFilesStore:
             if isinstance(buf, Response):
                 self.upload_response_content(bucket, path, buf)
             elif isinstance(buf, bytes):
-                bucket.put_object(path, buf)
+                res = bucket.put_object(path, buf)
+                res.resp.response.close()
             elif isinstance(buf, str) and os.path.exists(buf):
                 # bucket.put_object_from_file(key=path, filename=buf)
                 self.upload_local_file(bucket, path, buf)
@@ -167,7 +211,9 @@ class AliOSSFilesStore:
         with self._close_session(bucket):
             try:
                 meta_info = bucket.get_object_meta(path)
-                return {'last_modified': meta_info.headers["Last-Modified"], 'checksum': meta_info.headers["ETag"]}
+                result = {'last_modified': meta_info.headers["Last-Modified"], 'checksum': meta_info.headers["ETag"]}
+                meta_info.resp.response.close()
+                return result
             except oss2.exceptions.OssError:
                 return {}
 

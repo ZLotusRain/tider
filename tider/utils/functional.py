@@ -89,18 +89,29 @@ def retry_over_time(fun, catch, args=None, kwargs=None, errback=None,
                 time.sleep(abs(int(tts) - tts))
 
 
-def iter_generator(iterable):
+def noop(*args, **kwargs):
+    """No operation.
+
+    Takes any arguments/keyword arguments and does nothing.
+    """
+
+
+def iter_generator(iterable, sleep=time.sleep):
     if iterable is None:
         iterable = []
     if not hasattr(iterable, '__iter__'):
         iterable = [iterable]
     it = iter(iterable)
-    while True:
-        try:
-            yield next(it)
-        except StopIteration:
-            break
-        time.sleep(0.01)
-    if hasattr(iterable, 'close'):
-        iterable.close()
-    del iterable
+    try:
+        while True:
+            try:
+                yield next(it)
+            except StopIteration:
+                break
+            sleep(0.01)
+    except BaseException as e:
+        raise e
+    finally:
+        if hasattr(iterable, 'close'):
+            iterable.close()
+        del iterable

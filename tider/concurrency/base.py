@@ -19,7 +19,9 @@ def apply_target(target, args=(), kwargs=None, callback=None, propagate=(), **_)
         ret = target(*args, **kwargs)
     except (SpiderShutdown, SpiderTerminate):
         raise
-    except (propagate, Exception):
+    except propagate:
+        raise
+    except Exception:
         raise
     except BaseException as exc:
         try:
