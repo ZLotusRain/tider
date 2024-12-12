@@ -1,4 +1,4 @@
-"""Spider name utilities."""
+"""Crawler name utilities."""
 import socket
 from typing import Optional
 from functools import partial

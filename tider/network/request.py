@@ -1,4 +1,3 @@
-import copy
 import time
 import hashlib
 import inspect
@@ -8,10 +7,16 @@ from w3lib.url import canonicalize_url
 from typing import Optional
 
 from requests import PreparedRequest as _PreparedRequest
+from requests.exceptions import (
+    InvalidJSONError,
+    InvalidURL,
+    MissingSchema,
+)
 from requests.structures import CaseInsensitiveDict
 from requests.cookies import cookiejar_from_dict, merge_cookies
 
 from tider.network.proxy import Proxy
+from tider.exceptions import InvalidRequest
 from tider.utils.log import get_logger
 from tider.utils.serialize import pickle_loads
 from tider.utils.network import copy_cookie_jar
@@ -19,6 +24,8 @@ from tider.utils.curl import curl_to_request_kwargs
 from tider.utils.misc import symbol_by_name, to_bytes
 
 logger = get_logger(__name__)
+
+REQUEST_PREPARE_ERRORS = (InvalidJSONError, InvalidURL, MissingSchema, ValueError)
 
 
 _fingerprint_cache = WeakKeyDictionary()
@@ -70,28 +77,27 @@ class PreparedRequest(_PreparedRequest):
         **_
     ):
         """Prepares the entire request with the given parameters."""
-
-        self.prepare_method(method)
-        self.prepare_url(url, params)
-        headers = headers or {}
-        # Remove keys that are set to None.
-        none_keys = [k for (k, v) in headers.items() if v is None]
-        for key in none_keys:
-            del headers[key]
-        self.prepare_headers(headers)
-        if isinstance(cookies, CookieJar):
-            cookies = copy_cookie_jar(cookies)
-        self.prepare_cookies(cookies)
-        if self.body is None:
-            self.prepare_body(data, files, json)
-        # Note that prepare_auth must be last to enable authentication schemes
-        # such as OAuth to work on a fully prepared request.
-        self.prepare_auth(self.auth, url)
+        try:
+            self.prepare_method(method)
+            self.prepare_url(url, params)
+            headers = headers or {}
+            # Remove keys that are set to None.
+            none_keys = [k for (k, v) in headers.items() if v is None]
+            for key in none_keys:
+                del headers[key]
+            self.prepare_headers(headers)
+            self.prepare_cookies(cookies)
+            if self.body is None:
+                self.prepare_body(data, files, json)
+            # Note that prepare_auth must be last to enable authentication schemes
+            # such as OAuth to work on a fully prepared request.
+            self.prepare_auth(self.auth, url)
+        except REQUEST_PREPARE_ERRORS as e:
+            raise InvalidRequest('Failed to prepare request.') from e
 
     @property
     def cookies(self):
-        # use deepcopy instead of copy_cookie_jar to avoid ResourceWarning.
-        return copy.deepcopy(self._cookies)
+        return copy_cookie_jar(self._cookies)
 
     def copy_with(self, method=None, url=None, headers=None, files=None, data=None,
                   params=None, auth=None, cookies=None, json=None, body=None, body_position=None):
@@ -99,30 +105,31 @@ class PreparedRequest(_PreparedRequest):
         p = PreparedRequest(auth=auth, body=body, body_position=body_position)
         p.method = method.upper() if method is not None else self.method
 
-        if url is not None:
-            p.prepare_url(url, params)
-        else:
-            p.url = self.url
-
-        if headers is not None:
-            p.prepare_headers(headers)
-        else:
-            p.headers = self.headers.copy()
-
-        cookies = cookies if cookies is not None else self.cookies
-        if cookies is not None:
-            if isinstance(cookies, CookieJar):
-                cookies = copy_cookie_jar(cookies)
-            p.headers.pop('Cookie', None)  # avoid cookies can't be updated to empty.
-            p.prepare_cookies(cookies)
-
-        if p.body is None:
-            if data or files or json:
-                p.prepare_body(data, files, json)
+        try:
+            if url is not None:
+                p.prepare_url(url, params)
             else:
-                p.body = self.body
-        if auth is not None:
-            p.prepare_auth(auth, p.url)
+                p.url = self.url
+
+            if headers is not None:
+                p.prepare_headers(headers)
+            else:
+                p.headers = self.headers.copy()
+
+            cookies = cookies if cookies is not None else self.cookies
+            if cookies is not None:
+                p.headers.pop('Cookie', None)  # avoid cookies can't be updated to empty.
+                p.prepare_cookies(cookies)
+
+            if p.body is None:
+                if data or files or json:
+                    p.prepare_body(data, files, json)
+                else:
+                    p.body = self.body
+            if auth is not None:
+                p.prepare_auth(auth, p.url)
+        except REQUEST_PREPARE_ERRORS as e:
+            raise InvalidRequest('Failed to copy request with specific arguments.') from e
         return p
 
     def copy(self):
@@ -157,14 +164,15 @@ class Request:
     def __init__(self, url, callback=None, cb_kwargs=None, errback=None, encoding=None, priority=0,
                  meta=None, dup_check=False, allow_redirects=True, timeout=None, raise_for_status=True,
                  ignored_status_codes=(400, 412, 521), stream=None, verify=None, cert=None, http2=False,
-                 proxies=None, proxy_schema=0, proxy_params=None, max_retries=5, max_parse_times=1,
-                 impersonate=None, delay=0, downloader=None, prepared=None, session_cookies=None, **request_kwargs):
+                 proxies=None, proxy_schema=0, proxy_params=None, max_retries=5, max_parse_times=1, delay=0,
+                 downloader=None, impersonate=None, prepared=None, session_cookies=None, **request_kwargs):
 
         self._encoding = encoding
+        url = url.strip()
         if prepared is not None:
             self._prepared = prepared.copy()
         else:
-            self._prepared = self._prepare(url=url.strip(), **request_kwargs)
+            self._prepared = self._prepare(url=url, **request_kwargs)
 
         if not isinstance(session_cookies, CookieJar):
             session_cookies = cookiejar_from_dict(session_cookies)
@@ -197,7 +205,7 @@ class Request:
 
         self.impersonate = impersonate
         self.delay = delay
-        if delay:
+        if delay and delay > 0:
             self.meta["explore_after"] = time.monotonic() + delay  # add or update when using replace.
         self.max_retries = max_retries
         self.max_parse_times = max_parse_times
@@ -390,6 +398,8 @@ class Request:
             "errback": _find_method(spider, self.errback) if callable(self.errback) else self.errback
         }
         for attr in (*self.__dict__.keys(), *self.INTERNAL_ATTRIBUTES):
+            if attr.startswith("_"):
+                continue
             value = getattr(self, attr)
             if attr == 'prepared':
                 d.update(value.to_dict())

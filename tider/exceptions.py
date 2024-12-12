@@ -74,7 +74,15 @@ class SecurityError(TiderException):
     """Security related exception."""
 
 
+class StoreError(TiderException):
+    """Failed to persist file."""
+
+
 class DownloadError(TiderException):
+    pass
+
+
+class InvalidRequest(DownloadError):
     pass
 
 

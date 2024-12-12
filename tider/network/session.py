@@ -19,6 +19,7 @@ from tider import Request
 from tider.network.proxy import Proxy
 from tider.network.user_agent import default_user_agent
 from tider.utils.log import get_logger
+from tider.utils.network import cookiejar_from_str
 from tider.utils.misc import symbol_by_name, build_from_crawler
 
 logger = get_logger(__name__)
@@ -89,6 +90,8 @@ class Session:
         'default': 'tider.network.downloaders:HTTPDownloader',
         'wget': 'tider.network.downloaders:WgetDownloader',
         'impersonate': 'tider.network.downloaders:ImpersonateDownloader',
+        'playwright': 'tider.network.downloaders:PlaywrightDownloader',
+        'dp': 'tider.network.downloaders:DrissionPageDownloader',
     }
 
     __attrs__ = [
@@ -229,7 +232,8 @@ class Session:
     def download_request(self, request: Request):
         request.prepared.prepare_headers(merge_setting(request.headers, self.headers))
 
-        cookies = request.cookies
+        h_cookie = request.headers.pop("Cookie", None)
+        cookies = request.cookies or cookiejar_from_str(h_cookie)
         # Merge with session cookies
         merged_cookies = merge_cookies(
             merge_cookies(RequestsCookieJar(), self.cookies), cookies
@@ -252,8 +256,11 @@ class Session:
         if not downloader:
             raise RuntimeError(f"Can't load downloader `{downloader}`")
 
-        result = downloader.download_request(request, session_cookies=request.session_cookies, trust_env=self.trust_env)
-        return result
+        response = downloader.download_request(request, session_cookies=request.session_cookies, trust_env=self.trust_env)
+        if request.method.upper() == 'HEAD':
+            # avoid using stream and HEAD together
+            response.read()
+        return response
 
     def close(self):
         for downloader in self._downloaders.values():

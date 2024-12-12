@@ -128,7 +128,7 @@ def _basic_auth_str(username, password):
     return authstr
 
 
-def _urllib3_request_context(url, verify, client_cert) -> (Dict[str, Any], Dict[str, Any]):
+def _urllib3_request_context(url, verify, client_cert, poolmanager) -> (Dict[str, Any], Dict[str, Any]):
     parsed_request_url = urlparse(url)
     scheme = parsed_request_url.scheme.lower()
     port = parsed_request_url.port
@@ -138,21 +138,23 @@ def _urllib3_request_context(url, verify, client_cert) -> (Dict[str, Any], Dict[
         "port": port,
     }
 
+    poolmanager_kwargs = getattr(poolmanager, "connection_pool_kw", {})
+    has_poolmanager_ssl_context = poolmanager_kwargs.get("ssl_context")
+    should_use_default_ssl_context = (
+            _preloaded_ssl_context is not None and not has_poolmanager_ssl_context
+    )
+
     pool_kwargs = {}
     cert_reqs = "CERT_NONE"
     if scheme.startswith("https") and verify:
         cert_reqs = "CERT_REQUIRED"
-        if isinstance(verify, str):
+        if should_use_default_ssl_context:
+            pool_kwargs["ssl_context"] = _preloaded_ssl_context
+        elif isinstance(verify, str):
             if not os.path.isdir(verify):
                 pool_kwargs["ca_certs"] = verify
             else:
                 pool_kwargs['ca_cert_dir'] = verify
-        else:
-            if _preloaded_ssl_context is not None:
-                pool_kwargs["ssl_context"] = _preloaded_ssl_context
-            else:
-                pool_kwargs["ca_certs"] = extract_zipped_paths(DEFAULT_CA_BUNDLE_PATH)
-
     pool_kwargs["cert_reqs"] = cert_reqs
     if client_cert is not None:
         if isinstance(client_cert, tuple) and len(client_cert) == 2:
@@ -416,8 +418,6 @@ class HTTPDownloader(RedirectMixin):
         else:
             # clear proxymanager once the proxy is finalized.
             proxy_key = (proxy.weak(), selected_proxy)
-            weakref.finalize(proxy, self._clear_invalid_proxy, selected_proxy)
-
             proxy_headers = {}
             username, password = get_auth_from_url(selected_proxy)
             if username:
@@ -430,6 +430,7 @@ class HTTPDownloader(RedirectMixin):
                 block=self._pool_block,
                 **proxy_kwargs,
             )
+            weakref.finalize(proxy, self._on_proxy_collected, proxy_key=proxy_key)
 
         return manager
 
@@ -465,12 +466,6 @@ class HTTPDownloader(RedirectMixin):
     def get_connection(self, url, proxy=None, http2=False, verify=False, cert=None):
         """Returns a urllib3 connection pool for the given URL."""
         http2_pool_kwargs = {'http2': http2, 'verify': verify, 'cert': cert}
-        try:
-            host_params, pool_kwargs = _urllib3_request_context(url, verify, cert)
-        except ValueError as e:
-            raise InvalidURL(e)
-        pool_kwargs.update(http2_pool_kwargs)
-
         selected_proxy = proxy.select_proxy(url)
         if selected_proxy:
             proxy_url = parse_url(selected_proxy)
@@ -479,12 +474,18 @@ class HTTPDownloader(RedirectMixin):
                     "Please check proxy URL. It is malformed "
                     "and could be missing the host."
                 )
-            proxy_manager = self.proxy_manager_for(proxy, selected_proxy)
-            conn = proxy_manager.connection_from_host(**host_params, pool_kwargs=pool_kwargs)
+            manager = self.proxy_manager_for(proxy, selected_proxy)
         else:
-            # Only scheme should be lower case
-            conn = self.poolmanager.connection_from_host(**host_params, pool_kwargs=pool_kwargs)
+            manager = self.poolmanager
 
+        try:
+            host_params, pool_kwargs = _urllib3_request_context(url, verify, cert, poolmanager=manager)
+        except ValueError as e:
+            raise InvalidURL(e)
+        pool_kwargs.update(http2_pool_kwargs)
+
+        # Only scheme should be lower case
+        conn = manager.connection_from_host(**host_params, pool_kwargs=pool_kwargs)
         return conn
 
     def close(self):
@@ -497,14 +498,17 @@ class HTTPDownloader(RedirectMixin):
         for proxy in self.proxy_manager.values():
             proxy.clear()
 
-    def _clear_invalid_proxy(self, selected_proxy=None):
-        for proxy_key in list(iter(self.proxy_manager.keys())):
-            proxy, proxy_str = proxy_key
-            proxy = proxy()
-            if selected_proxy == proxy_str:
-                manager = self.proxy_manager.pop(proxy_key, None)
+    def _on_proxy_collected(self, proxy_key):
+        for key in list(iter(self.proxy_manager.keys())):
+            if key[1] == proxy_key[1]:
+                manager = self.proxy_manager.pop(key, None)
                 manager and manager.clear()
-            elif not proxy or not proxy.valid:
+
+    def _clear_invalid_proxy(self):
+        for proxy_key in list(iter(self.proxy_manager.keys())):
+            proxy_ref, proxy_str = proxy_key
+            proxy = proxy_ref()
+            if not proxy or not proxy.valid:
                 # maybe timeout.
                 manager = self.proxy_manager.pop(proxy_key, None)
                 manager and manager.clear()
@@ -588,7 +592,6 @@ class HTTPDownloader(RedirectMixin):
             return response
         finally:
             request.proxy.disconnect()
-            self._clear_invalid_proxy()
 
     def send(self, request, http2=False, timeout=None, verify=True, cert=None, proxy=None):
         """Sends PreparedRequest object. Returns Response-like object."""

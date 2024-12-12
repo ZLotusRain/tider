@@ -1,8 +1,10 @@
 import queue
 import threading
 from abc import abstractmethod
-from typing import Any, Optional
+from typing import Any, Optional, Dict, List, Iterable
 
+from tider.utils.url import parse_url_host
+from tider.utils.collections import DummyLock
 from tider.utils.misc import build_from_crawler
 
 
@@ -46,7 +48,10 @@ class BaseQueue(metaclass=_BaseQueueMeta):
 
 class PriorityQueue:
     """A priority queue implemented using multiple internal queues (typically,
-    FIFO queues). It uses one internal queue for each priority value."""
+    FIFO queues). It uses one internal queue for each priority value.
+
+    Only integer priorities should be used. Lower numbers are higher priorities.
+    """
 
     @classmethod
     def from_crawler(cls, crawler, downstream_queue_cls, startprios=()):
@@ -77,23 +82,26 @@ class PriorityQueue:
             self.crawler,
         )
         if not isinstance(downstream_queue, BaseQueue):
-            raise ValueError("Priority downstream queue must be the subclass of `BaseQueue`")
+            raise ValueError("Priority downstream queue must be the subclass of `tider.pqueues.BaseQueue`")
         return downstream_queue
 
+    def priority(self, request) -> int:
+        return -request.priority
+
     def push(self, request):
-        priority = request.priority
+        priority = self.priority(request)
         with self.priority_change:
             if priority not in self.queues:
                 self.queues[priority] = self.qfactory()
             q = self.queues[priority]
             q.push(request)  # this may fail (eg. serialization error)
-            if self.curprio is None or priority < self.curprio:
-                self.curprio = priority
+        if self.curprio is None or priority < self.curprio:
+            self.curprio = priority
 
     def pop(self):
+        if self.curprio is None:
+            return None
         with self.priority_change:
-            if self.curprio is None:
-                return
             q = self.queues[self.curprio]
             m = q.pop()
             if not q:
@@ -101,7 +109,7 @@ class PriorityQueue:
                 q.close()
                 prios = [p for p, q in self.queues.items() if q]
                 self.curprio = min(prios) if prios else None
-            return m
+        return m
 
     def peek(self):
         """Returns the next object to be returned by :meth:`pop`,
@@ -110,9 +118,9 @@ class PriorityQueue:
         Raises :exc:`NotImplementedError` if the underlying queue class does
         not implement a ``peek`` method, which is optional for queues.
         """
+        if self.curprio is None:
+            return None
         with self.priority_change:
-            if self.curprio is None:
-                return None
             curprio_queue = self.queues[self.curprio]
             return curprio_queue.peek()
 
@@ -125,6 +133,126 @@ class PriorityQueue:
 
     def __len__(self):
         return sum(len(x) for x in list(iter(self.queues.values()))) if self.queues else 0
+
+
+class ExplorerInterface:
+    def __init__(self, crawler):
+        assert crawler.engine
+        self.explorer = crawler.engine.explorer
+
+    def stats(self, possible_slots: Iterable[str]):
+        return [(self._dispatched_concurrency(slot), slot) for slot in possible_slots]
+
+    def get_slot_key(self, request) -> str:
+        url = request.url
+        domain = parse_url_host(url)
+        if domain in self.explorer.domain_concurrency:
+            return domain
+        if url in self.explorer.api_concurrency:
+            return url
+
+        return 'unlimited'
+
+    def _dispatched_concurrency(self, slot):
+        if slot == 'unlimited':
+            return self.explorer.concurrency
+        if slot in self.explorer.domain_concurrency:
+            return len(self.explorer.domain_concurrency[slot]) or self.explorer.concurrency + 1
+        # maybe not available
+        return len(self.explorer.api_concurrency[slot]) or self.explorer.concurrency + 1
+
+
+class ExplorerAwarePriorityQueue:
+    """PriorityQueue which takes Explorer activity into account:
+    domains/urls with the available slots and the least amount of dispatched concurrency are dequeued
+    first.
+    """
+
+    @classmethod
+    def from_crawler(cls, crawler, downstream_queue_cls, startprios=None):
+        return cls(crawler, downstream_queue_cls, startprios)
+
+    def __init__(self, crawler, downstream_queue_cls, slot_startprios=None):
+        if slot_startprios and not isinstance(slot_startprios, dict):
+            raise ValueError(
+                "ExplorerAwarePriorityQueue accepts "
+                "``slot_startprios`` as a dict; "
+                f"{slot_startprios.__class__!r} instance "
+                "is passed. Most likely, it means the state is"
+                "created by an incompatible priority queue. "
+                "Only a crawl started with the same priority "
+                "queue class can be resumed."
+            )
+
+        self._explorer_interface = ExplorerInterface(crawler)
+        self.downstream_queue_cls = downstream_queue_cls
+        self.crawler = crawler
+        self._slot_mutex = threading.Lock()
+        self._dummy_mutex = DummyLock()
+
+        self.pqueues: Dict[str, PriorityQueue] = {}  # slot -> priority queue
+        for slot, startprios in (slot_startprios or {}).items():
+            self.pqueues[slot] = self.pqfactory(startprios)
+        self.pqueues.setdefault('unlimited', self.pqfactory())
+
+    def pqfactory(
+            self, startprios: Iterable[int] = ()
+    ) -> PriorityQueue:
+        return PriorityQueue(
+            self.crawler,
+            self.downstream_queue_cls,
+            startprios,
+        )
+
+    def pop(self):
+        stats = self._explorer_interface.stats(self.pqueues)
+
+        if not stats:
+            return None
+
+        slot = min(stats)[1]
+        slot_queue = self.pqueues[slot]
+        request = slot_queue.pop()
+        if slot != 'unlimited':
+            with self._slot_mutex:
+                if len(slot_queue) == 0 and slot in self.pqueues:
+                    del self.pqueues[slot]
+        return request
+
+    def push(self, request):
+        slot = self._explorer_interface.get_slot_key(request)
+        mutex = self._slot_mutex if slot != 'unlimited' else self._dummy_mutex
+        with mutex:
+            if slot not in self.pqueues:
+                self.pqueues[slot] = self.pqfactory()
+            slot_queue = self.pqueues[slot]
+            slot_queue.push(request)
+
+    def peek(self):
+        """Returns the next object to be returned by :meth:`pop`,
+        but without removing it from the queue.
+
+        Raises :exc:`NotImplementedError` if the underlying queue class does
+        not implement a ``peek`` method, which is optional for queues.
+        """
+        stats = self._explorer_interface.stats(self.pqueues)
+        if not stats:
+            return None
+        slot = min(stats)[1]
+        with self._slot_mutex:
+            slot_queue = self.pqueues[slot]
+            return slot_queue.peek()
+
+    def close(self) -> Dict[str, List[int]]:
+        active = {slot: q.close() for slot, q in self.pqueues.items()}
+        self.pqueues.clear()
+        return active
+
+    def __len__(self) -> int:
+        return sum(len(x) for x in list(self.pqueues.values())) if self.pqueues else 0
+
+    def __contains__(self, slot: str) -> bool:
+        return slot in self.pqueues
 
 
 class LifoMemoryQueue(queue.LifoQueue):

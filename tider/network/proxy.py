@@ -7,6 +7,7 @@ from datetime import timedelta
 from threading import RLock
 from abc import abstractmethod
 from typing import Union, List
+from contextlib import suppress
 
 from urllib.parse import urlparse
 
@@ -66,38 +67,42 @@ class ProxyContainer:
             result = tmp
         if isinstance(result, list):
             result = random.choice(result)
-        if isinstance(result, Proxy):
-            return result
         if isinstance(result, str):
             if result.lower().startswith('socks'):
                 result = {'socks': result}
             else:
                 result = {'https': result, 'http': result}
         if isinstance(result, dict):
+            result = Proxy(proxies=result, disposable=disposable, on_discard=on_discard, pool=self, keepalive_expiry=60)
+        if isinstance(result, Proxy):
+            result._pool = self
             self.newed += 1
             self.stats and self.stats.inc_value('proxy/count')
-            return Proxy(proxies=result, disposable=disposable, on_discard=on_discard, keepalive_expiry=60)
+            return result
         typename = type(result).__name__
         raise TypeError(f"Received unexpected type {typename!r} from "
                         f"{self._proxypool.__class__.__name__}.get_proxy")
 
     def clear(self):
-        for proxy in self._queue:
-            proxy.invalidate()
-            proxy.discard()
-        self._queue[:] = []
+        for proxy in list(self._queue):
+            proxy.discard(force=True)
+        del self._queue[:]
+
+    def remove(self, proxy):
+        with suppress(ValueError):
+            self._queue.remove(proxy)
 
     def _get(self):
         """
         get the shortest valid proxy.
         """
         valids = []
-        for proxy in self._queue:
+        for proxy in list(self._queue):
             if not proxy.valid:
-                proxy.discard()
+                proxy.discard(force=True)
             else:
                 valids.append(proxy)
-        return min(valids, key=lambda x: x.elapsed)
+        return max(valids, key=lambda x: x.elapsed)
 
     def get_proxy(self, disposable=False, on_discard=None, **kwargs):
         if disposable:
@@ -165,19 +170,17 @@ class ProxyPoolManager:
         self.stats and self.stats.set_value(f'proxy/count/{schema}', container.newed)
         return proxy
 
-    def clear(self):
-        for container in self.containers.values():
-            container.clear()
-
     def close(self):
         for container in self.containers.values():
             container.close()
 
+    clear = close
+
 
 class Proxy:
 
-    def __init__(self, proxies=None, disposable=False, on_discard=None,
-                 keepalive_expiry=None, max_used_times=None):
+    def __init__(self, proxies=None, disposable=False, keepalive_expiry=None, max_used_times=None,
+                 on_discard=None, pool=None):
         proxies = dict(proxies) if proxies else {}
         for proxy_key in proxies:
             proxy = proxies[proxy_key]
@@ -189,10 +192,9 @@ class Proxy:
         self._init_time = preferred_clock()
         self._disposable = disposable
 
-        self._on_discard = []
-        if on_discard is not None:
-            self.add_errback(on_discard)
+        self._on_discard = on_discard
         self._lock = RLock()
+        self._pool = pool
 
         self._actives = 0  # nums of requests bound to this proxy.
         self._invalid = False
@@ -219,12 +221,6 @@ class Proxy:
     def elapsed(self):
         return timedelta(seconds=preferred_clock() - self._init_time)
 
-    def add_errback(self, errback):
-        if errback in self._on_discard:
-            # avoid adding duplicate errbacks.
-            return
-        self._on_discard.append(errback)
-
     def weak(self):
         return weakref.ref(self)
 
@@ -237,14 +233,15 @@ class Proxy:
             self._actives += 1
 
     def disconnect(self, invalidate=False):
+        if invalidate or self.disposable:
+            self.invalidate()
         with self._lock:
             self._actives -= 1
-            if invalidate or self.disposable:
-                self.invalidate()
             if self._keepalive_expiry is not None and self._actives <= 0:
                 now = time.monotonic()
                 self._expire_at = now + self._keepalive_expiry
-        self.discard()
+        if not self.valid:
+            self.discard()
 
     def invalidate(self):
         """
@@ -264,19 +261,20 @@ class Proxy:
             if not force and (self._actives > 0 or self.valid):
                 return
 
+            if self._pool is not None:
+                self._pool.remove(self)
+            self._pool = None
             self._discarded = True
             # may affect speed due to the RecentlyUsedContainer lock.
-            for errback in self._on_discard:
-                errback(proxy=self)
+            if self._on_discard is not None:
+                self._on_discard(proxy=self)
             del self._on_discard
 
     def __enter__(self):
         self.connect()
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        invalidate = False
-        if isinstance(exc_val, ProxyError):
-            invalidate = True
+        invalidate = isinstance(exc_val, ProxyError)
         self.disconnect(invalidate=invalidate)
 
     @property

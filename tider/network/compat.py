@@ -1,5 +1,7 @@
+import sys
 import time
 import queue
+import http.client
 import email.message
 from typing import Union
 
@@ -109,17 +111,26 @@ class RecentlyUsedContainer(_RecentlyUsedContainer):
         super().__init__(maxsize=maxsize, dispose_func=dispose_func)
         self.clean_func = clean_func
 
+    def __getitem__(self, key):
+        # Re-insert the item if item has not expired, moving it to the end of the eviction line.
+        with self.lock:
+            item = self._container.pop(key)
+            if hasattr(item, 'has_expired') and item.has_expired():
+                if self.dispose_func:
+                    self.dispose_func(item)
+                raise KeyError(key)
+            self._container[key] = item
+            return item
+
     def clean_up(self):
         if not self.clean_func:
             return
-        with self.lock:
-            for key in list(iter(self._container.keys())):
-                item = self._container[key]
-                self.clean_func(item)
-                if hasattr(item, 'has_expired') and item.has_expired():
-                    item = self._container.pop(key)
-                    if self.dispose_func:
-                        self.dispose_func(item)
+        # don't use lock here to avoid stuck.
+        for key in list(iter(self._container.keys())):
+            item = self.get(key)
+            if item is None:
+                continue
+            self.clean_func(item)
 
 
 class ExpirableConnection:
@@ -134,24 +145,58 @@ class ExpirableConnection:
         self._expire_at = None
 
     def deactivate(self):
-        if self._keepalive_expiry is not None:
-            now = time.monotonic()
-            self._expire_at = now + self._keepalive_expiry
-        # drop prior request buffer
-        del self._buffer[:]
-
-        # drop prior response because the body has already
-        # been read before putting back the connection.
-        # not recommended to access response like this.
-        response = self._HTTPConnection__response
-        if response:
-            self._HTTPConnection__response = None
-            response.close()
+        if not self._keepalive_expiry or self._keepalive_expiry < 0:
+            return
+        if self._expire_at is not None:
+            return
+        now = time.monotonic()
+        self._expire_at = now + self._keepalive_expiry
 
     def has_expired(self):
         now = time.monotonic()
         keepalive_expired = self._expire_at is not None and now > self._expire_at
         return keepalive_expired
+
+    if sys.version_info < (3, 11, 4):
+
+        def _tunnel(self) -> None:
+            _MAXLINE = http.client._MAXLINE  # type: ignore[attr-defined]
+            connect = b"CONNECT %s:%d HTTP/1.0\r\n" % (  # type: ignore[str-format]
+                self._tunnel_host.encode("ascii"),  # type: ignore[union-attr]
+                self._tunnel_port,
+            )
+            headers = [connect]
+            for header, value in self._tunnel_headers.items():  # type: ignore[attr-defined]
+                headers.append(f"{header}: {value}\r\n".encode("latin-1"))
+            headers.append(b"\r\n")
+            # Making a single send() call instead of one per line encourages
+            # the host OS to use a more optimal packet size instead of
+            # potentially emitting a series of small packets.
+            self.send(b"".join(headers))
+            del headers
+
+            response = self.response_class(self.sock, method=self._method)  # type: ignore[attr-defined]
+            try:
+                (version, code, message) = response._read_status()  # type: ignore[attr-defined]
+
+                if code != http.HTTPStatus.OK:
+                    self.close()
+                    raise OSError(f"Tunnel connection failed: {code} {message.strip()}")
+                while True:
+                    line = response.fp.readline(_MAXLINE + 1)
+                    if len(line) > _MAXLINE:
+                        raise http.client.LineTooLong("header line")
+                    if not line:
+                        # for sites which EOF without sending a trailer
+                        break
+                    if line in (b"\r\n", b"\n", b""):
+                        break
+
+                    if self.debuglevel > 0:
+                        print("header:", line.decode())
+            finally:
+                # https://github.com/urllib3/urllib3/pull/3252
+                response.close()
 
 
 class ExpirableHTTPConnection(ExpirableConnection, HTTPConnection):
@@ -183,9 +228,12 @@ class ConnectionPool:
         self._expire_at = None
 
     def deactivate(self):
-        if self._keepalive_expiry is not None:
-            now = time.monotonic()
-            self._expire_at = now + self._keepalive_expiry
+        if not self._keepalive_expiry or self._keepalive_expiry < 0:
+            return
+        if self._expire_at is not None:
+            return
+        now = time.monotonic()
+        self._expire_at = now + self._keepalive_expiry
 
     def has_expired(self):
         now = time.monotonic()
@@ -211,7 +259,8 @@ class ConnectionPool:
 
         try:
             conn = self.pool.get(block=self.block, timeout=timeout)
-            conn and conn.activate()
+            if conn and conn.has_expired():
+                conn.close()  # connection won't be dropped even closed.
         except AttributeError:  # self.pool is None
             raise ClosedPoolError(self, "Pool is closed.") from None  # Defensive:
 
@@ -234,6 +283,7 @@ class ConnectionPool:
                 conn = None
 
         self.activate()
+        conn and conn.activate()
         return conn or self._new_conn()
 
     def _put_conn(self, conn):
@@ -255,14 +305,18 @@ class ConnectionPool:
         if self.pool is not None:
             try:
                 self.pool.put(conn, block=False)
+                if self.pool.full():
+                    # maybe not retrieved again.
+                    self.deactivate()
                 return  # Everything is dandy, done.
             except AttributeError:
                 # self.pool is None.
-                pass
+                self.deactivate()
             except queue.Full:
                 # Connection never got put back into the pool, close it.
                 if conn:
                     conn.close()
+                self.deactivate()
 
                 if self.block:
                     # This should never happen if you got the conn from self._get_conn
@@ -276,9 +330,7 @@ class ConnectionPool:
                     self.host,
                     self.pool.qsize(),
                 )
-            if self.pool.full():
-                self.deactivate()
-        from queue import Queue
+
         # Connection never got put back into the pool, close it.
         if conn:
             conn.close()
@@ -297,22 +349,13 @@ class HTTPSConnectionPool(ConnectionPool, _HTTPSConnectionPool, _HTTPConnectionP
 def close_expired_connections(
     connectionpool: Union[HTTPConnectionPool, HTTPSConnectionPool]
 ):
-    # the connectionpool will not be used before cleaned up.
-    # LIFO pool
-    valids = []
-    while True:
-        try:
-            conn = connectionpool.pool.get(block=False)
+    # the connection pool(LIFO) will not be used before cleaned up if with container lock.
+    try:
+        # avoid deque mutated during iteration
+        for idx in range(len(connectionpool.pool.queue)):
+            conn = connectionpool.pool.queue[idx]
             if conn and conn.has_expired():
-                conn.close()
-                conn = None
-            valids.append(conn)
-        except (AttributeError, queue.Empty):
-            # pool is None:
-            break
-    while valids:
-        conn = valids.pop()
-        try:
-            connectionpool.pool.put(conn, block=False)
-        except (AttributeError, queue.Full):
-            conn and conn.close()
+                conn.close()  # no need to remove from pool.
+    except (AttributeError, IndexError):
+        # pool is None:
+        pass

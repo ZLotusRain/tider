@@ -70,25 +70,15 @@ def hello(state, from_node, **kwargs):
     #     Outside of this scope that is a function.
     if from_node != state.hostname:
         logger.info('sync with %s', from_node)
-        # Do not send expired items to the other worker.
+        # Do not send expired items to the other crawler.
         return {
             'clock': state.app.clock.forward(),
         }
 
 
-@inspect_command(visible=False)
-def sames(state, from_node, **kwargs):
-    """Request same hostnames."""
-    # pylint: disable=redefined-outer-name
-    # XXX Note that this redefines `revoked`:
-    #     Outside of this scope that is a function.
-    if from_node == state.hostname:
-        return ok('pong')
-
-
 @inspect_command(default_timeout=0.2)
 def ping(state, **kwargs):
-    """Ping worker(s)."""
+    """Ping crawler(s)."""
     return ok('pong')
 
 
@@ -104,16 +94,11 @@ def stats(state, **kwargs):
 
 
 @inspect_command(default_timeout=5)
-def exploring(state):
+def transferring(state):
     results = []
-    requests = state.crawler.engine.explorer.transferring
+    requests = list(state.crawler.engine.explorer.transferring)
     for request in requests:
-        try:
-            rd = request.to_dict(spider=state.crawler.spider)
-        except AttributeError as e:
-            if 'callback' in str(e):
-                continue
-            raise e
+        rd = request.to_dict(spider=state.crawler.spider)
         for key in rd:
             try:
                 json.dumps(rd[key])
@@ -126,7 +111,7 @@ def exploring(state):
 @inspect_command(default_timeout=5)
 def parsing(state):
     results = []
-    requests = state.crawler.engine.parser.parsing
+    requests = list(state.crawler.engine.parser.parsing)
     for request in requests:
         rd = request.to_dict(spider=state.crawler.spider)
         for key in rd:
@@ -138,12 +123,20 @@ def parsing(state):
     return results
 
 
+@inspect_command(default_timeout=5)
+def slots(state):
+    priority_queue = state.crawler.engine.scheduler.priority_queue
+    pqueues = dict(priority_queue.pqueues)
+    return {slot: len(pqueues[slot]) for slot in pqueues}
+
+
 @inspect_command(default_timeout=1)
 def engine(state, **kwargs):
     result = {
         'time()-crawler.engine.start_time': time.time() - state.crawler.engine.start_time,
         'crawler.engine.active()': state.crawler.engine.active(),
         'crawler.engine._overload()': state.crawler.engine._overload(),
+        'crawler.engine._spider_closed.is_set()': state.crawler.engine._spider_closed.is_set(),
         'crawler.engine.explorer.needs_backout()': state.crawler.engine.explorer.needs_backout(),
         'len(state.crawler.engine.scheduler)': len(state.crawler.engine.scheduler),
         'len(crawler.engine.explorer.queue)': len(state.crawler.engine.explorer.queue),
@@ -162,6 +155,7 @@ def sse(state, **kwargs):
         'time()-crawler.engine.start_time': time.time() - state.crawler.engine.start_time,
         'crawler.engine.active()': state.crawler.engine.active(),
         'crawler.engine._overload()': state.crawler.engine._overload(),
+        'crawler.engine._spider_closed.is_set()': state.crawler.engine._spider_closed.is_set(),
         'crawler.engine.explorer.needs_backout()': state.crawler.engine.explorer.needs_backout(),
         'len(state.crawler.engine.scheduler)': len(state.crawler.engine.scheduler),
         'len(crawler.engine.explorer.queue)': len(state.crawler.engine.explorer.queue),

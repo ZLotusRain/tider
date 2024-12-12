@@ -1,12 +1,12 @@
 import re
-import codecs
 import json
+import codecs
 import mimetypes
 import charset_normalizer
 from bs4 import BeautifulSoup
 from html import unescape as html_unescape
 from urllib.parse import urljoin, unquote
-from typing import Optional
+from typing import Optional, Callable
 
 from requests.models import REDIRECT_STATI
 from requests.structures import CaseInsensitiveDict
@@ -14,8 +14,10 @@ from requests.cookies import cookiejar_from_dict, merge_cookies, RequestsCookieJ
 from requests.utils import guess_json_utf
 
 from tider import Request
+from tider.utils.log import get_logger
 from tider.exceptions import DownloadError, HTTPError, ResponseReadError, ResponseStreamConsumed
 
+logger = get_logger(__name__)
 
 SPACE_CHARACTERS = ["&nbsp;", "&ensp;", "&emsp;", "&thinsp;",
                     "&zwnj;", "&zwj;", "&#x0020;", "&#x0009;",
@@ -63,10 +65,10 @@ class Response:
         'request', 'status_code', 'url', 'headers', 'encoding',
         'cookies', 'reason', 'raw', 'version', 'elapsed', '_error',
         '_redirect_target', '_content', '_content_consumed',
-        '_cached_text', '_cached_selector'
+        '_cached_text', '_cached_selector', 'on_consumed',
     )
 
-    def __init__(self, request: Optional[Request] = None):
+    def __init__(self, request: Optional[Request] = None, on_consumed: Optional[Callable] = None):
         # Final URL location of Response.
         self.url = None
 
@@ -89,13 +91,19 @@ class Response:
         self._cached_selector = None
 
         self.raw = None
+        self.on_consumed = on_consumed
         self._error = None
 
     @classmethod
-    def dummy(cls, text, url=None, request=None, encoding=None):
+    def dummy(cls, content=None, text=None, url=None, request=None, encoding=None):
         response = cls(request)
         response.url = url or 'about:blank'
-        response._cached_text = text
+        response._content_consumed = True
+        response._content = None
+        if content:
+            response._content = content
+        elif text:
+            response._cached_text = text
         response.encoding = encoding or 'utf-8'
         return response
 
@@ -155,6 +163,12 @@ class Response:
             # error, self._error = self._error, None
             raise self._error
 
+    def check_length(self):
+        """Can't use this with iter_content."""
+        content_length = self.headers.get('Content-Length')
+        if len(self.content) < content_length:
+            raise ResponseReadError('Expect to read more bytes.')
+
     def __iter__(self):
         """Allows you to use a response as an iterator."""
         return self.iter_content(128)
@@ -183,7 +197,7 @@ class Response:
         """
         try:
             self.raise_for_status()
-        except HTTPError:
+        except (TypeError, HTTPError):
             return False
         return True
 
@@ -254,6 +268,8 @@ class Response:
         for each in content_type.split(';'):
             if each == 'application/ms-download':
                 filetype = filetype or 'pdf'
+            elif each == 'image/webp':
+                filetype = filetype or 'png'
             else:
                 filetype = mimetypes.guess_extension(each) or filetype
             if filetype:
@@ -264,17 +280,21 @@ class Response:
     def apparent_encoding(self):
         return charset_normalizer.detect(self.content)["encoding"]
 
-    def read(self) -> bytes:
+    def read(self, ignore_errors=False) -> bytes:
         """Read and return the response content."""
-        return self.content
+        try:
+            return self.content
+        except DownloadError:
+            if not ignore_errors:
+                raise
 
     def iter_content(self, chunk_size=1, decode_unicode=False):
         def generate():
-            # Special case for urllib3.
+            # noinspection PyBroadException
             try:
+                # Special case for urllib3.
                 if hasattr(self.raw, "stream"):
                     yield from self.raw.stream(chunk_size, decode_content=True)
-
                 elif self.raw is not None:
                     # Standard file-like object.
                     while True:
@@ -284,10 +304,11 @@ class Response:
                         yield chunk
 
                 self._content_consumed = True
-            except Exception as e:
-                error = ResponseReadError(e)
-                self.fail(error)
+            except Exception as e:  # don't catch BaseException to avoid trigger `Exception ignored in xxx`
+                self.fail(ResponseReadError(e))
                 self.check_error()
+            finally:
+                self.maybe_on_consumed()
 
         if self._content_consumed and isinstance(self._content, bool):
             raise ResponseStreamConsumed()
@@ -316,9 +337,15 @@ class Response:
             else:
                 self._content = b"".join(self.iter_content(CONTENT_CHUNK_SIZE)) or b""
         self._content_consumed = True
+        self.maybe_on_consumed()
         # don't need to release the connection; that's been handled by urllib3
         # since we exhausted the data.
         return self._content
+
+    def maybe_on_consumed(self):
+        if hasattr(self, 'on_consumed') and self.on_consumed:
+            self.on_consumed(response=self)
+            del self.on_consumed
 
     @property
     def text(self):
@@ -368,7 +395,10 @@ class Response:
                         if tag.name in ('iframe', 'img', 'a'):
                             invalid_tags.append(tag)
                     else:
-                        tag['href'] = self.urljoin(tag['href'])
+                        try:
+                            tag['href'] = self.urljoin(tag['href'])
+                        except ValueError:
+                            pass
                 if tag.get("src"):
                     if remove_base64 and tag["src"].startswith("data:image"):
                         tag.extract()
@@ -431,11 +461,11 @@ class Response:
             self.request.invalidate_proxy()
 
         meta = dict(self.meta)
+        meta.update(kwargs.pop('meta', {}))
         meta.pop('promise_node', None)
         meta.pop('promise_then', None)
         parse_times = meta.get('parse_times', 0) + 1
         meta.update(retry_times=0, parse_times=parse_times)
-        meta.update(kwargs.pop('meta', {}))
 
         headers = kwargs.pop('headers', None) or self.request.headers
         headers = dict(headers or {})
@@ -489,6 +519,9 @@ class Response:
 
     def _clear_caches(self):
         self._cached_text = None
+        if self._cached_selector:
+            # root created by etree.fromstring
+            self._cached_selector.clear()
         self._cached_selector = None
 
         # break references.
@@ -496,21 +529,23 @@ class Response:
         self.cookies = None
 
     def close(self):
+        # maybe not read when using stream or in some specific case.
+        self.maybe_on_consumed()
         raw, self.raw = self.raw, None
-        if raw is not None:
-            if getattr(raw, "drain_conn", None):
-                if self.failed:
-                    raw.close()
-                # special for urllib3.
-                # if connection pool is closed, the connection will be closed.
-                # Read and discard any remaining HTTP response data in the response connection.
-                raw.drain_conn()
-            elif getattr(raw, "close", None):
-                try:
-                    raw.close()
-                except AttributeError:
-                    # using curl_cffi and Python version < 3.8
-                    pass
+        if getattr(raw, "release_conn", None):
+            # special for urllib3.
+            if not self._content_consumed or self.failed:
+                # also includes HEAD requests.
+                raw.close()  # close connection and http.client.HTTPResponse if exists.
+            # drain_conn will read and discard any remaining HTTP response data in the response connection,
+            # if connection pool is closed, the connection will be closed.
+            raw.release_conn()  # break refs
+        elif getattr(raw, "close", None):
+            try:
+                raw.close()
+            except AttributeError:
+                # using curl_cffi and Python version < 3.8
+                pass
         self._clear_caches()
         if self._error:
             self._error.__traceback__ = None

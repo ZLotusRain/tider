@@ -1,30 +1,55 @@
 import sys
 import time
+import logging
 import weakref
 import inspect
-import logging
 from collections import deque
+from enum import Enum
 
 from tider.network import Request
 from tider.utils.misc import evaluate_callable
-from tider.utils.functional import iter_generator
+from tider.utils.functional import noop, iter_generator
+
+__all__ = ('is_unresolved', 'is_pending', 'is_scheduled',
+           'is_executed', 'is_rejected', 'is_resolved', 'Promise', 'NodeState')
 
 logger = logging.getLogger(__name__)
 
-PENDING = -1
-SCHEDULED = 1
-EXECUTED = 2
-RESOLVED = 3
-REJECTED = 4
+
+class NodeState(Enum):
+    PENDING = -1
+    SCHEDULED = 1
+    EXECUTED = 2
+    RESOLVED = 3
+    REJECTED = 4
+
+
+def is_unresolved(state: NodeState):
+    return state.value < NodeState.RESOLVED.value
+
+
+def is_pending(state: NodeState):
+    return state == NodeState.PENDING
+
+
+def is_scheduled(state: NodeState):
+    return state == NodeState.SCHEDULED
+
+
+def is_executed(state: NodeState):
+    return state == NodeState.EXECUTED
+
+
+def is_rejected(state: NodeState):
+    return state == NodeState.REJECTED
+
+
+def is_resolved(state: NodeState):
+    return state == NodeState.RESOLVED
 
 
 class PromiseNode:
-    """The promise node which binds to a request task.
-
-    :param request: (optional) the instance of :class:`Request`
-    :param parent: (optional).
-
-    """
+    """The promise node which binds to a request task."""
     if not hasattr(sys, 'pypy_version_info'):  # pragma: no cover
         __slots__ = (
             'request', 'parent', 'children', 'invalid_children',
@@ -35,17 +60,18 @@ class PromiseNode:
     def __init__(self, request=None, parent=None, promise=None, source=None):
         # node tree and requests
         self.request = request
-        self.parent = parent
-        self.promise = promise
-
         if source and not hasattr(source, '__iter__'):
             raise ValueError('Requests source must be iterable.')
         self.source = source
+
+        self.promise = promise
+
+        self.parent = parent
         self.children = []
         self.invalid_children = []
 
         self.rejected_reason = None
-        self.state = PENDING
+        self.state = NodeState.PENDING
         self._pending = deque((1, ), maxlen=1)
         self._str = str(request) if request else None
         self._is_root = False if parent else True
@@ -62,11 +88,7 @@ class PromiseNode:
 
     @property
     def rejected(self):
-        if self.state == REJECTED:
-            return True
-        elif any([child.rejected for child in self.children]):
-            return True
-        return False
+        return any([is_rejected(self.state)] + [is_rejected(child.state) for child in self.children])
 
     @property
     def size(self):
@@ -77,97 +99,85 @@ class PromiseNode:
 
     @property
     def unresolved_children(self):
-        return list(filter(lambda x: isinstance(x, PromiseNode) and x.state < RESOLVED,
-                           [child for child in self.children]))
+        return list(filter(
+            lambda x: isinstance(x, PromiseNode) and is_unresolved(x.state), [child for child in self.children]
+        ))
 
     def add_child(self, request):
-        if request.meta.get('promise_node'):
+        if isinstance(request, Request):
             promise_node = request.meta.get('promise_node')
-            node = promise_node.root
-            if not node.parent:
+            if promise_node:
+                # # use this request to update promise values.
+                # # copy request state to avoid lose cb_kwargs
+                node = promise_node.root
+                if node.parent and node.parent is not self:
+                    raise ValueError("Can't add root with parent.")
                 node.parent = self  # add parent promise, do not use proxy here
-            # # use this request to update promise values.
-            # # copy request state to avoid lose cb_kwargs
-            # old_request, promise_node.request = promise_node.request, request
-            # old_request.close()
-            # promise_node.reset()  # SCHEDULED to PENDING
-            promise_node.merge_values(request)
+                # old_request, promise_node.request = promise_node.request, request
+                # old_request.close()
+                # promise_node.reset()  # SCHEDULED to PENDING
+                promise_node.merge_values(request)
+            else:
+                node = PromiseNode(request=request, parent=self)
+            children = self.children
         else:
-            node = PromiseNode(request=request, parent=self)
-        if node not in self.children:
-            self.children.append(node)
+            node = request
+            children = self.invalid_children
+        if node not in children:
+            children.append(node)
+        return node
 
     @property
     def next_nodes(self):
         """Schedule every pending child."""
-        if self.state == RESOLVED:
-            # avoid processing resolved node due to state changed after
-            # evaluating unresolved children.
-            if self.parent and self in self.parent.children:
-                self.parent.children.remove(self)
-            return
-
         while self.invalid_children:
             yield self.invalid_children.pop()
-        for child in self.unresolved_children:
-            yield from child.next_nodes  # update child state
+
+        if is_resolved(self.state):
+            # avoid processing resolved node due to state changed
+            # after evaluating unresolved children.
+            return
+
         try:
             self._pending.pop()
-            if self.state == PENDING:
-                if self.request:
-                    self.state = SCHEDULED
-                    yield self
-                else:
-                    self.state = EXECUTED  # root
-                    for idx, req in enumerate(iter_generator(self.source)):
-                        if not isinstance(req, Request):
-                            raise ValueError('Requests source contains non-Request object.')
-                        if 'promise_order' not in req.meta:
-                            req.meta['promise_order'] = idx
+            self.state = NodeState.SCHEDULED
+        except IndexError:
+            if is_executed(self.state):
+                self.on_executed()
+        else:
+            if not self._is_root:
+                yield self
+            else:
+                self.state = NodeState.EXECUTED  # root
+                order = 0
+                for output in iter_generator(self.source):
+                    if not isinstance(output, Request):
+                        node = output
+                    else:
+                        if 'promise_order' not in output.meta:
+                            output.meta['promise_order'] = order
+                        order += 1
                         # the address of reqs can't be the same,
                         # otherwise the node will be ignored.
-                        self.add_child(req)
-                        if req.meta.get('promise_node'):
-                            # unresolved children only be evaluated once
-                            # so state change won't affect the source promise.
-                            node = req.meta['promise_node']   # already SCHEDULED
-                            yield node
-                    for child in self.unresolved_children:
-                        yield from child.next_nodes
-                    if hasattr(self.source, 'close'):
-                        self.source.close()
-                    self.source = None  # don't delete source here to make sure the memory will be released.
-        except IndexError:
-            pass
-        if self.state == EXECUTED:
-            request, self.request = self.request, None
-            request and request.close()
-            if not self._is_root and self.root.promise == self.promise:
-                self.promise = None
-            if not self.children:
-                if not self._is_root and self.state not in (RESOLVED, REJECTED):
-                    self.state = RESOLVED
-                    if self.parent and self in self.parent.children:
-                        self.parent.children.remove(self)
-                    self.clear()
+                        self.add_child(output)
+                        node = output.meta.get('promise_node')  # already SCHEDULED
+                    if not node:
+                        continue
+                    # unresolved children only be evaluated once
+                    # so state change won't affect the source promise.
+                    yield node
+                self.source = None  # don't delete source here to make sure the memory will be released.
+        for child in self.unresolved_children:
+            yield from child.next_nodes
 
     def update_state(self):
         for child in self.children:
             child.update_state()
-        if self.state == EXECUTED:
-            request, self.request = self.request, None
-            request and request.close()
-            if not self._is_root and self.root.promise == self.promise:
-                self.promise = None
-            if not self.children:
-                if not self._is_root and self.state not in (RESOLVED, REJECTED):
-                    self.state = RESOLVED
-                    if self.parent and self in self.parent.children:
-                        self.parent.children.remove(self)
-                    self.clear()
+        if is_executed(self.state):
+            self.on_executed()
 
     def then(self):
-        yield from self.root.promise.then()  # maybe use lower memory if using `yield from` directly.
+        return self.root.promise.then()
 
     def merge_values(self, request):
         parent = self.root.parent
@@ -180,47 +190,54 @@ class PromiseNode:
             parent = parent.root.parent
         request.cb_kwargs.update(self.root.promise.values)
 
+    def on_executed(self):
+        if not self._is_root:
+            if self.root.promise == self.promise:
+                self.promise = None
+            if not self.children and self.state not in (NodeState.RESOLVED, NodeState.REJECTED):
+                self.state = NodeState.RESOLVED
+                self.clear()
+        request, self.request = self.request, None
+        request and request.close()
+
     def clear(self):
-        if self.state == RESOLVED:
-            return
         # do not clear parent and promise here if is root
         # to avoid break conn with parent promise.
         request, self.request = self.request, None
         request and request.close()
 
         # break references
-        self.parent = None
-        self.promise = None
+        try:
+            if self.parent and self in self.parent.children:
+                self.parent.children.remove(self)
+            self.parent = None
+            self.promise = None
+        except AttributeError:
+            pass
 
-        del self.parent, self.promise
-        del self.children[:], self.invalid_children[:]  # no need to delete request here.
+        del self.parent, self.promise  # no need to delete request here.
+        del self.children[:], self.invalid_children[:]
 
     def __str__(self):
         if self._is_root:
-            return f'<Promise root at 0x{id(self):0x}>'
+            return f'<Promise root at 0x{id(self):0x}: {self.state.name}>'
         else:
-            return f'<Promise node {self._str} at 0x{id(self):0x}>'
+            return f'<Promise node {self._str} at 0x{id(self):0x}: {self.state.name}>'
 
     __repr__ = __str__
 
 
 class Promise:
-    """Ensure completeness and sequence of the target which relies on multi async tasks.\n
-    Bound Executor: \n
-    tider.core.explorer | tider.core.parser \n
-    Bound Scheduler: \n
-    tider.core.parser | tider.core.scheduler \n
+    """Make sure the completeness and sequence of the information integration in multi layer async tasks.
 
     :param reqs: an iterable object which contains the instance of :class:`Request`
     :param callback: (optional) callback after all the async tasks are done.
     :param cb_kwargs: (optional)
-    :param delay: (optional) the interval between each schedule.
     :param values: (optional) key-value pairs passed between nodes.
-
-    Usage::
+    :param delay: (optional) the interval between each schedule.
     """
 
-    def __init__(self, reqs, callback, cb_kwargs=None, values=None, delay=None):
+    def __init__(self, reqs, callback=None, cb_kwargs=None, values=None, delay=None, spider=None):
         if isinstance(reqs, Request):
             reqs = [reqs]
 
@@ -235,14 +252,15 @@ class Promise:
         if inspect.ismethod(callback):
             self.callback = weakref.WeakMethod(callback)
         else:
-            self.callback = callback
+            self.callback = callback or noop
         self.cb_kwargs = dict(cb_kwargs) if cb_kwargs else {}
 
         self.delay = delay
         self.retry_times = 0
+        self.spider = spider
 
         self._unresolved = deque((1, ), maxlen=1)
-        self._state = PENDING
+        self._state = NodeState.PENDING
 
     @property
     def state(self):
@@ -258,14 +276,13 @@ class Promise:
         return size
 
     def reject(self):
-        self.root.state = REJECTED
+        self.root.state = NodeState.REJECTED
 
     def clear(self):
-        root, self.root = self.root, None
-        root.clear()
-
         self.values.clear()
         self.cb_kwargs.clear()
+        self.spider = None
+        self.root.clear()
         # Avoid a refcycle if the promise is running a function with
         # an argument that has a member that points to the promise.
         del self.callback, self.values, self.cb_kwargs
@@ -275,12 +292,10 @@ class Promise:
         Schedule every pending child.
         If every node is resolved, then the promise is resolved.
         """
-        for node in iter_generator(self.root.next_nodes):
+        for node in self.root.next_nodes:
             if not isinstance(node, PromiseNode):
                 yield node  # invalid child
-                continue
-
-            if node.state == REJECTED:
+            elif is_rejected(node.state):
                 logger.warning(f"{node} is rejected, reason: {node.rejected_reason}")
             else:
                 request = node.request.copy()  # copy when node is set
@@ -290,14 +305,13 @@ class Promise:
                 # use node instead of self to update from child promise.
                 node.merge_values(request)
                 yield request
-
             if self.delay:
                 time.sleep(self.delay)
-        # if promise has already resolved, then skip this.
         if self.root is None:
+            # if promise has already resolved, then skip this.
             return
         self.root.update_state()  # avoid misstate
-        if self.state == EXECUTED and not self.root.children:
+        if is_executed(self.state) and not self.root.children:
             for result in iter_generator(self.on_resolved()):
                 yield result  # iter self.on_resolved() directly.
 
@@ -307,34 +321,34 @@ class Promise:
         except IndexError:
             return
         kwargs = self.cb_kwargs.copy()
-        # values in node should be processed
-        kwargs.update(self.values)
+        kwargs.update(self.values)  # values in node should be processed
         callback = self.callback() if isinstance(self.callback, weakref.ReferenceType) else self.callback
+        # # clen parent promise before spawn child nodes.
         try:
             for result in iter_generator(callback(**kwargs)):
-                # # schedule anyway to avoid lose connection with parent promise.
-                # # maybe duplicated
-                # yield result
-
+                if result is None:
+                    continue
                 # keep parent promise.
                 if isinstance(result, Request) and self.root.parent is not None:
                     self.root.parent.add_child(result)
                     if result.meta.get("promise_node"):
-                        yield result
+                        yield result  # already SCHEDULED in result's parent promise(not this parent).
                 else:
+                    # schedule anyway to avoid lose connection with parent promise
+                    # maybe duplicated because some requests maybe already scheduled.
                     yield result
-        except Exception as e:
-            logger.error(f'Promise bug when resolving: {e}', exc_info=True)
-            self.reject()
+        except Exception:
+            self.reject()  # reserved
+            raise
+        finally:
+            del callback, kwargs
 
-        del callback
-
-        self.root.state = RESOLVED
-        if self.root.parent is not None:
-            # turn to parent promise
-            if self.root in self.root.parent.children:
-                self.root.parent.children.remove(self.root)
-            for request in iter_generator(self.root.parent.then()):
-                yield request
-        # clear root node and collect garbage.
-        self.clear()
+            self.root.state = NodeState.RESOLVED
+            if self.root.parent is not None:
+                # turn to parent promise
+                if self.root in self.root.parent.children:
+                    self.root.parent.children.remove(self.root)
+                for request in iter_generator(self.root.parent.then()):
+                    yield request
+            # clear root node and collect garbage.
+            self.clear()

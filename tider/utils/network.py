@@ -5,6 +5,7 @@ import struct
 import contextlib
 from urllib.parse import urlparse
 
+from requests.cookies import cookiejar_from_dict
 from requests.utils import proxy_bypass, get_environ_proxies, get_encoding_from_headers
 
 from tider.network.compat import CookieCompatRequest, CookieCompatResponse
@@ -21,6 +22,19 @@ def guess_encoding_from_headers(headers):
     else:
         encoding = charset[0].split("=")[-1]
     return encoding
+
+
+def cookiejar_from_str(s: str):
+    if not s:
+        return None
+    d = {}
+    for each in s.split(';'):
+        each = each.strip()
+        if '=' not in each:
+            continue
+        k, v = each.split('=', maxsplit=1)
+        d[k] = v
+    return cookiejar_from_dict(d)
 
 
 def copy_cookie_jar(jar):

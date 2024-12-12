@@ -60,10 +60,11 @@ class Item(MutableMapping, metaclass=ItemMeta):
     def _set_default(self):
         # self.fields = self.__class__.fields
         for field in self.fields:
-            if 'default' in self.fields[field]:
-                self[field] = self.fields[field]['default']
-            elif "datatype" in self.fields[field]:
-                datatype = self.fields[field]["datatype"]
+            meta = self.fields[field]
+            if 'default' in meta:
+                self[field] = deepcopy(meta['default'])
+            elif "datatype" in meta:
+                datatype = meta["datatype"]
                 if type(datatype).__name__ in ('classobj', 'type'):
                     self[field] = datatype()
 

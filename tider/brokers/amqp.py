@@ -441,8 +441,6 @@ class AMQPBroker(Broker):
     def __init__(self, queues=None, *args, **kwargs):
         super(AMQPBroker, self).__init__(*args, **kwargs)
 
-        self.amqheartbeat_rate = self.crawler.settings.get('BROKER_HEARTBEAT_CHECKRATE')
-
         # this connection won't establish, only used for params
         self._conninfo = self._connection(url=self.crawler.settings.get('BROKER_URL'))
         self.connection_errors = self._conninfo.connection_errors
@@ -450,6 +448,7 @@ class AMQPBroker(Broker):
             self.amqheartbeat = self.crawler.settings.get('BROKER_HEARTBEAT')
         else:
             self.amqheartbeat = 0
+        self.amqheartbeat_rate = self.crawler.settings.get('BROKER_HEARTBEAT_CHECKRATE')  # reserved
 
         self.queues = self.queues_cls(queues=None, default_exchange=self.default_exchange)
         queues = queues or []
@@ -568,7 +567,7 @@ class AMQPBroker(Broker):
             accept = self.crawler.settings.get('BROKER_ACCEPT_CONTENT')
         no_ack = kw.pop('no_ack', None) or self.crawler.settings.getbool('BROKER_NO_ACK')
         return self.Consumer(
-            channel, accept=accept, prefetch_count=self.crawler.concurrency,
+            channel, accept=accept, prefetch_count=self.crawler.concurrency * 10,
             queues=queues, no_ack=no_ack, **kw
         )
 
@@ -593,7 +592,6 @@ class AMQPBroker(Broker):
 
         try:
             if on_message is not None:
-                # message.ack()
                 on_message(message=message, payload=payload, no_ack=False)
             else:
                 logger.warning(f"Message acked but with no handlers: {dump_body(message, message.body)}")
@@ -632,7 +630,7 @@ class AMQPBroker(Broker):
 
         def restore_transaction(pipe, use_client=False):
             data = pipe.hgetall(chan.unacked_key)
-            pipe.multi()
+            not use_client and pipe.multi()
             # don't use multi here to avoid keys of command in MULTI calls must be in same slot.
             # pipe.multi()
             count = 0
@@ -670,8 +668,9 @@ class AMQPBroker(Broker):
             queues = list(queues.consume_from.values())
         key = "_".join([queue.name for queue in queues])
         key = set_md5(key)
+        # no need to set polling_interval
         transport_options = {
-            'unacked_restore_limit': 1000,
+            'unacked_restore_limit': None,  # maybe restore messages
             'unacked_key': f'{key}.unacked',
             'unacked_index_key': f'{key}.unacked_index',
             'max_connections': self.crawler.concurrency,
@@ -690,15 +689,17 @@ class AMQPBroker(Broker):
             while not self._stopped.is_set():
                 try:
                     connection.drain_events(timeout=2.0)
-                    on_message_consumed()
                     logged = False
                 except socket.timeout:
-                    on_message_consumed()
+                    on_message_consumed and on_message_consumed()
                     if not logged:
-                        logger.info(f"Waiting for messages from {','.join([queue.name for queue in consumer.queues])}")
+                        logger.info(f"No messages fetched or reached prefetch limit, "
+                                    f"prefetch count: {consumer.prefetch_count}, "
+                                    f"queues: {','.join([queue.name for queue in consumer.queues])}")
                     logged = True
+                    consumer.channel.qos._flush()  # clear dirty.
                 except connection.connection_errors:
-                    logger.warning('Broker connection broken, try to reconnect...')
+                    logger.warning('Broker connection has broken, try reconnecting...')
                     ignore_errors(connection, consumer.close)
                     connection.release()
 
@@ -708,7 +709,7 @@ class AMQPBroker(Broker):
                     consumer.on_message = on_message
                     consumer.consume()
                     self._restore_messages(consumer)
-                    on_message_consumed()
+                    on_message_consumed and on_message_consumed()
                 except OSError:
                     if self.crawler.crawling:
                         raise

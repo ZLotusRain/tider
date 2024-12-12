@@ -12,14 +12,12 @@ class SpiderLoader:
     in a Tider project.
     """
     def __init__(self, settings):
-        self._schemas = settings.getdict('SPIDER_SCHEMAS').copy()
-        self._schemas = self._schemas or {'default': []}
-        if 'default' not in self._schemas:
-            self._schemas['default'] = []
-        self._spider_modules = settings.getlist('SPIDER_MODULES').copy()
-        self._schemas['default'].append({'SPIDER_MODULES': self._spider_modules})
+        self._spider_schemas = settings.getdict('SPIDER_SCHEMAS').copy() or {'default': []}
+        if 'default' not in self._spider_schemas:
+            self._spider_schemas['default'] = []
+        self._spider_schemas['default'].append({'SPIDER_MODULES': settings.getlist('SPIDER_MODULES').copy()})
 
-        self._spiders = defaultdict()
+        self._schemas = defaultdict(dict)
         self.warn_only = settings.getbool('SPIDER_LOADER_WARN_ONLY')
         self._found = defaultdict(list)
         self._load_all_spiders()
@@ -44,30 +42,32 @@ class SpiderLoader:
     def _load_spiders(self, module, custom_settings=None, schema='default'):
         for spider_cls in iter_spider_classes(module):
             spider_cls.name = spider_cls.name or spider_cls.__name__
-            name = spider_cls.name if schema == 'default' else f'{schema}.{spider_cls.name}'
+            name = spider_cls.name
 
             custom_settings = dict(custom_settings or {})
             spider_cls.custom_settings = spider_cls.custom_settings or {}
+            # spider is higher than project settings
             custom_settings.update(spider_cls.custom_settings)
             spider_cls.custom_settings = custom_settings
 
-            self._found[name].append((schema, module.__name__, spider_cls.__name__))
-            self._spiders[name] = spider_cls
+            found_name = spider_cls.name if schema == 'default' else f'{schema}.{spider_cls.name}'
+            self._found[found_name].append((schema, module.__name__, spider_cls.__name__))
+            self._schemas[schema][name] = spider_cls
 
     def _load_all_spiders(self):
         # may load the same spider multiple times
-        for schema in self._schemas:
-            sources = self._schemas[schema].copy()
-            for source in sources:
-                spider_modules = source.pop('SPIDER_MODULES')
+        for schema in self._spider_schemas:
+            spider_settings = self._spider_schemas[schema].copy()
+            for spider_setting in spider_settings:
+                spider_modules = spider_setting.pop('SPIDER_MODULES')
                 if isinstance(spider_modules, str):
                     spider_modules = spider_modules.split(',')
                 spider_modules = list(spider_modules)
                 for each in spider_modules:
                     try:
                         for module in walk_modules(each):
-                            self._load_spiders(module, source, schema=schema)
-                    except ImportError:
+                            self._load_spiders(module, spider_setting, schema=schema)
+                    except (ImportError, SyntaxError):
                         if self.warn_only:
                             warnings.warn(
                                 f"\n{traceback.format_exc()}Could not load spiders "
@@ -85,17 +85,23 @@ class SpiderLoader:
         name is not found, raise a KeyError.
         """
         schema = schema or 'default'
-        spider_name = spider_name if schema == 'default' else f'{schema}.{spider_name}'
+        hint_name = spider_name if schema == 'default' else f'{schema}.{spider_name}'
         try:
-            return self._spiders[spider_name]
+            return self._schemas[schema][spider_name]
         except KeyError:
             for schema in self._schemas:
-                if f'{schema}.{spider_name}' in self._spiders:
-                    raise KeyError(f"Spider not found: {spider_name}, maybe you meant `{schema}.{spider_name}`?")
-            raise KeyError(f"Spider not found: {spider_name}")
+                if spider_name in self._schemas[schema]:
+                    raise KeyError(f"Spider not found: {hint_name}, maybe you meant `{schema}.{spider_name}`?")
+            raise KeyError(f"Spider not found: {hint_name}")
 
-    def list(self):
+    def list(self, schema='default'):
         """
-        Return a list with the names and schemas of all spiders available in the project.
+        Return a list with the names of all spiders available in the specified schema.
         """
-        return list(self._spiders.keys())
+        return list(self._schemas[schema].keys())
+
+    def list_all(self):
+        """
+        Return a dict with the names and schemas of all spiders available in the project.
+        """
+        return {schema: list(self._schemas[schema].keys()) for schema in self._schemas}

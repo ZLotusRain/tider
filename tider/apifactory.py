@@ -11,11 +11,13 @@ class ApiFactory:
     API = ""
     DEFAULT_RESULT_FIELD = "api_result"
 
+    def __call__(self, *args, **kwargs):
+        return self.factory(*args, **kwargs)
+
     def factory(self, api_kwargs, callback, cb_kwargs=None, errback=None, **kwargs):
         """build Request according to api request kwargs"""
-        request_kwargs = self.prepare_request_kwargs(**api_kwargs)
-        kw = dict(kwargs)
-        kw.update(request_kwargs)
+        kw = self.prepare_request_kwargs(**api_kwargs)
+        kw.update(**dict(kwargs))
         return Request(url=self.API, callback=callback, errback=errback,
                        cb_kwargs=cb_kwargs, **kw)
 

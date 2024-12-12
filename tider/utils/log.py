@@ -41,9 +41,26 @@ _in_sighandler = False
 
 
 def set_in_sighandler(value):
-    """Set flag signifiying that we're inside a signal handler."""
+    """Set flag signifying  that we're inside a signal handler."""
     global _in_sighandler
     _in_sighandler = value
+
+
+def iter_open_logger_fds():
+    seen = set()
+    loggers = (list(logging.Logger.manager.loggerDict.values()) +
+               [logging.getLogger(None)])
+    for l in loggers:
+        try:
+            for handler in l.handlers:
+                try:
+                    if handler not in seen:  # pragma: no cover
+                        yield handler.stream
+                        seen.add(handler)
+                except AttributeError:
+                    pass
+        except AttributeError:  # PlaceHolder does not have handlers
+            pass
 
 
 @contextmanager

@@ -1,4 +1,4 @@
-"""Spider Pidbox (remote control)."""
+"""Crawler Pidbox (remote control)."""
 from kombu.common import ignore_errors
 from kombu.utils.encoding import safe_str, safe_repr
 
@@ -18,7 +18,6 @@ body: %s
 
 def dump_body(m, body):
     """Format message body for debugging purposes."""
-    # v2 protocol does not deserialize body
     body = m.body if body is None else body
     return '{} ({}b)'.format(truncate(safe_repr(body), 1024),
                              len(m.body))

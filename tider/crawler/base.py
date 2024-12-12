@@ -25,7 +25,7 @@ from tider.platforms import EX_FAILURE, EX_OK, create_pidlock
 from tider.network.user_agent import set_default_ua
 from tider.utils.log import get_logger, in_sighandler, set_in_sighandler
 from tider.utils.misc import symbol_by_name, build_from_crawler
-from tider.utils.nodenames import gethostname, nodename, nodesplit, default_nodename
+from tider.utils.nodenames import gethostname, nodename, nodesplit, default_nodename, node_format
 
 try:
     import resource
@@ -114,26 +114,21 @@ class Crawler:
         self.app = app or self.app
         self._source_hostname = hostname
         self.startup_time = datetime.utcnow()
-        custom_settings = spidercls.custom_settings or {}
-        self.settings = Settings(defaults=[self.app.conf.copy(), custom_settings.copy()])
-        self.pid = os.getpid()
+        self.settings = Settings(defaults=[self.app.conf.copy()])
+        self.spidercls.update_settings(self.settings)
         self.data_source = data_source
         set_default_ua(self.settings.get('DEFAULT_USER_AGENT'))
 
         get, set_setting = self.settings.get, self.settings.set
         self.concurrency = concurrency or get("CONCURRENCY")
-        set_setting("CONCURRENCY", self.concurrency, 'cmdline')
         self.pool_cls = pool_cls or get("POOL")
-        set_setting("POOL", self.pool_cls, 'cmdline')
+        self.broker_transport = broker_transport or get('BROKER_TRANSPORT') or 'default'
+        self.broker_wait_timeout = broker_wait_timeout or get('BROKER_TIMEOUT')
+
         self.scheduler_cls = scheduler_cls or get('SCHEDULER')
         set_setting("SCHEDULER", self.scheduler_cls, 'cmdline')
         self.explorer_cls = explorer_cls or get('EXPLORER')
         set_setting("EXPLORER", self.explorer_cls, 'cmdline')
-
-        self.broker_transport = broker_transport or get('BROKER_TRANSPORT') or 'default'
-        set_setting("BROKER_TRANSPORT", self.broker_transport, 'cmdline')
-        self.broker_wait_timeout = broker_wait_timeout or get('BROKER_TIMEOUT')
-        set_setting("BROKER_TIMEOUT", self.broker_wait_timeout, 'cmdline')
 
         self.stats_cls = stats_cls or get('STATS_CLASS')
         set_setting("STATS_CLASS", self.stats_cls, 'cmdline')
@@ -142,11 +137,11 @@ class Crawler:
         self.alarm_message_type = get('ALARM_MESSAGE_TYPE')
         set_setting("ALARM_MESSAGE_TYPE", self.alarm_message_type, 'cmdline')
 
-        self.debug = debug
         logfile = logfile or get("LOG_FILE")
         self.logfile = os.path.join(get('LOG_DIRECTORY'), logfile) if logfile else logfile
         self.loglevel = loglevel or get("LOG_LEVEL")
 
+        self.debug = debug
         self.allow_duplicates = allow_duplicates or get('CRAWLER_ALLOW_DUPLICATES')
 
         self.pidfile = pidfile
@@ -163,8 +158,15 @@ class Crawler:
         self.crawling = False
 
     def on_start(self):
+        self.pidbox = Pidbox(self)
+        self.pidbox.start()
+        self.pidfile = node_format(self.pidfile, self.hostname, g=self.group)
         if self.pidfile:
-            self.pidlock = create_pidlock(self.pidfile)
+            self.pidlock = create_pidlock(self.pidfile, group=self.group, allow_duplicates=self.allow_duplicates)
+
+    @property
+    def pid(self):
+        return os.getpid()
 
     @cached_property
     def stats(self):
@@ -217,16 +219,22 @@ class Crawler:
     def get_hostname(self, hostname):
         hostname = self._default_hostname(hostname)
         # note: do not use self.connection here to avoid connection loss in pidbox.
-        inspect = self.app.control.inspect(timeout=2.0)
-        logger.info("Checking if hostname duplicates...")
+        # adjust timeout to avoid spawning duplicate hostname when using multi.
+        inspect = self.app.control.inspect(timeout=1.0)
+        print("Checking if hostname duplicates...")
 
         replies = inspect.ping(destination=[hostname])
-        if replies:
+        if replies or (self.pidfile and os.path.exists(node_format(self.pidfile, hostname, g=hostname))):
+            # avoid duplicates in multi start.
             if self.allow_duplicates:
                 return nodename(f'{nodesplit(hostname)[0]}.{str(self.pid)}', nodesplit(hostname)[-1])
-            logger.error(f"Duplicate hostname: {hostname}")
             raise RuntimeError("Can't crawl a duplicated spider.")
         return hostname
+
+    @cached_property
+    def group(self):
+        """group for join same spiders"""
+        return self._default_hostname(self._source_hostname)
 
     @cached_property
     def hostname(self):
@@ -267,6 +275,8 @@ class Crawler:
         uptime = datetime.utcnow() - self.startup_time
         return {'pid': self.pid,
                 'server_ip': self.svr,
+                'schema': self.schema,
+                'group': self.group,
                 'clock': str(self.app.clock),
                 'uptime': round(uptime.total_seconds())}
 
@@ -308,6 +318,7 @@ class Crawler:
             backup_count=get('LOG_BACKUP_COUNT'),
             encoding=get('LOG_ENCODING'),
             hostname=self.hostname,
+            group=self.group,
             debug=self.debug,
         )
 
@@ -323,11 +334,9 @@ class Crawler:
         logger.info(f"Crawler info:\n{banner}", {'banner': banner})
 
         self.settings.freeze()
-        self.pidbox = Pidbox(self)
 
         try:
             self.engine = self._create_engine()
-            self.pidbox.start()
             self.engine.start(self.spider, self.broker)
         except Exception:
             self.crawling = False
@@ -342,6 +351,8 @@ class Crawler:
             self.crawling = False
             assert self.engine
             self.engine.stop()
+        if self.pidlock:
+            self.pidlock.release()
         self.extensions.close()
         self.pidbox is not None and self.pidbox.shutdown()
         self.connection.release()

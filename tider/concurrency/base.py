@@ -1,7 +1,5 @@
 import sys
-import time
 import psutil
-from typing import Deque, Callable
 from billiard.einfo import ExceptionInfo
 from billiard.exceptions import WorkerLostError
 
@@ -35,24 +33,6 @@ def apply_target(target, args=(), kwargs=None, callback=None, propagate=(), **_)
             callback(ret)
     finally:
         del target, args, kwargs, callback
-
-
-def worker(queue: Deque, processor: Callable, output_handler=None, shutdown_event=None):
-    while True:
-        try:
-            obj = queue.popleft()
-            result = processor(obj)
-            # don't use thread lock in handler if possible.
-            if output_handler:
-                output_handler(result)
-        except IndexError:
-            if shutdown_event and shutdown_event():
-                return
-        finally:
-            # switch greenlet if using gevent
-            # when the active one can't get the next request
-            # to avoid keeping loop.
-            time.sleep(0.01)
 
 
 class BasePool:

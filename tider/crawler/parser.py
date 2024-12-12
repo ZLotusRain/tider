@@ -1,13 +1,15 @@
 import time
+from queue import Full
 from collections import deque
 
 from tider import Item, Request
 from tider.crawler import state
+from tider.promise import NodeState
 from tider.platforms import EX_FAILURE
-from tider.promise import EXECUTED, REJECTED
 from tider.utils.log import get_logger
 from tider.utils.functional import iter_generator
 from tider.utils.misc import symbol_by_name, build_from_crawler
+from tider.exceptions import SpiderShutdown, SpiderTerminate
 
 __all__ = ('Parser', )
 
@@ -56,32 +58,50 @@ class Parser:
         if not self.running:
             raise RuntimeError("Parser not running")
         self.queue.append(result)
+        self.maybe_wakeup()
 
-        if not self.loop and len(self.parsing) < self.concurrency and len(self.queue) > 0:
+    def maybe_wakeup(self):
+        if self.loop:
+            return
+
+        queue = self.queue
+        parse_func = self.parse
+        if len(self.parsing) < self.concurrency and len(self.queue) > 0:
             try:
                 self.free_slots.pop()
-                self.pool.apply_async(self._parse_next)
+                self.pool.apply_async(
+                    self._parse_next,
+                    kwargs={'queue': queue, 'parse_func': parse_func}
+                )
             except IndexError:
-                return
+                pass
+            except Full:
+                self.free_slots.append(None)
 
-    def _parse_next(self):
+    def _parse_next(self, queue, parse_func):
         # using `sys.getsizeof(self.queue)` in child thread
         # when using gevent pool may be stuck.
         while self.running:
             try:
-                response = self.queue.popleft()
-                self.parse(response)
+                response = queue.popleft()
+                parse_func(response)
+                del response  # to reduce peak memory usage
             except IndexError:
                 if not self.loop:
                     self.free_slots.append(None)
                     break
-            except BaseException:
+            except (SpiderTerminate, SpiderShutdown):
+                self.running = False
+                break
+            except Exception:
                 self.running = False
                 state.should_terminate = EX_FAILURE
                 raise
             finally:
                 # sleep to switch thread
                 time.sleep(0.01)
+
+        del parse_func
 
     def start(self):
         if self.running:
@@ -90,8 +110,13 @@ class Parser:
 
         self.pool.start()
         if self.loop:
+            queue = self.queue
+            parse_func = self.parse
             for _ in range(self.concurrency):
-                self.pool.apply_async(self._parse_next)
+                self.pool.apply_async(
+                    self._parse_next,
+                    kwargs={'queue': queue, 'parse_func': parse_func}
+                )
         else:
             for _ in range(self.concurrency):
                 self.free_slots.append(None)
@@ -118,8 +143,8 @@ class Parser:
             order = 0
             # sleep to switch thread
             for output in iter_generator(spider_outputs, sleep=self.crawler.maybe_sleep):
+                # maybe iter spider outputs directly.
                 state.maybe_shutdown()
-                # iter spider outputs directly.
                 if self._spider_output_filter(output, response):
                     if node and isinstance(output, Request):
                         if not output.meta.get('promise_order'):
@@ -130,25 +155,31 @@ class Parser:
                             self._process_spider_output(output, request)
                     else:
                         self._process_spider_output(output, request)
-        except BaseException as e:
+        except (SpiderTerminate, SpiderShutdown):
+            raise
+        except Exception as e:
             logger.exception(f"Parser bug processing {request}")
             self.crawler.stats.inc_value(f"parser/{e.__class__.__name__}/count")
+        finally:
+            del callback, errback
 
         _success = True  # reserved
         if node:
-            node.state = EXECUTED if _success else REJECTED
+            node.state = NodeState.EXECUTED if _success else NodeState.REJECTED
             try:
                 for output in iter_generator(node.then(), sleep=self.crawler.maybe_sleep):
+                    # maybe iter node.then() directly.
                     state.maybe_shutdown()
-                    # iter node.then() directly.
                     self._process_spider_output(output, request)
-            except BaseException as e:
+            except (SpiderTerminate, SpiderShutdown):
+                raise
+            except Exception as e:
                 logger.exception(f"Promise bug processing {request}")
                 self.crawler.stats.inc_value(f"promise/{e.__class__.__name__}/count")
 
+        response.close()
         request.close()
         self.parsing.remove(request)
-        response.close()
 
     def _spider_output_filter(self, request, response):
         if isinstance(request, Request):
@@ -178,12 +209,11 @@ class Parser:
         return True
 
     def _process_spider_output(self, output, request):
-        if not self.running:
-            return
         if isinstance(output, Request):
             self.crawler.engine.schedule_request(output)
         elif isinstance(output, (Item, dict)):
-            self.crawler.stats.inc_value(f"item/{output.__class__.__name__}/count")
+            self.crawler.stats.inc_value(f"item/count")
+            self.crawler.stats.inc_value(f"item/count/{output.__class__.__name__}")
             self._quick_process_item(output)
         elif output is None:
             pass
@@ -193,6 +223,9 @@ class Parser:
 
     def close(self, reason):
         self.running = False
-        self.itemproc.close()
-        self.pool.stop()  # stop pool first
-        logger.info("Parser closed (%(reason)s)", {'reason': reason})
+        try:
+            self.itemproc.close()
+            self.pool.stop()  # stop pool first, maybe throw exception.
+            logger.info("Parser closed (%(reason)s)", {'reason': reason})
+        except Exception as e:
+            logger.error("Parser exception when closing, reason: %(reason)s", {'reason': e}, exc_info=True)

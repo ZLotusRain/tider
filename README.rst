@@ -16,7 +16,7 @@ Tider
 
 
 :Author: LotusRain
-:Version: 3.1.0
+:Version: 3.2.0
 :Source: https://github.com/ZLotusRain/tider
 
 
