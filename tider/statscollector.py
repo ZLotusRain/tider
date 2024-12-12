@@ -1,15 +1,17 @@
 """
-Tider extension for collecting frame stats(from scrapy)
+Crawler extension for collecting frame stats(from scrapy).
 """
 import pprint
-import logging
 
-logger = logging.getLogger(__name__)
+from tider.utils.log import get_logger
+
+logger = get_logger(__name__)
 
 
 class StatsCollector:
-    def __init__(self, tider):
-        self._dump = tider.settings.getbool('STATS_DUMP')
+
+    def __init__(self, crawler):
+        self._dump = crawler.settings.getbool('STATS_DUMP')
         self._stats = {}
 
     def get_value(self, key, default=None):
@@ -37,8 +39,7 @@ class StatsCollector:
     def clear_stats(self):
         self._stats.clear()
 
-    def close(self, spider, reason=None):
-        ... if reason else ...
+    def close_spider(self, spider, reason):
         if self._dump:
             logger.info("Dumping Tider stats:\n" + pprint.pformat(self._stats),
                         extra={'spider': spider})
@@ -50,8 +51,8 @@ class StatsCollector:
 
 class MemoryStatsCollector(StatsCollector):
 
-    def __init__(self, tider):
-        super().__init__(tider)
+    def __init__(self, crawler):
+        super().__init__(crawler)
         self.spider_stats = {}
 
     def _persist_stats(self, stats, spider):
@@ -77,11 +78,3 @@ class DummyStatsCollector(StatsCollector):
 
     def min_value(self, key, value):
         pass
-
-
-class InfluxStatsCollector:
-    pass
-
-
-class PrometheusStatsCollector:
-    pass

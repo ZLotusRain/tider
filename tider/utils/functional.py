@@ -1,4 +1,5 @@
 import time
+import inspect
 from itertools import count
 
 
@@ -18,6 +19,14 @@ def fxrange(start=1.0, stop=None, step=1.0, repeatlast=False):
             if not repeatlast:
                 break
             yield cur - step
+
+
+def fun_accepts_kwargs(fun):
+    """Return true if function accepts arbitrary keyword arguments."""
+    return any(
+        p for p in inspect.signature(fun).parameters.values()
+        if p.kind == p.VAR_KEYWORD
+    )
 
 
 def retry_over_time(fun, catch, args=None, kwargs=None, errback=None,
@@ -78,3 +87,20 @@ def retry_over_time(fun, catch, args=None, kwargs=None, errback=None,
                     time.sleep(1.0)
                 # sleep remainder after int truncation above.
                 time.sleep(abs(int(tts) - tts))
+
+
+def iter_generator(iterable):
+    if iterable is None:
+        iterable = []
+    if not hasattr(iterable, '__iter__'):
+        iterable = [iterable]
+    it = iter(iterable)
+    while True:
+        try:
+            yield next(it)
+        except StopIteration:
+            break
+        time.sleep(0.01)
+    if hasattr(iterable, 'close'):
+        iterable.close()
+    del iterable

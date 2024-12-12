@@ -4,7 +4,7 @@ import click
 from json import dumps
 from functools import partial
 
-from tider.core.control import Panel, Inspect
+from tider.crawler.control import Panel, Inspect
 from tider.utils.text import indent, pluralize
 from tider.bin.base import COMMA_SEPARATED_LIST
 from tider.exceptions import TiderCommandException
@@ -68,7 +68,7 @@ def _compile_arguments(action, args):
 def status(ctx, timeout, destination, json, **kwargs):
     """Show list of workers that are online."""
     callback = None if json else partial(_say_remote_command_reply, ctx)
-    replies = Inspect(tider=ctx.obj.tider, timeout=timeout,
+    replies = Inspect(app=ctx.obj.app, timeout=timeout,
                       destination=destination, callback=callback).ping()
 
     if not replies:
@@ -112,7 +112,7 @@ def inspect(ctx, action, timeout, destination, json, **kwargs):
     callback = None if json else partial(_say_remote_command_reply, ctx,
                                          show_reply=True)
     arguments = _compile_arguments(action, ctx.args)
-    inspector = Inspect(tider=ctx.obj.tider,
+    inspector = Inspect(app=ctx.obj.app,
                         timeout=timeout,
                         destination=destination,
                         callback=callback)

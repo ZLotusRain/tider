@@ -4,7 +4,7 @@ import logging
 import platform
 
 from tider.spiders import Spider
-from tider.core.engine import HeartEngine
+from tider.crawler.engine import HeartEngine
 from tider.settings import Settings, overridden_settings
 from tider.utils.log import configure_logging
 from tider.utils.decorators import cached_property

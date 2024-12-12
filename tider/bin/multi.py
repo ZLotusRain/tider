@@ -19,9 +19,20 @@ from kombu.utils.encoding import from_utf8
 from kombu.utils.objects import cached_property
 from collections import OrderedDict, UserList, defaultdict
 
+from tider import __version__
 from tider.platforms import EX_OK, EX_FAILURE, IS_WINDOWS
+from tider.utils import term
 
-TIDER_EXE = 'tider'
+try:
+    from importlib.metadata import distribution, distributions
+except ModuleNotFoundError:
+    from importlib_metadata import distribution, distributions
+
+# tricky way to decide how to start a tider program.
+INSTALLED_PACKAGES = [dist.metadata["Name"] for dist in distributions() if "Name" in dist.metadata]
+TIDER_EXE = 'tider' if 'tider' in INSTALLED_PACKAGES else '-m tider'
+
+del INSTALLED_PACKAGES
 
 
 def tider_exe(*args):
@@ -41,11 +52,30 @@ def format_opt(opt, value):
     return f'{opt} {value}'
 
 
+def splash(fun):
+
+    @wraps(fun)
+    def _inner(self, *args, **kwargs):
+        self.splash()
+        return fun(self, *args, **kwargs)
+    return _inner
+
+
 def using_cluster(fun):
 
     @wraps(fun)
     def _inner(self, *argv, **kwargs):
         return fun(self, self.cluster_from_argv(argv), **kwargs)
+    return _inner
+
+
+def using_cluster_and_sig(fun):
+
+    @wraps(fun)
+    def _inner(self, *argv, **kwargs):
+        p, cluster = self._cluster_from_argv(argv)
+        sig = self._find_sig_argument(p)
+        return fun(self, cluster, sig, **kwargs)
     return _inner
 
 
@@ -68,7 +98,18 @@ class OptionParser:
                 break
             elif arg[0] == '-':
                 if arg[1] == '-':
-                    self.process_long_opt(arg[2:])
+                    value = None
+                    if '=' not in arg[2:]:
+                        # process options like ['--proj', 'default']
+                        try:
+                            value = rargs[pos + 1]
+                            if not value.startswith('-'):
+                                pos += 1
+                            else:
+                                value = None
+                        except IndexError:
+                            pass
+                    self.process_long_opt(arg[2:], value=value)
                 else:
                     value = None
                     if len(rargs) > pos + 1 and rargs[pos + 1][0] != '-':
@@ -103,15 +144,29 @@ class OptionParser:
 
 class MultiParser:
 
-    def __init__(self, spiders=None, cmd='tider crawl'):
+    def __init__(self, spiders=None, cmd='tider crawl', append='', prefix='', suffix='',
+                 range_prefix='tider'):
         self.spiders = spiders or []
         self.cmd = cmd
+        self.append = append
+        self.prefix = prefix
+        self.suffix = suffix
+        self.range_prefix = range_prefix
 
     def parse(self, p):
         names = p.values
         options = dict(p.options)
+        ranges = len(names) == 1
         cmd = options.pop('--cmd', self.cmd)
-        concurrency = options.pop('--worker-concurrency', '1')
+        # concurrency = options.pop('--worker-concurrency', '1')
+        if ranges:
+            try:
+                concurrency = int(names[0])
+                name = options.pop('-s', None) or options.pop('--spider', None)
+                names = [name for _ in range(concurrency)]
+                options.setdefault('-dup', None)
+            except ValueError:
+                pass
         self._update_ns_opts(p, names)
         if not names:
             return (
@@ -122,13 +177,13 @@ class MultiParser:
         return (
             self._node_from_options(
                 p, name, cmd, options)
-            for name in names for _ in range(int(concurrency))
+            for name in names
         )
 
     def _node_from_options(self, p, name, cmd, options):
-        namespace = nodename = name
-        return Node(nodename, cmd,
-                    p.optmerge(namespace, options), p.passthrough)
+        namespace = nodename = name  # spider name
+        return Node(name=nodename, cmd=cmd,
+                    options=p.optmerge(namespace, options), extra_args=p.passthrough)
 
     def _update_ns_opts(self, p, names):
         # Numbers in args always refers to the index in the list of names.
@@ -169,7 +224,7 @@ class Node:
     def __init__(self, name,
                  cmd=None, append=None, options=None, extra_args=None):
         self.name = name
-        self.cmd = cmd or f"-m {tider_exe('crawl', '--detach')}"
+        self.cmd = cmd or tider_exe('crawl', '--detach')
         if 'crawl' not in self.cmd:
             self.cmd += ' crawl --detach'
         self.append = append
@@ -180,7 +235,11 @@ class Node:
         self._pid = None
 
     def _annotate_with_default_opts(self, options):
+        if not self.name:
+            raise ValueError('Expect valid spider name, but no spider provided')
         options['-s'] = self.name
+        # self._setdefaultopt(options, ['--pidfile', '-p'], '/var/run/tider/%n.pid')
+        # self._setdefaultopt(options, ['--logfile', '-f'], '/var/log/tider/%n%I.log')
         self._setdefaultopt(options, ['--executable'], sys.executable)
         return options
 
@@ -204,6 +263,7 @@ class Node:
             if opt in (
                 '-s', '--spider',
                 '--settings',
+                '--proj',
                 '--schema',
                 '--workdir',
                 '-C', '--no-color',
@@ -286,14 +346,20 @@ class Cluster(UserList):
 
 class TermLogger:
 
+    splash_text = 'tider multi v{version}'
+    splash_context = {'version': __version__}
+
     #: Final exit code.
     retcode = 0
 
-    def setup_terminal(self, stdout, stderr, quiet=False, verbose=False):
+    def setup_terminal(self, stdout, stderr, nosplash=False, quiet=False,
+                       verbose=False, no_color=False):
         self.stdout = stdout or sys.stdout
         self.stderr = stderr or sys.stderr
+        self.nosplash = nosplash
         self.quiet = quiet
         self.verbose = verbose
+        self.no_color = no_color
 
     def ok(self, m, newline=True, file=None):
         self.say(m, newline=newline, file=file)
@@ -318,14 +384,31 @@ class TermLogger:
         if not self.quiet:
             self.say(str(msg), newline=newline)
 
+    def splash(self):
+        if not self.nosplash:
+            self.note(self.colored.cyan(
+                self.splash_text.format(**self.splash_context)))
+
+    @cached_property
+    def colored(self):
+        return term.colored(enabled=not self.no_color)
+
 
 class MultiTool(TermLogger):
     """The ``tider multi`` program."""
 
+    reserved_options = [
+        ('--nosplash', 'nosplash'),
+        ('--quiet', 'quiet'),
+        ('-q', 'quiet'),
+        ('--verbose', 'verbose'),
+        ('--no-color', 'no_color'),
+    ]
+
     def __init__(self, spiders, env=None, cmd=None, stdout=None, stderr=None, **kwargs):
         self.spiders = spiders
         self.env = env
-        self.cmd = cmd or f"-m {TIDER_EXE}"
+        self.cmd = cmd or TIDER_EXE
         self.setup_terminal(stdout, stderr, **kwargs)
         self.prog_name = 'tider multi'
         self.commands = {
@@ -333,6 +416,8 @@ class MultiTool(TermLogger):
         }
 
     def execute_from_commandline(self, argv, cmd=None):
+        # Reserve the --nosplash|--quiet|-q/--verbose options.
+        argv = self._handle_reserved_options(argv)
         self.cmd = cmd if cmd is not None else self.cmd
         self.prog_name = os.path.basename(argv.pop(0))
 
@@ -350,6 +435,13 @@ class MultiTool(TermLogger):
             return self.commands[command](*argv) or EX_OK
         except KeyError:
             return self.error(f'Invalid command: {command}')
+
+    def _handle_reserved_options(self, argv):
+        argv = list(argv)  # don't modify callers argv.
+        for arg, attr in self.reserved_options:
+            if arg in argv:
+                setattr(self, attr, bool(argv.pop(argv.index(arg))))
+        return argv
 
     @staticmethod
     def prepare_argv(argv, path):
@@ -408,11 +500,24 @@ class MultiTool(TermLogger):
 )
 @click.pass_context
 def multi(ctx):
-    spiders = ctx.obj.tider.autodiscover_spiders()
-    args = sys.argv[1:]
-    if 'tider' not in args:
-        args = ['-m', 'tider'] + args
-    cmd = MultiTool(spiders=spiders, cmd=' '.join(args[:args.index('multi')]), quiet=ctx.obj.quiet)
+    schema = ctx.obj.schema
+    spider_loader = ctx.obj.app.spider_loader
+    spiders = []
+    result = spider_loader.list()
+    if not schema:
+        spiders = result.copy()
+    else:
+        for each in result:
+            parts = each.split('.', maxsplit=1)
+            if len(parts) == 1 and schema == 'default':
+                spiders.append(each)
+            elif len(parts) == 2:
+                s, name = parts
+                if s == schema:
+                    spiders.append(name)
+
+    cmd = MultiTool(spiders=spiders,  quiet=ctx.obj.quiet, no_color=ctx.obj.no_color)
     # rearrange the arguments so that the MultiTool will parse them correctly.
-    args = args[args.index('multi'):]
+    args = sys.argv[1:]
+    args = args[args.index('multi'):] + args[:args.index('multi')]
     return cmd.execute_from_commandline(args)

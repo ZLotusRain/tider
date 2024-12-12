@@ -1,5 +1,9 @@
+import contextlib
 from click import ClickException
-from requests import RequestException, Timeout
+from typing import Iterator, Mapping, Type
+
+
+ExceptionMapping = Mapping[Type[Exception], Type[Exception]]
 
 
 def reraise(tp, value, tb=None):
@@ -9,8 +13,23 @@ def reraise(tp, value, tb=None):
     raise value
 
 
+@contextlib.contextmanager
+def map_exceptions(mapping: ExceptionMapping) -> Iterator[None]:
+    try:
+        yield
+    except Exception as exc:  # noqa: PIE786
+        for from_exc, to_exc in mapping.items():
+            if isinstance(exc, from_exc):
+                raise to_exc(exc) from exc
+        raise  # pragma: nocover
+
+
 class SpiderShutdown(SystemExit):
-    """Signals that the worker should perform a warm shutdown."""
+    """Signals that the spider should perform a warm shutdown."""
+
+
+class SpiderTerminate(SystemExit):
+    """Signals that the spider should perform a cold shutdown."""
 
 
 class TiderDeprecationWarning(Warning):
@@ -55,17 +74,93 @@ class SecurityError(TiderException):
     """Security related exception."""
 
 
-class ExplorerTimeoutError(TiderException):
-    """Raised when timeout parameter is invalid."""
+class DownloadError(TiderException):
+    pass
 
 
-class ContentDecodingError(TiderException):
+class HTTPError(DownloadError):
+    """Base class for all http errors in tider."""
+
+
+class ProxyError(DownloadError):
+    """An error occurred while establishing a proxy connection."""
+
+
+class ProtocolError(DownloadError):
+    """The protocol was violated."""
+
+
+class SSLError(DownloadError):
+    """An SSL error occurred."""
+
+
+class TooManyRedirects(DownloadError):
+    """Too many redirects."""
+
+
+class InvalidURL(DownloadError):
+    pass
+
+
+class InvalidHeader(DownloadError):
+    pass
+
+
+class InvalidProxyURL(DownloadError):
+    pass
+
+
+class InvalidSchema(DownloadError):
+    pass
+
+
+class Timeout(DownloadError):
+    pass
+
+
+class PoolTimeout(Timeout):
+    """
+    compat for `httpcore.PoolTimeout`
+    """
+
+
+class WriteTimeout(Timeout):
+    """
+     compat for `httpcore.WriteError`
+     """
+
+
+class ReadTimeout(Timeout):
+    pass
+
+
+class ConnectTimeout(Timeout):
+    pass
+
+
+class ConnectionError(DownloadError):
+    pass
+
+
+class RetryError(DownloadError):
+    pass
+
+
+class ContentDecodingError(DownloadError):
     """
     Decoding of the response failed, due to a malformed encoding.
     """
 
 
-class WgetError(TiderException):
+class ResponseReadError(DownloadError):
+    pass
+
+
+class ResponseStreamConsumed(DownloadError):
+    pass
+
+
+class WgetError(DownloadError):
     def __init__(self, cmd, returncode=None, timeout=None, output=None, stderr=None):
         self.cmd = cmd
         self.returncode = returncode
@@ -93,55 +188,37 @@ class WgetError(TiderException):
         self.output = value
 
 
-class ReadError(RequestException):
+class ReadError(DownloadError):
     """
     compat for `httpcore.ReadError`
     """
 
 
-class WriteError(RequestException):
+class WriteError(DownloadError):
     """
     compat for `httpcore.WriteError`
     """
 
 
-class NetworkError(RequestException):
+class NetworkError(DownloadError):
     """
     compat for `httpcore.NetworkError`
     """
 
 
-class UnsupportedProtocol(RequestException):
+class UnsupportedProtocol(DownloadError):
     """
     compat for `httpcore.UnsupportedProtocol`
     """
 
 
-class ProtocolError(RequestException):
-    """
-    compat for `httpcore.ProtocolError`
-    """
-
-
-class LocalProtocolError(RequestException):
+class LocalProtocolError(DownloadError):
     """
     compat for `httpcore.LocalProtocolError`
     """
 
 
-class RemoteProtocolError(RequestException):
+class RemoteProtocolError(DownloadError):
     """
     compat for `httpcore.RemoteProtocolError`
     """
-
-
-class PoolTimeout(Timeout):
-    """
-    compat for `httpcore.PoolTimeout`
-    """
-
-
-class WriteTimeout(Timeout):
-    """
-     compat for `httpcore.WriteError`
-     """

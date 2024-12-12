@@ -7,10 +7,6 @@ __all__ = ('get_implementation', 'get_available_pool_names',)
 ALIASES = {
     'eventlet': 'tider.concurrency.eventlet:TaskPool',
     'gevent': 'tider.concurrency.gevent:TaskPool'
-    # 'prefork': 'concurrency.prefork:TaskPool',
-    # 'gevent': 'concurrency.gevent:TaskPool',
-    # 'solo': 'concurrency.solo:TaskPool',
-    # 'processes': 'concurrency.prefork:TaskPool',  # XXX compat alias
 }
 
 try:

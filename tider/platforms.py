@@ -110,7 +110,7 @@ class Pidfile:
     def remove_if_stale(self):
         """Remove the lock if the process isn't running.
 
-        I.e. process does not respons to signal.
+        I.e. process does not respond to signal.
         """
         try:
             pid = self.read_pid()
@@ -124,7 +124,7 @@ class Pidfile:
 
         try:
             os.kill(pid, 0)
-        except os.error as exc:
+        except OSError as exc:
             if exc.errno == errno.ESRCH or exc.errno == errno.EPERM:
                 print('Stale pidfile exists - Removing it.', file=sys.stderr)
                 self.remove()
@@ -291,7 +291,7 @@ class DaemonContext:
 
 
 def detached(logfile=None, pidfile=None, uid=None, gid=None, umask=0,
-             workdir=None, fake=False, **opts):
+             workdir=None, fake=False):
     """Detach the current process in the background (daemonize).
 
     Arguments:
@@ -310,21 +310,6 @@ def detached(logfile=None, pidfile=None, uid=None, gid=None, umask=0,
             the child process.
         workdir (str): Optional new working directory.
         fake (bool): Don't actually detach, intended for debugging purposes.
-        **opts (Any): Ignored.
-
-    Example:
-        >>> from tider.platforms import detached, create_pidlock
-        >>> with detached(
-        ...           logfile='/var/log/app.log',
-        ...           pidfile='/var/run/app.pid',
-        ...           uid='nobody'):
-        ... # Now in detached child process with effective user set to nobody,
-        ... # and we know that our logfile can be written to, and that
-        ... # the pidfile isn't locked.
-        ... pidlock = create_pidlock('/var/run/app.pid')
-        ...
-        ... # Run the program
-        ... program.run(logfile='/var/log/app.log')
     """
     if not resource:
         raise RuntimeError('This platform does not support detach.')
@@ -513,34 +498,6 @@ class Signals:
 
     If the requested signal isn't supported on the current platform,
     the operation will be ignored.
-
-    Example:
-        >>> from tider.platforms import signals
-
-        >>> from proj.handlers import my_handler
-        >>> signals['INT'] = my_handler
-
-        >>> signals['INT']
-        my_handler
-
-        >>> signals.supported('INT')
-        True
-
-        >>> signals.signum('INT')
-        2
-
-        >>> signals.ignore('USR1')
-        >>> signals['USR1'] == signals.ignored
-        True
-
-        >>> signals.reset('USR1')
-        >>> signals['USR1'] == signals.default
-        True
-
-        >>> from proj.handlers import exit_handler, hup_handler
-        >>> signals.update(INT=exit_handler,
-        ...                TERM=exit_handler,
-        ...                HUP=hup_handler)
     """
 
     ignored = _signal.SIG_IGN
@@ -609,6 +566,10 @@ class Signals:
 
 
 signals = Signals()
+get_signal = signals.signum  # compat
+install_signal_handler = signals.__setitem__  # compat
+reset_signal = signals.reset  # compat
+ignore_signal = signals.ignore  # compat
 
 
 def get_errno_name(n):

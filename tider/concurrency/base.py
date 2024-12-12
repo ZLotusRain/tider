@@ -1,14 +1,14 @@
 import sys
 import time
 import psutil
-import logging
 from typing import Deque, Callable
 from billiard.einfo import ExceptionInfo
 from billiard.exceptions import WorkerLostError
 
-from tider.exceptions import SpiderShutdown, reraise
+from tider.utils.log import get_logger
+from tider.exceptions import SpiderShutdown, SpiderTerminate, reraise
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def apply_target(target, args=(), kwargs=None, callback=None, propagate=(), **_):
@@ -17,7 +17,9 @@ def apply_target(target, args=(), kwargs=None, callback=None, propagate=(), **_)
     args = args or ()
     try:
         ret = target(*args, **kwargs)
-    except (propagate, Exception, SpiderShutdown):
+    except (SpiderShutdown, SpiderTerminate):
+        raise
+    except (propagate, Exception):
         raise
     except BaseException as exc:
         try:
@@ -44,13 +46,11 @@ def worker(queue: Deque, processor: Callable, output_handler=None, shutdown_even
         except IndexError:
             if shutdown_event and shutdown_event():
                 return
+        finally:
             # switch greenlet if using gevent
             # when the active one can't get the next request
             # to avoid keeping loop.
-        except Exception as e:
-            logger.exception(f'Worker processing bug: {e}')
-        finally:
-            time.sleep(0.1)
+            time.sleep(0.01)
 
 
 class BasePool:

@@ -19,8 +19,8 @@ version_info = tuple(int(v) if v.isdigit() else v for v in __version__.split('.'
 
 
 # Check minimum required Python version
-if sys.version_info < (3, 6):
-    print(f"Tider {__version__} requires Python 3.6+")
+if sys.version_info < (3, 7):
+    print(f"Tider {__version__} requires Python 3.7+")
     sys.exit(1)
 
 # https://github.com/gevent/gevent/issues/1909
@@ -75,11 +75,12 @@ def _patch_eventlet():
 def _patch_gevent():
     import gevent.monkey
     import gevent.signal
-    from gevent.queue import LifoQueue
 
     gevent.monkey.patch_all()
 
+    from gevent.queue import LifoQueue
     from urllib3.connectionpool import ConnectionPool
+    # https://github.com/gevent/gevent/issues/1957
     ConnectionPool.QueueCls = LifoQueue
 
 

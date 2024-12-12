@@ -1,224 +1,265 @@
-from urllib3.response import HTTPResponse
-from urllib3.util import Timeout as TimeoutSauce
-from urllib3.exceptions import ClosedPoolError, ConnectTimeoutError
-from urllib3.exceptions import HTTPError as _HTTPError
-from urllib3.exceptions import InvalidHeader as _InvalidHeader
-from urllib3.exceptions import (
-    LocationValueError,
-    MaxRetryError,
-    NewConnectionError,
-    ProtocolError,
-)
-from urllib3.exceptions import ProxyError as _ProxyError
-from urllib3.exceptions import ReadTimeoutError, ResponseError
-from urllib3.exceptions import SSLError as _SSLError
+import os
+import threading
+from pathlib import Path
+from typing import Mapping, Optional
 
-from requests import Response
-from requests.cookies import extract_cookies_to_jar
+from requests.utils import (
+    get_environ_proxies,
+    get_netrc_auth,
+    to_key_val_list
+)
+from requests.cookies import (
+    merge_cookies,
+    cookiejar_from_dict,
+    RequestsCookieJar
+)
 from requests.structures import CaseInsensitiveDict
-from requests.utils import get_encoding_from_headers
-from requests.adapters import HTTPAdapter as _HTTPAdapter
-from requests.exceptions import (
-    ConnectionError,
-    ConnectTimeout,
-    InvalidHeader,
-    InvalidURL,
-    ProxyError,
-    ReadTimeout,
-    RetryError,
-    SSLError,
-)
-from requests.sessions import Session as _Session
+
+from tider import Request
+from tider.network.proxy import Proxy
+from tider.network.user_agent import default_user_agent
+from tider.utils.log import get_logger
+from tider.utils.misc import symbol_by_name, build_from_crawler
+
+logger = get_logger(__name__)
 
 
-DEFAULT_POOL_TIMEOUT = None
+def default_headers():
+    """
+    :rtype: requests.structures.CaseInsensitiveDict
+    """
+    return CaseInsensitiveDict({
+        'User-Agent': default_user_agent(),
+        'Accept-Encoding': ', '.join(('gzip', 'deflate')),
+        'Accept': '*/*',
+        'Connection': 'keep-alive',
+    })
 
 
-def _encoding_from_content_type(headers):
-    content_type = headers.get("Content-Type", "")
-    charset = list(filter(lambda x: "charset" in x, content_type.split(";")))
+def merge_setting(request_setting, session_setting, dict_class=CaseInsensitiveDict):
+    """Determines appropriate setting for a given request, taking into account
+    the explicit setting on that request, and the setting in the session. If a
+    setting is a dictionary, they will be merged together using `dict_class`
+    """
 
-    if not charset:
-        encoding = get_encoding_from_headers(headers)
-        if "text" in content_type:
-            encoding = None  # maybe "ISO-8859-1" or 'UTF-8'
-    else:
-        encoding = charset[0].split("=")[-1]
-    return encoding
+    if session_setting is None:
+        return request_setting
+
+    if request_setting is None:
+        return session_setting
+
+    # Bypass if not a dictionary (e.g. verify)
+    if not (
+        isinstance(session_setting, Mapping) and isinstance(request_setting, Mapping)
+    ):
+        return request_setting
+
+    merged_setting = dict_class(to_key_val_list(session_setting))
+    merged_setting.update(to_key_val_list(request_setting))
+
+    # Remove keys that are set to None. Extract keys first to avoid altering
+    # the dictionary during iteration.
+    none_keys = [k for (k, v) in merged_setting.items() if v is None]
+    for key in none_keys:
+        del merged_setting[key]
+
+    return merged_setting
 
 
-class HTTPAdapter(_HTTPAdapter):
+def get_ca_bundle_from_env() -> Optional[str]:
+    if "REQUESTS_CA_BUNDLE" in os.environ:
+        return os.environ.get("REQUESTS_CA_BUNDLE")
+    if "CURL_CA_BUNDLE" in os.environ:
+        return os.environ.get("CURL_CA_BUNDLE")
+    if "SSL_CERT_FILE" in os.environ:
+        ssl_file = Path(os.environ["SSL_CERT_FILE"])
+        if ssl_file.is_file():
+            return str(ssl_file)
+    if "SSL_CERT_DIR" in os.environ:
+        ssl_path = Path(os.environ["SSL_CERT_DIR"])
+        if ssl_path.is_dir():
+            return str(ssl_path)
+    return None
 
-    def build_response(self, req, resp):
-        """Builds a :class:`Response <requests.Response>` object from a urllib3
-        response. This should not be called from user code, and is only exposed
-        for use when subclassing the
-        :class:`HTTPAdapter <requests.adapters.HTTPAdapter>`
 
-        :param req: The :class:`PreparedRequest <PreparedRequest>` used to generate the response.
-        :param resp: The urllib3 response object.
-        :rtype: requests.Response
-        """
-        response = Response()
+class Session:
 
-        # Fallback to None if there's no status_code, for whatever reason.
-        response.status_code = getattr(resp, "status", None)
+    DEFAULT_REDIRECT_LIMIT = 30
+    DEFAULT_DOWNLOADERS = {
+        'default': 'tider.network.downloaders:HTTPDownloader',
+        'wget': 'tider.network.downloaders:WgetDownloader',
+        'impersonate': 'tider.network.downloaders:ImpersonateDownloader',
+    }
 
-        # Make headers case-insensitive.
-        response.headers = CaseInsensitiveDict(getattr(resp, "headers", {}))
+    __attrs__ = [
+        "headers",
+        "cookies",
+        "auth",
+        "proxies",
+        "verify",
+        "cert",
+        "_downloaders",
+        "stream",
+        "trust_env",
+        "max_redirects",
+    ]
 
-        # Set encoding.
-        response.encoding = _encoding_from_content_type(response.headers)
-        response.raw = resp
-        response.reason = resp.reason
+    def __init__(self, crawler=None, headers=None, auth=None, proxies=None, stream=False, cookies=None,
+                 verify=False, cert=None, trust_env=True, redirect_limit=None, downloaders=None):
+        self._crawler = crawler
+        self.headers = default_headers()
+        if headers is not None:
+            self.headers.update(headers)
+        self.auth = auth
+        self.proxies = dict(proxies) if proxies else {}
+        self.stream = stream
+        self.verify = verify
+        self.cert = cert
+        self.cookies = cookiejar_from_dict(cookies)
 
-        if isinstance(req.url, bytes):
-            response.url = req.url.decode("utf-8")
-        else:
-            response.url = req.url
+        #: Trust environment settings for proxy configuration, default
+        #: authentication and similar.
+        self.trust_env = trust_env
 
-        # Add new cookies from the server.
-        extract_cookies_to_jar(response.cookies, req, resp)
+        self.max_redirects = redirect_limit or self.DEFAULT_REDIRECT_LIMIT
+        self._load_lock = threading.Lock()
 
-        # Give the Response some context.
-        # use connection(adapter) to manage pool and proxy
-        response.request = req
-        # response.connection = self
+        self._downloaders = {}
+        self._detected_downloaders = self.DEFAULT_DOWNLOADERS.copy()
+        self._detected_downloaders.update(dict(downloaders) if downloaders else {})
+        for downloader in self._detected_downloaders:
+            self._load_downloader(downloader, skip_lazy=True)
 
-        return response
-
-    def send(self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):
-        try:
-            conn = self.get_connection(request.url, proxies)
-        except LocationValueError:
-            raise InvalidURL(request=request)
-
-        self.cert_verify(conn, request.url, verify, cert)
-        url = self.request_url(request, proxies)
-        self.add_headers(
-            request,
-            stream=stream,
-            timeout=timeout,
-            verify=verify,
-            cert=cert,
-            proxies=proxies,
+    @classmethod
+    def from_crawler(cls, crawler):
+        return cls(
+            crawler=crawler,
+            headers=crawler.settings.get('EXPLORER_SESSION_HEADERS'),
+            auth=crawler.settings.get('EXPLORER_SESSION_AUTH'),
+            proxies=crawler.settings.get('EXPLORER_SESSION_PROXIES'),
+            stream=crawler.settings.getbool('EXPLORER_SESSION_STREAM'),
+            cookies=crawler.settings.get('EXPLORER_SESSION_COOKIES'),
+            verify=crawler.settings.get('EXPLORER_SESSION_VERIFY'),
+            cert=crawler.settings.get('EXPLORER_SESSION_CERT'),
+            trust_env=crawler.settings.get('EXPLORER_SESSION_TRUST_ENV'),
+            redirect_limit=crawler.settings.get("EXPLORER_SESSION_REDIRECT_LIMIT"),
+            downloaders=crawler.settings.getdict("EXPLORER_DOWNLOADERS"),
         )
 
-        chunked = not (request.body is None or "Content-Length" in request.headers)
+    def _get_downloader(self, downloader: str):
+        """
+        Lazy-load the downloader only on the first request for that downloader.
+        """
+        if downloader in self._downloaders:
+            return self._downloaders[downloader]
+        if downloader not in self._detected_downloaders:
+            return None
 
-        if isinstance(timeout, tuple):
+        return self._load_downloader(downloader)
+
+    def _load_downloader(self, downloader, skip_lazy=False):
+        with self._load_lock:
+            # avoid loading the same downloader multi times.
+            if downloader in self._downloaders:
+                return self._downloaders[downloader]
+            path = self._detected_downloaders[downloader]
+            # noinspection PyBroadException
             try:
-                connect, read = timeout
-                timeout = TimeoutSauce(connect=connect, read=read)
-            except ValueError:
-                raise ValueError(
-                    f"Invalid timeout {timeout}. Pass a (connect, read) timeout tuple, "
-                    f"or a single float to set both timeouts to the same value."
-                )
-        elif isinstance(timeout, TimeoutSauce):
-            pass
-        else:
-            timeout = TimeoutSauce(connect=timeout, read=timeout)
-
-        if not chunked:
-            try:
-                resp = conn.urlopen(
-                    method=request.method,
-                    url=url,
-                    body=request.body,
-                    headers=request.headers.copy(),
-                    redirect=False,
-                    assert_same_host=False,
-                    preload_content=False,
-                    decode_content=False,
-                    retries=self.max_retries,
-                    timeout=timeout,
-                )
-            except (ProtocolError, OSError) as err:
-                raise ConnectionError(err, request=request)
-
-            except MaxRetryError as e:
-                if isinstance(e.reason, ConnectTimeoutError):
-                    # TODO: Remove this in 3.0.0: see #2811
-                    if not isinstance(e.reason, NewConnectionError):
-                        raise ConnectTimeout(e, request=request)
-
-                if isinstance(e.reason, ResponseError):
-                    raise RetryError(e, request=request)
-
-                if isinstance(e.reason, _ProxyError):
-                    raise ProxyError(e, request=request)
-
-                if isinstance(e.reason, _SSLError):
-                    # This branch is for urllib3 v1.22 and later.
-                    raise SSLError(e, request=request)
-
-                raise ConnectionError(e, request=request)
-
-            except ClosedPoolError as e:
-                raise ConnectionError(e, request=request)
-
-            except _ProxyError as e:
-                raise ProxyError(e)
-
-            except (_SSLError, _HTTPError) as e:
-                if isinstance(e, _SSLError):
-                    # This branch is for urllib3 versions earlier than v1.22
-                    raise SSLError(e, request=request)
-                elif isinstance(e, ReadTimeoutError):
-                    raise ReadTimeout(e, request=request)
-                elif isinstance(e, _InvalidHeader):
-                    raise InvalidHeader(e, request=request)
-                else:
-                    raise
-        else:
-            if hasattr(conn, "proxy_pool"):
-                conn = conn.proxy_pool
-
-            low_conn = conn._get_conn(timeout=DEFAULT_POOL_TIMEOUT)
-            try:
-                skip_host = "Host" in request.headers
-                low_conn.putrequest(
-                    request.method,
-                    url,
-                    skip_accept_encoding=True,
-                    skip_host=skip_host,
-                )
-
-                for header, value in request.headers.items():
-                    low_conn.putheader(header, value)
-
-                low_conn.endheaders()
-
-                for i in request.body:
-                    low_conn.send(hex(len(i))[2:].encode("utf-8"))
-                    low_conn.send(b"\r\n")
-                    low_conn.send(i)
-                    low_conn.send(b"\r\n")
-                low_conn.send(b"0\r\n\r\n")
-
-                # Receive the response from the server
-                r = low_conn.getresponse()
-
-                resp = HTTPResponse.from_httplib(
-                    r,
-                    pool=conn,
-                    connection=low_conn,
-                    preload_content=False,
-                    decode_content=False,
+                dhcls = symbol_by_name(path)
+                if skip_lazy and getattr(dhcls, "lazy", True):
+                    return None
+                dh = build_from_crawler(
+                    dhcls,
+                    self._crawler,
                 )
             except Exception:
-                # If we hit any problems here, clean up the connection.
-                # Then, raise so that we can handle the actual exception.
-                low_conn.close()
-                raise
+                logger.error(
+                    'Loading "%(clspath)s" for downloader "%(downloader)s"',
+                    {"clspath": path, "scheme": downloader},
+                    exc_info=True,
+                )
+                return None
+            else:
+                self._downloaders[downloader] = dh
+                return dh
 
-        return self.build_response(request, resp)
+    def __enter__(self):
+        return self
 
+    def __exit__(self, *args):
+        self.close()
 
-class Session(_Session):
+    def merge_environment_settings(self, request: Request):
+        """
+        Check the environment and merge it with some settings.
 
-    def __init__(self):
-        super(Session, self).__init__()
-        self.mount("https://", HTTPAdapter(pool_maxsize=10, pool_block=True))
-        self.mount("http://", HTTPAdapter(pool_maxsize=10, pool_block=True))
+        :rtype: dict
+        """
+        # Gather clues from the surrounding environment.
+        if self.trust_env:
+            if request.proxy_schema not in ('no_proxy', 'dummy', 0):
+                new_proxies = dict(request.proxies or {})
+                # Set environment's proxies.
+                # use no_proxy to avoid using proxy for specific domain.
+                no_proxy = new_proxies.get("no_proxy") if new_proxies is not None else None
+                env_proxies = get_environ_proxies(request.url, no_proxy=no_proxy)
+                for (k, v) in env_proxies.items():
+                    new_proxies.setdefault(k, v)
+                new_proxies = merge_setting(new_proxies, self.proxies)
+
+                new_proxy = Proxy(new_proxies)
+                if new_proxy.select_proxy(request.url) != request.selected_proxy:
+                    # replace with environment proxies.
+                    # if the proxy has already been discarded, a ProxyError will be raised.
+                    request.update_proxy(new_proxy)
+
+            # Look for requests environment configuration
+            # and be compatible with cURL.
+            if request.verify is True or request.verify is None:
+                request.verify = (
+                    get_ca_bundle_from_env()
+                    or request.verify
+                )
+
+        # Merge all the kwargs.
+        request.stream = merge_setting(request.stream, self.stream)
+        request.verify = merge_setting(request.verify, self.verify)
+        request.cert = merge_setting(request.cert, self.cert)
+
+    def download_request(self, request: Request):
+        request.prepared.prepare_headers(merge_setting(request.headers, self.headers))
+
+        cookies = request.cookies
+        # Merge with session cookies
+        merged_cookies = merge_cookies(
+            merge_cookies(RequestsCookieJar(), self.cookies), cookies
+        )
+        request.prepared.prepare_cookies(merged_cookies)
+
+        auth = request.prepared.auth
+        if self.trust_env and not auth and not self.auth:
+            auth = get_netrc_auth(request.url)
+            auth = merge_setting(auth, self.auth)
+            request.prepared.auth = auth
+            request.prepared.prepare_auth(auth)
+
+        self.merge_environment_settings(request)
+
+        downloader = request.downloader
+        if request.impersonate and not downloader:
+            downloader = 'impersonate'
+        downloader = self._get_downloader(downloader or 'default')
+        if not downloader:
+            raise RuntimeError(f"Can't load downloader `{downloader}`")
+
+        result = downloader.download_request(request, session_cookies=request.session_cookies, trust_env=self.trust_env)
+        return result
+
+    def close(self):
+        for downloader in self._downloaders.values():
+            downloader.close()
+
+    def close_expired_connections(self):
+        # avoid dict changed.
+        for downloader in dict(self._downloaders).values():
+            downloader.close_expired_connections()

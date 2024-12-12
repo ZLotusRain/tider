@@ -347,7 +347,7 @@ class Settings(BaseSettings):
         # values given by the user
         default = {key: getattr(default_settings, key) for key in dir(default_settings) if key.isupper()}
         defaults = [] if defaults is None else defaults
-        defaults.append(default)
+        defaults.insert(0, default)
         super().__init__(values, priority, defaults)
         self.update(values, priority)
 

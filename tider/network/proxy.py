@@ -1,14 +1,19 @@
-import time
 import random
 import inspect
 import urllib3
+import weakref
+from datetime import timedelta
 from threading import RLock
-from typing import Union, List
 from abc import abstractmethod
+from typing import Union, List
 
-from tider import Item, Field
-from tider.structures.lock import DummyLock
-from tider.exceptions import UnSupportedMethod
+from urllib.parse import urlparse
+
+from tider.utils.misc import symbol_by_name, build_from_crawler
+from tider.utils.collections import DummyLock
+from tider.utils.time import preferred_clock
+from tider.utils.url import prepend_scheme_if_needed
+from tider.exceptions import ProxyError
 
 URLLIB3_SUPPORTS_HTTPS = tuple(urllib3.__version__.split('.')) > ('1', '26')
 
@@ -51,6 +56,7 @@ class ProxyContainer:
         self.lock = RLock() if use_lock else DummyLock()
 
     def _new_proxy(self, disposable=False, on_discard=None, **kwargs):
+        """arguments are only used if a new proxy is created."""
         result = None
         while result is None:
             result = self._proxypool.get_proxy(**kwargs)
@@ -59,16 +65,24 @@ class ProxyContainer:
             result = tmp
         if isinstance(result, list):
             result = random.choice(result)
+        if isinstance(result, Proxy):
+            return result
+        if isinstance(result, str):
+            if result.lower().startswith('socks'):
+                result = {'socks': result}
+            else:
+                result = {'https': result, 'http': result}
         if isinstance(result, dict):
             self.newed += 1
             self.stats and self.stats.inc_value('proxy/count')
-            return Proxy(disposable=disposable, on_discard=on_discard, **result)
+            return Proxy(proxies=result, disposable=disposable, on_discard=on_discard)
         typename = type(result).__name__
         raise TypeError(f"Received unexpected type {typename!r} from "
                         f"{self._proxypool.__class__.__name__}.get_proxy")
 
     def clear(self):
         for proxy in self._queue:
+            proxy.invalidate()
             proxy.discard()
         self._queue[:] = []
 
@@ -76,7 +90,12 @@ class ProxyContainer:
         """
         get the shortest valid proxy.
         """
-        valids = list(filter(lambda x: x.valid, self._queue))
+        valids = []
+        for proxy in self._queue:
+            if not proxy.valid:
+                proxy.discard()
+            else:
+                valids.append(proxy)
         return min(valids, key=lambda x: x.elapsed)
 
     def get_proxy(self, disposable=False, on_discard=None, **kwargs):
@@ -88,7 +107,7 @@ class ProxyContainer:
             except ValueError:
                 # no valid Proxy in queue.
                 if len(self) >= self._maxsize:
-                    self._queue[:] = []
+                    self.clear()
                 proxy = self._new_proxy(disposable, on_discard, **kwargs)
                 self._queue.append(proxy)
                 return proxy
@@ -108,11 +127,25 @@ class ProxyPoolManager:
 
     NO_PROXY_FIELDS = ('no_proxy', 'dummy', 0)
 
-    def __init__(self, proxypool_kw=None, on_proxy_discard=None, stats=None):
+    def __init__(self, crawler, proxy_schemas=None, proxypool_kw=None, on_proxy_discard=None):
+        self._crawler = crawler
+        self.stats = crawler.stats
+
         self.containers = {}  # ProxyContainer, get proxy by schema
+        for schema in proxy_schemas:
+            proxy_cls = symbol_by_name(proxy_schemas[schema])
+            proxy_ins = build_from_crawler(proxy_cls, crawler)
+            self.register(schema, proxy_ins)
         self.proxypool_kw = dict(proxypool_kw) if proxypool_kw else {}  # global params for ProxyPool.get_proxy
         self._on_proxy_discard = on_proxy_discard
-        self.stats = stats
+
+    @classmethod
+    def from_crawler(cls, crawler):
+        return cls(
+            crawler=crawler,
+            proxy_schemas=crawler.settings.getdict('PROXY_SCHEMAS'),
+            proxypool_kw=crawler.settings.getdict('PROXY_PARAMS'),
+        )
 
     def register(self, schema, proxypool, maxsize=1):
         if not isinstance(proxypool, ProxyPool):
@@ -140,65 +173,38 @@ class ProxyPoolManager:
             container.close()
 
 
-class Proxy(Item):
+class Proxy:
 
-    http = Field()
-    https = Field()
+    def __init__(self, proxies=None, disposable=False, on_discard=None,
+                 timeout=None, max_used_times=None):
+        proxies = dict(proxies) if proxies else {}
+        for proxy_key in proxies:
+            proxy = proxies[proxy_key]
+            proxies[proxy_key] = prepend_scheme_if_needed(proxy, "http") if proxy else None
+            if URLLIB3_SUPPORTS_HTTPS and proxy_key in ('https', 'all'):
+                proxies[proxy_key] = proxies[proxy_key].replace('https', 'http')
+        self._proxies = proxies
 
-    def __init__(self, timeout=None, max_used_times=None,
-                 disposable=False, on_discard=None, *args, **kwargs):
-        self._initialized = False
-        super().__init__(*args, **kwargs)
-        self._initialized = True
-        self._init_time = time.time()
-        self._active_count = 0
-        self._used_times = 0
-        self._timeout = timeout
-        self._max_used_times = max_used_times
+        self._init_time = preferred_clock()
         self._disposable = disposable
-        self._elapsed = None
-        self._forbidden = False
-        self._on_discard = on_discard
+
+        self._on_discard = []
+        if on_discard is not None:
+            self.add_errback(on_discard)
+        self._lock = RLock()
+
+        self._actives = 0  # nums of requests bound to this proxy.
+        self._invalid = False
+        self._discarded = False
+        self._timeout = timeout
+        self._used_times = 0
+        if disposable:
+            max_used_times = 1
+        self._max_used_times = max_used_times
 
     @property
-    def elapsed(self):
-        if not self.discarded:
-            self._elapsed = int(time.time() - self._init_time)
-        return self._elapsed
-
-    def __setitem__(self, key, value):
-        if self._initialized:
-            raise ValueError("Can not update the Proxy after initialized.")
-        if URLLIB3_SUPPORTS_HTTPS and key == 'https':
-            value = value.replace('https', 'http')
-        super().__setitem__(key, value)
-
-    def forbid(self):
-        """
-        Forbid this Proxy when occurred proxy-related error.
-        """
-        self._forbidden = True
-
-    def discard(self):
-        """
-        Force to discard the proxy, use this directly
-        may close connections which are used by other requests.
-        """
-        if self._discarded:
-            return
-        self._elapsed = int(time.time() - self._init_time)
-        # may affect speed due to the RecentlyUsedContainer lock.
-        self._on_discard and self._on_discard(proxy=self)
-        self._discarded = True
-
-    def maybe_discard(self):
-        """
-        Call this method if the proxy is no longer needed.
-        """
-        self.deactivate()
-        if self.valid or self.active():
-            return
-        self.discard()
+    def proxies(self):
+        return dict(self._proxies)  # can't be updated.
 
     @property
     def disposable(self):
@@ -207,11 +213,65 @@ class Proxy(Item):
         """
         return self._disposable
 
-    def update(self, **kwargs):
-        raise UnSupportedMethod("Can not update the Proxy, recreate a Proxy instance instead.")
+    @property
+    def elapsed(self):
+        return timedelta(seconds=preferred_clock() - self._init_time)
 
-    def active(self):
-        return self._active_count > 0
+    def add_errback(self, errback):
+        if errback in self._on_discard:
+            # avoid adding duplicate errbacks.
+            return
+        self._on_discard.append(errback)
+
+    def weak(self):
+        return weakref.ref(self)
+
+    def connect(self):
+        with self._lock:
+            self._used_times += 1
+            if not self.valid:
+                raise ProxyError("Can't connect to the invalid proxy.")
+            self._actives += 1
+
+    def disconnect(self, invalidate=False):
+        with self._lock:
+            self._actives -= 1
+            if invalidate or self.disposable:
+                self.invalidate()
+        self.discard()
+
+    def invalidate(self):
+        """
+        Invalidate this Proxy when occurred proxy-related error.
+        """
+        self._invalid = True
+
+    def discard(self, force=False):
+        """
+        Discard the proxy if invalid and no request is using it , force to call this directly
+        may close connections which are used by other requests.
+        """
+        with self._lock:
+            if self._discarded:
+                return
+
+            if not force and (self._actives > 0 or self.valid):
+                return
+
+            self._discarded = True
+            # may affect speed due to the RecentlyUsedContainer lock.
+            for errback in self._on_discard:
+                errback(proxy=self)
+            del self._on_discard
+
+    def __enter__(self):
+        self.connect()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        invalidate = False
+        if isinstance(exc_val, ProxyError):
+            invalidate = True
+        self.disconnect(invalidate=invalidate)
 
     @property
     def valid(self):
@@ -220,24 +280,35 @@ class Proxy(Item):
         If the proxy is disposable or forbidden or has already been discarded,
         we consider it as invalid.
         """
-        valid = not (self.disposable or self._forbidden or self.discarded)
+        valid = not (self._invalid or self._discarded)
         if self._timeout is not None:
             valid = valid and self.elapsed < self._timeout
-        if self._max_used_times is not None:
+        if self._max_used_times is not None and self._max_used_times > 0:
             valid = valid and self._used_times <= self._max_used_times
         return valid
 
-    def activate(self):
-        """
-        Call this method after assigned.
-        """
-        self._active_count += 1
+    def select_proxy(self, url):
+        """Select a proxy for the url, if applicable.
 
-    def deactivate(self):
-        self._active_count -= 1
+        :param url: The url being for the request
+        """
+        if not self.valid:
+            raise ProxyError("Can't select from a discarded proxy.")
+        urlparts = urlparse(url)
+        if urlparts.hostname is None:
+            return self.proxies.get(urlparts.scheme, self.proxies.get("all"))
 
-    def fetch(self):
-        if self.discarded or not self.active():
-            raise TypeError("Can not fetch from an inactive or discarded proxy.")
-        self._used_times += 1
-        return dict(self)
+        proxy_keys = [
+            urlparts.scheme + "://" + urlparts.hostname,
+            urlparts.scheme + "://",
+            urlparts.scheme,
+            "all://" + urlparts.hostname,
+            "all",
+        ]
+        proxy = None
+        for proxy_key in proxy_keys:
+            if proxy_key in self.proxies:
+                proxy = self.proxies[proxy_key]
+                break
+
+        return proxy
