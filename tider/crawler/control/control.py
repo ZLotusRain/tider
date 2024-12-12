@@ -124,18 +124,6 @@ class Inspect:
     def hello(self, from_node):
         return self._request('hello', from_node=from_node)
 
-    def sames(self, from_node):
-        return self._exclude_errors_and_nones(self.app.control.broadcast(
-            'sames',
-            arguments={'from_node': from_node},
-            destination=self.destination,
-            callback=self.callback,
-            connection=self.connection,
-            limit=self.limit,
-            timeout=self.timeout, reply=True,
-            pattern=self.pattern, matcher=self.matcher,
-        ))
-
     def settings(self):
         return self._request('settings')
 

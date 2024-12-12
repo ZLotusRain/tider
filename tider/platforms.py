@@ -8,14 +8,18 @@ import sys
 import math
 import errno
 import atexit
+import shutil
 import numbers
 import signal as _signal
 import platform as _platform
 from contextlib import contextmanager
+
 from kombu.utils.compat import maybe_fileno
 from billiard.compat import close_open_fds, get_fdmax
+from billiard.util import set_pdeathsig as _set_pdeathsig
 
 from tider.utils.misc import try_import
+from tider.utils.nodenames import nodesplit
 from tider.exceptions import reraise, SecurityError
 
 
@@ -76,7 +80,11 @@ class Pidfile:
     #: Path to the pid lock file.
     path = None
 
-    def __init__(self, path):
+    def __init__(self, path, group=None):
+        self.group = group
+        dir_path = os.path.dirname(path)
+        if dir_path and not os.path.exists(dir_path):
+            os.makedirs(dir_path)
         self.path = os.path.abspath(path)
 
     def acquire(self):
@@ -118,6 +126,10 @@ class Pidfile:
         """Remove the lock."""
         with ignore_errno(errno.ENOENT, errno.EACCES):
             os.unlink(self.path)
+        dirname = os.path.dirname(self.path)
+        if self.group and dirname.endswith(self.group):
+            pidd = PidDirectory(dirname)
+            pidd.remove_if_stale()
 
     def remove_if_stale(self):
         """Remove the lock if the process isn't running.
@@ -173,7 +185,52 @@ class Pidfile:
             rfh.close()
 
 
-def create_pidlock(pidfile):
+class PidDirectory:
+
+    dirname = None
+
+    def __init__(self, dirname):
+        if dirname == '/' or '*' in dirname:
+            raise ValueError("Can't use root or vague directory to store pidfile.")
+
+        self.dirname = dirname
+        self.program_name = dirname.split('/')[-1]
+
+    def exists(self):
+        return os.path.exists(self.dirname)
+
+    def pidlocks(self):
+        if not self.exists():
+            return
+        group = nodesplit(self.program_name)[0] or self.program_name
+        for name in os.listdir(self.dirname):
+            if not name.endswith('.pid'):
+                continue
+            pidlock = Pidfile(os.path.join(self.dirname, name))
+            if name.startswith(group):
+                yield pidlock
+
+    def remove_if_stale(self):
+        for pidlock in self.pidlocks():
+            pidlock.remove_if_stale()
+        if self.exists() and not os.listdir(self.dirname):
+            print('Stale pid directory exists - Removing it.', file=sys.stderr)
+            try:
+                shutil.rmtree(self.dirname)
+            except FileNotFoundError:
+                pass
+
+    def read_pids(self):
+        pids = []
+        for pidlock in self.pidlocks():
+            if not pidlock.remove_if_stale():
+                pids.append(pidlock.read_pid())
+        if not pids:
+            self.remove_if_stale()
+        return pids
+
+
+def create_pidlock(pidfile, group=None, allow_duplicates=False):
     """Create and verify pidfile.
 
     If the pidfile already exists the program exits with an error message,
@@ -187,14 +244,17 @@ def create_pidlock(pidfile):
     Returns:
        Pidfile: used to manage the lock.
     """
-    pidlock = _create_pidlock(pidfile)
+    pidlock = _create_pidlock(pidfile, group=group, allow_duplicates=allow_duplicates)
     atexit.register(pidlock.release)
     return pidlock
 
 
-def _create_pidlock(pidfile):
-    pidlock = Pidfile(pidfile)
+def _create_pidlock(pidfile, group=None, allow_duplicates=False):
+    pidlock = Pidfile(pidfile, group=group)
     if pidlock.is_locked() and not pidlock.remove_if_stale():
+        if allow_duplicates:
+            pidfile = pidfile.replace('.pid', f'.{os.getpid()}.pid')
+            return _create_pidlock(pidfile, group=group)
         print(PIDLOCKED.format(pidfile, pidlock.read_pid()), file=sys.stderr)
         raise SystemExit(EX_CANTCREAT)
     pidlock.acquire()
@@ -303,7 +363,7 @@ class DaemonContext:
 
 
 def detached(logfile=None, pidfile=None, uid=None, gid=None, umask=0,
-             workdir=None, fake=False):
+             workdir=None, group=None, allow_duplicates=False, fake=False):
     """Detach the current process in the background (daemonize).
 
     Arguments:
@@ -321,6 +381,8 @@ def detached(logfile=None, pidfile=None, uid=None, gid=None, umask=0,
         umask (str, int): Optional umask that'll be effective in
             the child process.
         workdir (str): Optional new working directory.
+        group (str):
+        allow_duplicates (bool):
         fake (bool): Don't actually detach, intended for debugging purposes.
     """
     if not resource:
@@ -336,7 +398,8 @@ def detached(logfile=None, pidfile=None, uid=None, gid=None, umask=0,
         logfile and open(logfile, 'a').close()
         # Doesn't actually create the pidfile, but makes sure it's not stale.
         if pidfile:
-            _create_pidlock(pidfile).release()
+            # avoid pidlock conflicts.
+            _create_pidlock(pidfile, group=group, allow_duplicates=allow_duplicates).release()
 
     return DaemonContext(
         umask=umask, workdir=workdir, fake=fake, after_chdir=after_chdir_do,
@@ -582,6 +645,16 @@ get_signal = signals.signum  # compat
 install_signal_handler = signals.__setitem__  # compat
 reset_signal = signals.reset  # compat
 ignore_signal = signals.ignore  # compat
+
+
+def set_pdeathsig(name):
+    """Sends signal ``name`` to process when parent process terminates."""
+    if signals.supported('SIGKILL'):
+        try:
+            _set_pdeathsig(signals.signum('SIGKILL'))
+        except OSError:
+            # We ignore when OS does not support set_pdeathsig
+            pass
 
 
 def get_errno_name(n):

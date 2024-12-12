@@ -104,10 +104,9 @@ class DummyBroker(Broker):
 
     def consume(self, queues=None, on_message=None, on_message_consumed=None):
         on_message(message=None, payload=None, no_ack=True)
-        if not self.crawler.engine._spider_closed.is_set():
+        try:
             # start_requests consumed.
             self.crawler.engine._spider_closed.set()
-        try:
-            on_message_consumed(loop=True)
-        except RuntimeError:
+            on_message_consumed and on_message_consumed(loop=True)
+        except (TypeError, RuntimeError):
             return  # maybe shutdown

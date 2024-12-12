@@ -4,11 +4,12 @@ import importlib
 from typing import Iterable
 from pkgutil import iter_modules
 
+from tider.item import Item
 from tider.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-_ITERABLE_SINGLE_VALUES = dict, str, bytes
+_ITERABLE_SINGLE_VALUES = dict, Item, str, bytes
 
 
 def is_iterable(o) -> bool:

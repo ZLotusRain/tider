@@ -37,6 +37,7 @@ class BrokersManager:
 
         self.crawler = crawler
         self.custom_transports = dict(custom_transports or {})
+        self.poller = None
 
         self._brokers = set()
         self._consuming = False
@@ -65,11 +66,18 @@ class BrokersManager:
                              on_message=on_message,
                              on_message_consumed=on_message_consumed,)
 
-    def consume(self, transport='default', queues=None, on_message=None, on_messages_consumed=None):
-        broker = self._instantiate_broker(transport, queues, on_message, on_messages_consumed)
+    def start(self, poller=None):
+        self.poller = poller
+        if self.poller is not None:
+            self.poller.start()
+
+    def consume(self, transport='default', queues=None, on_message=None, on_message_consumed=None):
+        broker = self._instantiate_broker(transport, queues, on_message, on_message_consumed)
         self._brokers.add(broker)
         broker.start()
 
     def stop(self):
         for broker in self._brokers:
             broker.stop()
+        if self.poller is not None:
+            self.poller.join()

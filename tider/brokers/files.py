@@ -6,6 +6,8 @@ import zipfile
 import openpyxl
 from io import BytesIO
 
+from kombu.message import Message as KombuMessage
+
 from tider import Request
 from tider.brokers import Broker
 from tider.utils.log import get_logger
@@ -17,13 +19,34 @@ logger = get_logger(__name__)
 rarfile = try_import('rarfile')
 
 
+class Message(KombuMessage):
+
+    def __init__(self, filename=None, lineno=None, tell=None, body=None, **kwargs):
+        self.filename = filename
+        self.acked = f"{filename}.acked" if filename else None  # *.tell
+        self.lineno = lineno
+        self.tell = tell
+        super().__init__(body=body, **kwargs)
+
+    def ack(self, multiple=False):
+        if not self.acked:
+            return
+        with open(self.acked, 'a+', encoding='utf-8') as fw:
+            json.dump({'lineno': self.lineno, 'tell': self.tell}, fw)
+
+
 class FilesBroker(Broker):
 
     def _consume_json(self, file, on_message=None, on_message_consumed=None):
+        lineno = 0
+        filename = None
+        if hasattr(file, 'name'):
+            filename = file.name
         line = file.readline()
         while line:
-            message = json.loads(line)
-            on_message and on_message(message=message, payload=message, no_ack=True)
+            lineno += 1
+            message = Message(filename=filename, lineno=lineno, tell=file.tell(), body=line, content_type='application/json')
+            on_message and on_message(message=message, payload=message.payload, no_ack=True)
             line = file.readline()
             on_message_consumed and on_message_consumed()
 
@@ -136,10 +159,11 @@ class FilesBroker(Broker):
             if not self.crawler.engine._spider_closed.is_set():
                 # start_requests consumed.
                 self.crawler.engine._spider_closed.set()
-            on_message_consumed(loop=True)
+            on_message_consumed and on_message_consumed(loop=True)
         except RuntimeError:
             return  # maybe shutdown
         finally:
             if is_local_file:
                 file and file.close()
-                os.remove(data_source)
+                if self.crawler.settings.getbool('BROKER_REMOVE_FILE_AFTER_CONSUMED', False):
+                    os.remove(data_source)

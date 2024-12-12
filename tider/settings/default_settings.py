@@ -9,7 +9,6 @@ BROKER_CONNECTION_MAX_RETRIES = 100
 BROKER_CONNECTION_RETRY_ON_STARTUP = None
 BROKER_CONNECTION_RETRY = True
 BROKER_CONNECTION_TIMEOUT = 4
-BROKER_CUSTOM_SETTINGS = {}
 BROKER_DEFAULT_EXCHANGE = None
 BROKER_DEFAULT_EXCHANGE_TYPE = 'direct'
 BROKER_ENCODING = 'utf-8'
@@ -25,8 +24,8 @@ BROKER_PORT = None
 BROKER_QUEUES = ''
 BROKER_TRANSPORT = None  # 'redis'
 BROKER_TRANSPORT_OPTIONS = {}
+BROKER_TRANSPORTS = {}
 BROKER_URL = None
-BROKER_URL_GENERATOR = None
 BROKER_USE_SSL = False
 BROKER_USER = None
 BROKER_VALIDATE_MESSAGE = True
@@ -50,7 +49,8 @@ DOWNLOADER_WGET_QUIET = True
 DUPEFILTER_CLASS = None
 
 EXPLORER = "tider.crawler.explorer.Explorer"
-EXPLORER_DESIGNATED_PROXY = None
+EXPLORER_API_CONCURRENCY = {}
+EXPLORER_DOMAIN_CONCURRENCY = {}
 EXPLORER_DOWNLOADERS = {}
 EXPLORER_RETRY_PRIORITY_ADJUST = 1
 EXPLORER_SESSION_AUTH = None
@@ -63,7 +63,13 @@ EXPLORER_SESSION_STREAM = False
 EXPLORER_SESSION_TRUST_ENV = True
 EXPLORER_SESSION_VERIFY = True
 EXPLORER_USE_LOOP = False
-EXPLORER_USE_SESSION = True
+
+FTP_USER = ""
+FTP_PASSWORD = ""
+FTP_USE_ACTIVE_MODE = False
+FTP_URI = ""
+
+FS_BASEDIR = ""
 
 ITEM_PIPELINES = {}
 ITEM_PROCESSOR = "tider.pipelines.ItemPipelineManager"
@@ -80,50 +86,6 @@ LOG_MAX_BYTES = 30 * 1024 * 1024
 LOG_STDOUT = False
 LOG_STDOUT_LEVEL = 'WARNING'
 
-PARSER_ASYNC_START = True
-PARSER_DEPTH_LIMIT = 0
-PARSER_DEPTH_PRIORITY = 0
-PARSER_USE_LOOP = False
-
-# Never use this option to select the eventlet or gevent pool.
-# You must use the -P option to tider worker instead,
-# to ensure the monkey patches aren’t applied too late,
-# causing things to break in strange ways.
-POOL = "threads"
-PROXY_SCHEMAS = {}
-PROXY_PARAMS = {}
-
-SCHEDULER = "tider.crawler.scheduler.Scheduler"
-SCHEDULER_MEMORY_QUEUE = "tider.pqueues.FifoMemoryQueue"
-SCHEDULER_PRIORITY_QUEUE = "tider.pqueues:PriorityQueue"
-SCHEDULER_BODY_PRIORITY_ADJUST = 0
-
-SESSION_TRUST_ENV = True
-
-SPIDER_LOADER_CLASS = "tider.spiderloader.SpiderLoader"
-SPIDER_LOADER_WARN_ONLY = False
-
-STATS_CLASS = 'tider.statscollector.MemoryStatsCollector'
-STATS_DUMP = True
-STATSMAILER_RCPTS = []
-
-STORE_SCHEMAS = {}
-
-TASK_DEFAULT_QUEUE = 'tider'
-
-WGET_OUTPUT_DIR = ""
-WORKER_TIMEOUT = None
-
-
-# ----- deprecated in future maybe -----
-
-FS_BASEDIR = ""
-
-FTP_USER = ""
-FTP_PASSWORD = ""
-FTP_USE_ACTIVE_MODE = False
-FTP_URI = ""
-
 OSS_ACCESS_KEY_ID = ""
 OSS_ACCESS_KEY_SECRET = ""
 OSS_BUCKET_NAME = ""
@@ -131,9 +93,33 @@ OSS_DEFAULT_TIMEOUT = 50
 OSS_DOMAIN = ""
 OSS_ENDPOINT = ""
 
-SCHEDULER_URL = None
-SCHEDULER_KEY = None
-SCHEDULER_CONNECTION_KWARGS = {}
+PARSER_ASYNC_START = True
+PARSER_DEPTH_LIMIT = 0
+PARSER_DEPTH_PRIORITY = 0
+PARSER_USE_LOOP = False
 
-STATE_DB_URL = ''
-STATE_DB_CONNECTION_KWARGS = {}
+# Never use this option to select the eventlet or gevent pool.
+# You must use the -P option to tider crawler instead,
+# to ensure the monkey patches aren’t applied too late,
+# causing things to break in strange ways.
+POOL = "threads"
+
+PROXY_SCHEMAS = {}
+PROXY_PARAMS = {}
+
+SCHEDULER = "tider.crawler.scheduler.Scheduler"
+SCHEDULER_MEMORY_QUEUE = "tider.pqueues.FifoMemoryQueue"
+SCHEDULER_PRIORITY_QUEUE = "tider.pqueues:ExplorerAwarePriorityQueue"
+SCHEDULER_BODY_PRIORITY_ADJUST = 0
+SCHEDULER_DOWNSTREAM_QUEUE_MAXSIZE = 0
+
+SPIDER_LOADER_CLASS = "tider.spiderloader.SpiderLoader"
+SPIDER_LOADER_WARN_ONLY = False
+SPIDER_MODULES = []
+SPIDER_SCHEMAS = {}
+
+STATS_CLASS = 'tider.statscollector.MemoryStatsCollector'
+STATS_DUMP = True
+STATSMAILER_RCPTS = []
+
+STORE_SCHEMAS = {}

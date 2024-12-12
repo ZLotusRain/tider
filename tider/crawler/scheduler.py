@@ -131,8 +131,11 @@ class Scheduler(BaseScheduler):
     def has_pending_requests(self):
         return len(self) > 0
 
-    def close(self, reason):
+    def clear(self):
         self.priority_queue.close()
+
+    def close(self, reason):
+        self.clear()
         if self.dupefilter is not None:
             self.dupefilter.close(reason)
         logger.info(f"Scheduler closed ({reason})")

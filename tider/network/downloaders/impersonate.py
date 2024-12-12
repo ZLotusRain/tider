@@ -51,7 +51,7 @@ class ImpersonateDownloader:
 
     lazy = True
 
-    def __init__(self, trust_env=True, concurrency=None):
+    def __init__(self, concurrency=None):
         self._thread = None
         gevent_monkey = try_import('gevent.monkey')
         eventlet_patcher = try_import('eventlet.patcher')
@@ -63,17 +63,15 @@ class ImpersonateDownloader:
             logger.warning("Using greenlet with ImpersonateDownloader will obviously decrease the crawling speed.")
         if concurrency and concurrency >= 50:
             logger.warning("Consider decreasing concurrency to avoid causing python core dump.")
-        self.trust_env = trust_env
 
     @classmethod
     def from_crawler(cls, crawler):
-        return cls(trust_env=crawler.settings.get('SESSION_TRUST_ENV'),
-                   concurrency=crawler.concurrency,)
+        return cls(concurrency=crawler.concurrency)
 
     def close_expired_connections(self):
         pass
 
-    def download_request(self, request: Request, session_cookies=None, max_redirects=None, **_):
+    def download_request(self, request: Request, session_cookies=None, trust_env=True):
         if not Session:
             raise ImproperlyConfigured(
                 'You need to install the curl_cffi library to use impersonate downloader.'
@@ -91,17 +89,19 @@ class ImpersonateDownloader:
 
             # Start time (approximately) of the request
             start = preferred_clock()
-            with Session(thread=self._thread, trust_env=self.trust_env) as session:
-                session_kwargs = {}
-                if sys.version_info > (3, 8):
-                    session_kwargs.update(cert=request.cert)
+
+            session_kwargs = {}
+            if sys.version_info > (3, 8):
+                session_kwargs.update(cert=request.cert)
+            # don't keep session to avoid stuck in greenlet.
+            with Session(thread=self._thread, trust_env=trust_env) as session:
                 # don't use stream here to avoid core dump.
                 resp = session.request(
                     method=request.method,
                     url=request.url,
                     headers=headers,
                     cookies=request.prepared.cookies,
-                    data=b"" if not request.body else request.body.replace(b" ", b""),  # may cause 403.
+                    data=b"" if not request.body else request.body,
                     auth=request.prepared.auth,
                     allow_redirects=request.allow_redirects,
                     timeout=request.timeout,
@@ -109,7 +109,7 @@ class ImpersonateDownloader:
                     verify=request.verify,
                     http_version=http_version,
                     impersonate=impersonate,
-                    max_redirects=max_redirects,
+                    max_redirects=None,
                     **session_kwargs,
                 )
             # Total elapsed time of the request (approximately)

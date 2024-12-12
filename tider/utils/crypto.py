@@ -49,18 +49,16 @@ def encrypt(source, key, method, mode="ECB", iv=None, block_size=16, style="pkcs
                 generator = AES.new(key, AES.MODE_CBC, iv)
         elif method == "DES":
             if mode == "ECB":
-                generator = DES.new(key, DES.MODE_ECB)  # 创建一个aes对象
+                generator = DES.new(key, DES.MODE_ECB)
             elif mode == "CBC":
                 generator = DES.new(key, DES.MODE_CBC, iv)
         if not generator:
             return result
-        result = generator.encrypt(pad(source, block_size, style))  # 加密明文
+        result = generator.encrypt(pad(source, block_size, style))
         if encoding == "base64":
-            result = base64.b64encode(result)  # 将返回的字节型数据转进行base64编码
-            result = result.decode("utf-8")  # 将字节型数据转换成python中的字符串类型
+            result = base64.b64encode(result).decode("utf-8")
         else:
             result = b2a_hex(result).decode()
-            # result = result.hex()
     except ValueError as e:
         logger.error(f"Failed to encrypt message by {method}, reason: {e}")
     return result
@@ -88,12 +86,12 @@ def decrypt(source, key, method, mode="ECB", iv=None, block_size=16, style="pkcs
                 generator = AES.new(key, AES.MODE_CBC, iv)
         elif method == "DES":
             if mode == "ECB":
-                generator = DES.new(key, DES.MODE_ECB)  # 创建一个aes对象
+                generator = DES.new(key, DES.MODE_ECB)
             elif mode == "CBC":
                 generator = DES.new(key, DES.MODE_CBC, iv)
         if not generator:
             return result
-        result = generator.decrypt(source)  # 解密
+        result = generator.decrypt(source)
         result = unpad(result, block_size, style)
         result = result.decode("utf-8")
     except ValueError as e:

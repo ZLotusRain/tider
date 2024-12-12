@@ -206,8 +206,15 @@ class Tider:
     def control(self):
         return symbol_by_name(self.control_cls)(app=self)
 
-    def autodiscover_spiders(self):
-        return self.spider_loader.list()
+    def autodiscover_spiders(self, schema=None):
+        """
+        Return a dict with the names and schemas of all spiders available
+        in the project if no schema supplied else return a list with the names
+        of all spiders available in the specified schema.
+        """
+        if schema:
+            return self.spider_loader.list(schema=schema)
+        return self.spider_loader.list_all()
 
     def __reduce__(self):
         return _unpickle, (self.__class__, self.__reduce_keys__())

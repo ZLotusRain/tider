@@ -2,8 +2,11 @@
 Crawler extension for collecting frame stats(from scrapy).
 """
 import pprint
+from typing import List
 
+from tider.mail import MailSender
 from tider.utils.log import get_logger
+from tider.exceptions import ImproperlyConfigured
 
 logger = get_logger(__name__)
 
@@ -47,6 +50,23 @@ class StatsCollector:
 
     def _persist_stats(self, stats, spider):
         pass
+
+
+class StatsMailer(StatsCollector):
+
+    def __init__(self, crawler):
+        super().__init__(crawler)
+        recipients: List[str] = crawler.settings.getlist("STATSMAILER_RCPTS")
+        if not recipients:
+            raise ImproperlyConfigured
+        self.recipients: List[str] = recipients
+        self._mail = MailSender.from_settings(crawler.settings)
+
+    def _persist_stats(self, stats, spider):
+        body = f"{spider.name} stats\n\n"
+        body += "\n".join(f"{k:<50} : {v}" for k, v in self.get_stats().items())
+        self._mail.send(self.recipients, f"Tider stats for: {spider.name}", body)
+        self._mail.close()
 
 
 class MemoryStatsCollector(StatsCollector):

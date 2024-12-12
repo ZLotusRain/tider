@@ -1,6 +1,7 @@
 import time
 import inspect
 from itertools import count
+from typing import Iterator
 
 
 def dictfilter(d=None, **kw):
@@ -97,21 +98,22 @@ def noop(*args, **kwargs):
 
 
 def iter_generator(iterable, sleep=time.sleep):
-    if iterable is None:
-        iterable = []
-    if not hasattr(iterable, '__iter__'):
-        iterable = [iterable]
-    it = iter(iterable)
+    it = iterable = iterable if iterable is not None else []
+    # a generator is always an iterator.
+    if not isinstance(iterable, Iterator):
+        try:
+            it = iter(iterable)
+        except TypeError:
+            it = iter([iterable])
     try:
         while True:
             try:
+                # generator's return value will be ignored here.
                 yield next(it)
             except StopIteration:
                 break
             sleep(0.01)
-    except BaseException as e:
-        raise e
     finally:
-        if hasattr(iterable, 'close'):
+        if isinstance(iterable, Iterator) and hasattr(iterable, 'close'):
             iterable.close()
-        del iterable
+        del iterable, it

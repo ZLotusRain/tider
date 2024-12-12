@@ -11,37 +11,18 @@ Taken from: celery
 import logging
 import os
 import sys
-from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
 
 from kombu.utils.encoding import set_default_encoding_file
 
 from tider import signals
-from tider.utils.nodenames import node_format
 from tider.utils.log import (ColorFormatter, LoggingProxy, get_logger, get_multiprocessing_logger, mlevel,
                              reset_multiprocessing_logger)
+from tider.utils.nodenames import node_format
 
-__all__ = ('Logging', 'set_in_sighandler', 'in_sighandler')
-
-_in_sighandler = False
+__all__ = ('Logging',)
 
 MP_LOG = os.environ.get('MP_LOG', False)
-
-
-def set_in_sighandler(value):
-    """Set flag signifiying that we're inside a signal handler."""
-    global _in_sighandler
-    _in_sighandler = value
-
-
-@contextmanager
-def in_sighandler():
-    """Context that records that we are in a signal handler."""
-    set_in_sighandler(True)
-    try:
-        yield
-    finally:
-        set_in_sighandler(False)
 
 
 class Logging:
@@ -59,11 +40,12 @@ class Logging:
         self.colorize = self.app.conf.get('LOG_COLORIZE')
 
     def setup(self, loglevel=None, logfile=None, maxbytes=30*1024*1024, backup_count=1, encoding=None,
-              fmt=None, redirect_stdouts=False, redirect_level='WARNING', colorize=None, hostname=None, debug=False):
+              fmt=None, redirect_stdouts=False, redirect_level='WARNING', colorize=None, hostname=None,
+              group=None, debug=False):
         loglevel = mlevel(loglevel)
         self.setup_logging_subsystem(
             loglevel, logfile, maxbytes=maxbytes, backup_count=backup_count,
-            encoding=encoding, fmt=fmt, colorize=colorize, hostname=hostname, debug=debug,
+            encoding=encoding, fmt=fmt, colorize=colorize, hostname=hostname, group=group, debug=debug,
         )
         if redirect_stdouts:
             self.redirect_stdouts(redirect_level)
@@ -77,11 +59,11 @@ class Logging:
         )
 
     def setup_logging_subsystem(self, loglevel=None, logfile=None, fmt=None,
-                                colorize=None, hostname=None, debug=False, **kwargs):
+                                colorize=None, hostname=None, group=None, debug=False, **kwargs):
         if hostname in self._setups:
             return
         if logfile and hostname:
-            logfile = node_format(logfile, hostname)
+            logfile = node_format(logfile, hostname, g=group)
         Logging._setups.append(hostname)
         loglevel = mlevel(loglevel or self.loglevel)
         fmt = fmt or self.format
@@ -191,7 +173,6 @@ class Logging:
 
     def _detect_handler(self, logfile=None, maxbytes=0, backup_count=0, encoding=None):
         """Create handler from filename, an open stream or `None` (stderr)."""
-        # TODO remove streamhandler if logfile
         logfile = sys.__stderr__ if logfile is None else logfile
         if hasattr(logfile, 'write'):
             return logging.StreamHandler(logfile)

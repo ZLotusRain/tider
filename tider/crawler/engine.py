@@ -4,8 +4,9 @@ from threading import Event
 
 from tider import signals, Request, Item
 from tider.crawler import state
-from tider.exceptions import SpiderShutdown, SpiderTerminate
 from tider.network import Response
+from tider.exceptions import SpiderShutdown, SpiderTerminate
+from tider.utils.decorators import inthread
 from tider.utils.log import get_logger
 from tider.utils.misc import symbol_by_name, build_from_crawler
 
@@ -50,8 +51,10 @@ class HeartEngine:
 
         self.running = False
         self.paused = False
+        self.polling = False
 
         self._spider_closed = Event()
+        self._is_shutdown = Event()
         if on_spider_closed is not None:
             signals.spider_closed.connect(on_spider_closed, sender=self)
         self.start_time = None
@@ -94,35 +97,35 @@ class HeartEngine:
                 promise = Promise(reqs=message_handler(message=payload), callback=_ack_message)
                 start_requests = iter(promise.then())
             else:
-                start_requests = iter(message_handler(message=payload))
+                start_requests = iter(message_handler(message=payload) or [])
             while start_requests is not None:
-                if self.paused:
-                    time.sleep(1)
-                    continue
-
                 if self._spider_closed.is_set():
                     if hasattr(start_requests, 'close'):
                         start_requests.close()
                     break
 
+                if self.paused:
+                    time.sleep(1)
+                    continue
+
+                # no need to double-check to make sure terminate immediately
+                # because after scheduler closed no request can be scheduled.
                 while (
-                    self.active()  # double check to make sure terminate immediately.
-                    and not self._needs_backout()
+                    not self.needs_backout()
                     and not self._overload()
                     and self._next_request_from_scheduler() is not None
                 ):
                     pass
 
-                if start_requests is not None and not self._needs_backout() and not self._overload():
+                if not self.needs_backout() and not self._overload():
                     # noinspection PyBroadException
                     try:
                         request = next(start_requests)
                     except StopIteration:
+                        start_requests = None
+                    except Exception:
                         if hasattr(start_requests, 'close'):
-                            start_requests = start_requests.close()
-                    except BaseException:
-                        if hasattr(start_requests, 'close'):
-                            start_requests = start_requests.close()
+                            start_requests.close()
                         logger.error('Error while obtaining start requests', exc_info=True)
                     else:
                         request and self.schedule_request(request)
@@ -132,19 +135,40 @@ class HeartEngine:
         return on_message_received
 
     def on_start_requests_scheduled(self, loop=False, **_):
-        first_loop = True
-        while first_loop or (loop and self.active()):
+        while self.active():
+            self.polling = True
+            scheduled = 0
             while (
-                    not self._needs_backout()
-                    and not self._overload()
-                    and self._next_request_from_scheduler() is not None
+                not self.needs_backout()
+                and not self._overload()
+                and self._next_request_from_scheduler()
+                and scheduled < self.crawler.concurrency + 1  # to avoid infinite loop due to concurrency limit.
+            ):
+                scheduled += 1
+                # don't judge spider_closed event because the spider_closed
+                # event will be set after start_requests iterated in dummy broker.
+                time.sleep(0.01)
+            self.polling = False
+            if not loop:
+                break
+            # maybe switch greenlet
+            time.sleep(0.01)  # avoid stuck in threads.
+
+    @inthread(name='Poller')
+    def _poll(self):
+        while self.active():
+            self.polling = True
+            while (
+                not self.needs_backout()
+                and not self._overload()
+                and self._next_request_from_scheduler()
             ):
                 # don't judge spider_closed event because the spider_closed
                 # event will be set after start_requests iterated in dummy broker.
-                pass
-            first_loop = False
+                time.sleep(0.01)
+            self.polling = False
             # maybe switch greenlet
-            self.crawler.maybe_sleep(0.01)
+            time.sleep(0.01)
 
     def _next_request_from_scheduler(self):
         request = self.scheduler.next_request()
@@ -154,12 +178,13 @@ class HeartEngine:
 
     def active(self):
         # spider might be closed by other components.
-        return not self._spider_closed.is_set() or self._check_if_active()
+        return not self._is_shutdown.is_set() and (not self._spider_closed.is_set() or self._check_if_active())
 
     def _check_if_active(self):
         flag = False
         for _ in range(5):
-            flag = (self.explorer.active() or
+            flag = (self.polling or
+                    self.explorer.active() or
                     self.parser.active() or
                     self.scheduler.has_pending_requests())
             if flag:
@@ -167,6 +192,12 @@ class HeartEngine:
             # consider some message queues like redis
             time.sleep(0.15)
         return flag
+    
+    def maybe_wakeup(self):
+        self.explorer.maybe_wakeup()
+
+    def needs_backout(self):
+        return self.explorer.needs_backout()
 
     def start(self, spider, broker):
         if self.running:
@@ -181,28 +212,27 @@ class HeartEngine:
         self.crawler.stats.set_value("time/start_time", start_time)
         self.crawler.stats.set_value("time/start_time/format", format_start_time)
 
-        output_handler = self.create_response_handler()
-        self.explorer.async_explore(output_handler)
+        on_response = self.create_response_handler()
+        self.explorer.async_explore(on_response=on_response)
+        on_message = self.create_message_handler()
+        on_message_consumed = self.on_start_requests_scheduled
         self.broker.consume(transport=self.crawler.broker_transport,
                             queues=self.settings.getlist('BROKER_QUEUES'),
-                            on_message=self.create_message_handler(), on_messages_consumed=self.on_start_requests_scheduled)
+                            on_message=on_message, on_message_consumed=on_message_consumed)
 
         while self.active():
             try:
                 state.maybe_shutdown()
                 # maybe stuck here when using threads
                 # and gevent monkey patch at the same time
-                self.crawler.connection.drain_events(timeout=0.5)
+                self.crawler.connection.drain_events(timeout=2.0)
             except socket.timeout:
                 pass
             except (SpiderShutdown, SpiderTerminate):  # control shutdown
                 return self.close_spider(spider, reason='shutdown')
-            if self.explorer.session:
-                self.explorer.session.close_expired_connections()
+            self.explorer.clear_idle_conns()
+            self.maybe_wakeup()
         self.close_spider(spider, reason='finished')
-
-    def _needs_backout(self):
-        return self.explorer.needs_backout()
 
     def _overload(self):
         limit = self.crawler.concurrency * 3
@@ -210,7 +240,8 @@ class HeartEngine:
 
     def schedule_request(self, request):
         if isinstance(request, Item):
-            self.crawler.stats.inc_value(f"item/{request.__class__.__name__}/count")
+            self.crawler.stats.inc_value(f"item/count")
+            self.crawler.stats.inc_value(f"item/count/{request.__class__.__name__}")
             return self.parser._quick_process_item(request)
         if not self.scheduler.enqueue_request(request):
             logger.error(f"Request dropped: {request}")
@@ -232,7 +263,7 @@ class HeartEngine:
                 raise TypeError(f"Incorrect type: expected Request, Response or Failure, "
                                 f"got {type(result)}: {result!r}")
             while overload():
-                time.sleep(1)
+                time.sleep(0.01)
             if isinstance(result, Request):
                 # if processed in explorer,
                 # the frame may be stuck for limited queue size.
@@ -243,6 +274,7 @@ class HeartEngine:
         return on_response
 
     def force_clean(self):
+        self.scheduler.clear()
         self.explorer.queue.clear()
         self.parser.queue.clear()
 
@@ -272,8 +304,9 @@ class HeartEngine:
     def close_spider(self, spider, reason="cancelled"):
         logger.info("Closing spider (%(reason)s)", {'reason': reason}, extra={'spider': spider})
 
-        if not self._spider_closed.is_set():
-            self._spider_closed.set()
+        # set anyway.
+        self._is_shutdown.set()
+        self._spider_closed.set()
 
         end_time = round(time.time(), 4)
         format_end_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(end_time)))
@@ -285,8 +318,8 @@ class HeartEngine:
         # keep the order
         self.parser.close(reason=reason)
         self.broker.stop()
-        self.explorer.close(reason=reason)
         self.scheduler.close(reason=reason)
+        self.explorer.close(reason=reason)
 
         self.spider.close(reason=reason)
 

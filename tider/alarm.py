@@ -1,9 +1,9 @@
 import json
 import time
 import socket
-import requests
 import warnings
 
+from tider.exceptions import DownloadError
 from tider.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -84,9 +84,10 @@ class Alarm:
 
 class WeChatGRobotAlarm(Alarm):
 
-    def __init__(self, stats, spidername, key, mentioned_list=None,
+    def __init__(self, crawler, stats, spidername, key, mentioned_list=None,
                  mentioned_mobile_list=None, msg_type='text'):
         super().__init__(stats, spidername, msg_type)
+        self.crawler = crawler
         self.key = key
         self.mentioned_list = mentioned_list
         self.mentioned_mobile_list = mentioned_mobile_list
@@ -94,6 +95,7 @@ class WeChatGRobotAlarm(Alarm):
     @classmethod
     def from_crawler(cls, crawler):
         return cls(
+            crawler=crawler,
             stats=crawler.stats,
             msg_type=crawler.settings['ALARM_MESSAGE_TYPE'],
             spidername=crawler.spidername,
@@ -113,11 +115,11 @@ class WeChatGRobotAlarm(Alarm):
             }
 
         }
-        resp = None
+        explorer = self.crawler.engine.explorer
         try:
-            resp = requests.post(url, data=json.dumps(payload), timeout=10)
+            response = explorer.try_explore(method="POST", url=url, data=json.dumps(payload), max_retries=2)
             logger.info(f"Send alarm message by wechat robot successfully: {infos['message']}")
-        except requests.RequestException as e:
+            response.close()
+        except DownloadError as e:
             logger.error(f"Unable to send alarm message by wechat robot: {e}")
-        if resp is not None:
-            resp.close()
+

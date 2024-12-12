@@ -145,3 +145,10 @@ class Selector(_ParselSelector):
         return "<%s xpath=%r data=%s>" % (type(self).__name__, self._expr, data)
 
     __repr__ = __str__
+
+    def clear(self):
+        # root created by `etree.fromstring()`
+        # don't bother text with json type.
+        if isinstance(self.root, etree._Element):
+            self.root.clear()
+            del self.root

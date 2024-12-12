@@ -5,12 +5,15 @@ from weakref import proxy
 
 from tider import Response
 from tider.utils.log import get_logger
+from tider.network.user_agent import default_user_agent
 
 
 class Spider:
 
     name: Optional[str] = None
     custom_settings: Optional[dict] = None
+
+    default_ua: Optional[str] = None
 
     def __init__(self, name=None, **kwargs):
         if name is not None:
@@ -22,9 +25,10 @@ class Spider:
         self.__dict__.update(kwargs)
         if not hasattr(self, 'start_urls'):
             self.start_urls = []
+        self.default_ua = default_user_agent()
 
     @property
-    def logger(self):
+    def logger(self) -> logging.LoggerAdapter:
         logger = get_logger(self.name)
         return logging.LoggerAdapter(logger, {'spider': self})
 
@@ -65,9 +69,6 @@ class Spider:
 
     def parse(self, response: Response):
         raise NotImplementedError(f'{self.__class__.__name__}.parse callback is not defined')
-
-    def process(self, message, body=None):
-        pass
 
     @classmethod
     def update_settings(cls, settings):
