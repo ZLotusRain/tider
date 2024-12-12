@@ -3,11 +3,10 @@ import click
 import numbers
 from pprint import pformat
 from click import ParamType
-from kombu.utils.objects import cached_property
+from collections import OrderedDict
 
-from tider import Tider
-from tider import concurrency
-from tider.settings import Settings
+from kombu.utils import cached_property
+
 from tider.utils.text import indent, str_to_list
 
 try:
@@ -25,77 +24,17 @@ else:
     FORMATTER = Terminal256Formatter()
 
 
-class TiderSettings(ParamType):
-
-    name = "settings"
-
-    def convert(self, value, param, ctx):
-        settings_module = value
-        value = Settings()
-        value.setmodule(module=settings_module)
-        return value
-
-
-class LogLevel(click.Choice):
-    """Log level option."""
-
-    def __init__(self):
-        """Initialize the log level option with the relevant choices."""
-        super().__init__(('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL', 'FATAL'))
-
-    def convert(self, value, param, ctx):
-        if isinstance(value, numbers.Integral):
-            return value
-
-        value = value.upper()
-        value = super().convert(value, param, ctx)
-        return value
-
-
-class WorkersPool(click.Choice):
-    """Workers pool option."""
-
-    name = "pool"
-
-    def __init__(self):
-        """Initialize the workers pool option with the relevant choices."""
-        super().__init__(concurrency.get_available_pool_names())
-
-
-class CommaSeparatedList(ParamType):
-    """Comma separated list argument."""
-
-    name = "comma separated list"
-
-    def convert(self, value, param, ctx):
-        return str_to_list(value)
-
-
-class TiderDaemonCommand(click.Command):
-    def __init__(self, *args, **kwargs):
-        """Initialize a Tider command with common daemon options."""
-        super().__init__(*args, **kwargs)
-        self.params.append(click.Option(('-f', '--logfile')))
-        self.params.append(click.Option(('--pidfile',)))
-        self.params.append(click.Option(('--uid',)))
-        self.params.append(click.Option(('--gid',)))
-        self.params.append(click.Option(('--umask',)))
-        self.params.append(click.Option(('--executable',)))
-
-
 class CLIContext:
 
-    def __init__(self, spider, settings, schema=None, spider_type='task',
-                 worker_concurrency=0, workdir=None):
-        self.tider = None
+    def __init__(self, app, schema=None, spider=None, workdir=None,
+                 no_color=False, quiet=False):
+        self.app = app
         self.spider = spider
-        self.settings = settings
-        self.schema = schema
-        self.spider_type = spider_type
-        self.worker_concurrency = worker_concurrency
-        self.no_color = False
-        self.quiet = False
+
+        self.no_color = no_color
+        self.quiet = quiet
         self.workdir = workdir
+        self.schema = schema
 
     @cached_property
     def OK(self):
@@ -157,15 +96,77 @@ class CLIContext:
         if body and show_body:
             self.echo(body)
 
-    def finalize(self):
-        if self.tider is not None:
-            raise RuntimeError('Tider already finalized')
-        self.tider = Tider(spider=self.spider,
-                           settings=self.settings,
-                           schema=self.schema,
-                           spider_type=self.spider_type,
-                           processes=self.worker_concurrency)
-        return self.tider
+
+class TiderOption(click.Option):
+    """Customized option for Tider."""
+
+    def get_default(self, ctx, *args, **kwargs):
+        if self.default_value_from_context:
+            self.default = ctx.obj[self.default_value_from_context]
+        return super().get_default(ctx, *args, **kwargs)
+
+    def __init__(self, *args, **kwargs):
+        """Initialize a Tider option."""
+        self.help_group = kwargs.pop('help_group', None)
+        self.default_value_from_context = kwargs.pop('default_value_from_context', None)
+        super().__init__(*args, **kwargs)
+
+
+class TiderCommand(click.Command):
+    """Customized command for Tider."""
+
+    def format_options(self, ctx, formatter):
+        """Write all the options into the formatter if they exist."""
+        opts = OrderedDict()
+        for param in self.get_params(ctx):
+            rv = param.get_help_record(ctx)
+            if rv is not None:
+                if hasattr(param, 'help_group') and param.help_group:
+                    opts.setdefault(str(param.help_group), []).append(rv)
+                else:
+                    opts.setdefault('Options', []).append(rv)
+
+        for name, opts_group in opts.items():
+            with formatter.section(name):
+                formatter.write_dl(opts_group)
+
+
+class TiderDaemonCommand(TiderCommand):
+    def __init__(self, *args, **kwargs):
+        """Initialize a Tider command with common daemon options."""
+        super().__init__(*args, **kwargs)
+        self.params.append(TiderOption(('-f', '--logfile'), help_group="Daemonization Options"))
+        self.params.append(TiderOption(('--pidfile',), help_group="Daemonization Options"))
+        self.params.append(TiderOption(('--uid',), help_group="Daemonization Options"))
+        self.params.append(TiderOption(('--gid',), help_group="Daemonization Options"))
+        self.params.append(TiderOption(('--umask',), help_group="Daemonization Options"))
+        self.params.append(TiderOption(('--executable',), help_group="Daemonization Options"))
+
+
+class CommaSeparatedList(ParamType):
+    """Comma separated list argument."""
+
+    name = "comma separated list"
+
+    def convert(self, value, param, ctx):
+        return str_to_list(value)
+
+
+class LogLevel(click.Choice):
+    """Log level option."""
+
+    def __init__(self):
+        """Initialize the log level option with the relevant choices."""
+        super().__init__(('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL', 'FATAL'))
+
+    def convert(self, value, param, ctx):
+        if isinstance(value, numbers.Integral):
+            return value
+
+        value = value.upper()
+        value = super().convert(value, param, ctx)
+        return value
 
 
 COMMA_SEPARATED_LIST = CommaSeparatedList()
+LOG_LEVEL = LogLevel()

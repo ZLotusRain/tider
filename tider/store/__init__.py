@@ -1,16 +1,9 @@
 """Base file store class"""
-from typing import Optional
-
 from tider.store.filesystem import FSFilesStore
 from tider.store.ftp import FTPFilesStore
 from tider.store.alioss import AliOSSFilesStore
 
-from tider.utils.misc import create_instance
-
-__all__ = ('get_fsm', 'create_fsm')
-
-
-_filestore_manager = None
+from tider.utils.misc import build_from_crawler
 
 
 class FilesStoreManager:
@@ -22,8 +15,8 @@ class FilesStoreManager:
         "alioss": AliOSSFilesStore
     }
 
-    def __init__(self, tider, store_schemas=None):
-        self.tider = tider
+    def __init__(self, crawler, store_schemas=None):
+        self.crawler = crawler
         store_schemas = store_schemas or {}
         for k, v in store_schemas.items():
             self.mount(k, v)
@@ -31,10 +24,9 @@ class FilesStoreManager:
 
     def _instantiate_schema(self, schema):
         store_cls = self.STORE_SCHEMAS[schema]
-        self._store_schemas_instances[schema] = create_instance(
+        self._store_schemas_instances[schema] = build_from_crawler(
             objcls=store_cls,
-            tider=self.tider,
-            settings=self.tider.settings
+            crawler=self.crawler,
         )
 
     def get_fs(self, schema):
@@ -43,8 +35,8 @@ class FilesStoreManager:
         return self._store_schemas_instances[schema]
 
     @classmethod
-    def from_tider(cls, tider):
-        settings = tider.settings
+    def from_crawler(cls, crawler):
+        settings = crawler.settings
 
         ftp_store = cls.STORE_SCHEMAS["ftp"]
         ftp_store.FTP_USERNAME = settings["FTP_USER"]
@@ -52,7 +44,7 @@ class FilesStoreManager:
         ftp_store.USE_ACTIVE_MODE = settings.getbool("FTP_USE_ACTIVE_MODE")
 
         store_schemas = settings["STORE_SCHEMAS"]
-        return cls(tider, store_schemas=store_schemas)
+        return cls(crawler, store_schemas=store_schemas)
 
     def mount(self, schema, fs_cls):
         if not hasattr(fs_cls, 'persist_file'):
@@ -68,17 +60,3 @@ class FilesStoreManager:
     def close(self):
         for schema in self._store_schemas_instances:
             self._store_schemas_instances[schema].close()
-
-
-def create_fsm(tider):
-    global _filestore_manager
-    if _filestore_manager is None:
-        _filestore_manager = FilesStoreManager.from_tider(tider)
-
-
-def get_fsm() -> Optional[FilesStoreManager]:
-    return _filestore_manager
-
-
-def close_fsm():
-    _filestore_manager and _filestore_manager.close()

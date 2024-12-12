@@ -7,7 +7,8 @@ Request and Response outside this module.
 
 from tider.network.request import Request
 from tider.network.response import Response
-from tider.network.proxy import ProxyPool, ProxyPoolManager
+from tider.network.session import Session
+from tider.network.proxy import Proxy, ProxyPool, ProxyPoolManager
 
 
-__all__ = ('Request', 'Response', 'ProxyPool', 'ProxyPoolManager')
+__all__ = ('Session', 'Request', 'Response', 'Proxy', 'ProxyPool', 'ProxyPoolManager')

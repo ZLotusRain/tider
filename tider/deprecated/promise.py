@@ -3,7 +3,7 @@ from inspect import isgenerator
 
 from tider.network import Request
 from tider.network import Response, Failure
-from tider.core.parser import evaluate_iterable
+from tider.crawler.parser import evaluate_iterable
 from tider.utils.misc import symbol_by_name
 
 

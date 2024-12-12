@@ -1,91 +1,106 @@
 import re
+import codecs
 import json
+import mimetypes
 import charset_normalizer
 from bs4 import BeautifulSoup
+from html import unescape as html_unescape
 from urllib.parse import urljoin, unquote
-from urllib3.exceptions import (
-    DecodeError,
-    ProtocolError,
-    ReadTimeoutError,
-    SSLError,
-)
+from typing import Optional
+
 from requests.models import REDIRECT_STATI
-from requests.cookies import cookiejar_from_dict
 from requests.structures import CaseInsensitiveDict
-from requests.exceptions import (
-    ChunkedEncodingError,
-    ConnectionError,
-    ContentDecodingError,
-    StreamConsumedError,
-    HTTPError
-)
-from requests.exceptions import SSLError as RequestsSSLError
-from requests.utils import iter_slices, stream_decode_response_unicode, guess_json_utf
+from requests.cookies import cookiejar_from_dict, merge_cookies, RequestsCookieJar
+from requests.utils import guess_json_utf
 
 from tider import Request
+from tider.exceptions import DownloadError, HTTPError, ResponseReadError, ResponseStreamConsumed
 
 
 SPACE_CHARACTERS = ["&nbsp;", "&ensp;", "&emsp;", "&thinsp;",
                     "&zwnj;", "&zwj;", "&#x0020;", "&#x0009;",
                     "&#x000A;", "&#x000D;", "&#12288;"]
-# html 源码中的特殊字符，需要删掉，否则会影响etree的构建
-# 移除控制字符 全部字符列表 https://zh.wikipedia.org/wiki/%E6%8E%A7%E5%88%B6%E5%AD%97%E7%AC%A6
+# remove the special characters which may affect the construct of etree in html codes
+# remove control characters, full list see: https://zh.wikipedia.org/wiki/%E6%8E%A7%E5%88%B6%E5%AD%97%E7%AC%A6
 SPECIAL_CHARACTERS = ["[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]", "|".join(SPACE_CHARACTERS)]
 SPECIAL_CHARACTER_PATTERNS = [re.compile(special_character) for special_character in SPECIAL_CHARACTERS]
 
 CONTENT_CHUNK_SIZE = 10 * 1024
+
+mimetypes.add_type('application/x-rar-compressed', '.rar')
+
+
+def iter_slices(content, slice_length):
+    """Iterate over slices of a string."""
+    pos = 0
+    if slice_length is None or slice_length <= 0:
+        slice_length = len(content)
+    while pos < len(content):
+        yield content[pos: pos + slice_length]
+        pos += slice_length
+
+
+def stream_decode_response_unicode(iterator, encoding=None):
+    """Stream decodes an iterator."""
+
+    if encoding is None:
+        yield from iterator
+        return
+
+    decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+    for chunk in iterator:
+        rv = decoder.decode(chunk)
+        if rv:
+            yield rv
+    rv = decoder.decode(b"", final=True)
+    if rv:
+        yield rv
 
 
 class Response:
 
     __slots__ = (
         'request', 'status_code', 'url', 'headers', 'encoding',
-        'cookies', 'reason', 'raw', 'version', 'elapsed', 'history', '_next',
-        '_redirect_target', '_success', '_content', '_content_consumed',
+        'cookies', 'reason', 'raw', 'version', 'elapsed', '_error',
+        '_redirect_target', '_content', '_content_consumed',
         '_cached_text', '_cached_selector'
     )
 
-    def __init__(self, request=None):
-        # bound request
-        self.request = request
-
-        self.status_code = None
-
+    def __init__(self, request: Optional[Request] = None):
         # Final URL location of Response.
         self.url = None
+
+        self.status_code = None
         self.headers = CaseInsensitiveDict()
-        self.encoding = None
         self.cookies = cookiejar_from_dict({})
         self.reason = None
         self.version = None
 
         self.elapsed = 0
-        self.history = []
-        self._next = None
+        self.encoding = None
 
+        # bound request
+        self.request = request
         self._redirect_target = None
-        self._success = True
-        self._content = False
+
+        self._content: Optional[bool, bytes] = False
         self._content_consumed = False
         self._cached_text = None
         self._cached_selector = None
 
         self.raw = None
+        self._error = None
 
     @classmethod
-    def dummy(cls, text, request=None, **kwargs):
-        resp = cls(request)
-        kwargs.setdefault('encoding', 'utf-8')
-        resp._cached_text = text
-        for key, value in kwargs.items():
-            setattr(resp, key, value)
-        return resp
+    def dummy(cls, text, url=None, request=None, encoding=None):
+        response = cls(request)
+        response.url = url or 'about:blank'
+        response._cached_text = text
+        response.encoding = encoding or 'utf-8'
+        return response
 
     @property
     def is_redirect(self):
-        """True if this Response is a well-formed HTTP redirect that could have
-        been processed automatically (by :meth:`Session.resolve_redirects`).
-        """
         return "location" in self.headers and self.status_code in REDIRECT_STATI
 
     @property
@@ -112,7 +127,7 @@ class Response:
             # We attempt to decode utf-8 first because some servers
             # choose to localize their reason strings. If the string
             # isn't utf-8, we fall back to iso-8859-1 for all other
-            # encodings. (See PR #3538)
+            # encodings.
             try:
                 reason = self.reason.decode("utf-8")
             except UnicodeDecodeError:
@@ -133,6 +148,13 @@ class Response:
         if http_error_msg:
             raise HTTPError(http_error_msg)
 
+    def check_error(self):
+        """Raise and remove error if error exists."""
+        if self._error is not None:
+            # don't clear error here to avoid resource leak.
+            # error, self._error = self._error, None
+            raise self._error
+
     def __iter__(self):
         """Allows you to use a response as an iterator."""
         return self.iter_content(128)
@@ -144,14 +166,30 @@ class Response:
         self.close()
 
     def __repr__(self):
-        if self.ok:
+        if self._error:
+            return '<Failed Response [%s]>' % self._error
+        if self.status_code:
             return '<Response [%s]>' % self.status_code
-        else:
-            return '<Failure [%s]>' % self.reason
+        return f'<Dummy Response at {id(self):#x}>'
 
     @property
     def ok(self):
-        return self._success
+        """Returns True if :attr:`status_code` is less than 400, False if not.
+
+        This attribute checks if the status code of the response is between
+        400 and 600 to see if there was a client error or a server error. If
+        the status code is between 200 and 400, this will return True. This
+        is **not** a check to see if the response code is ``200 OK``.
+        """
+        try:
+            self.raise_for_status()
+        except HTTPError:
+            return False
+        return True
+
+    @property
+    def failed(self):
+        return self._error is not None
 
     @property
     def cb_kwargs(self):
@@ -174,8 +212,19 @@ class Response:
             )
 
     @property
+    def proxy(self):
+        return self.request.proxy if self.request else None
+
+    @property
     def is_html(self):
         return "text/html" in self.headers.get("Content-Type", "")
+
+    def fail(self, error):
+        if self._error is not None:
+            raise RuntimeError("Can't assign an error to an already failed response")
+        if not isinstance(error, DownloadError):
+            error = DownloadError(error)
+        self._error = error
 
     def urljoin(self, url):
         """Join this Response's url with a possible relative url to form an
@@ -184,47 +233,41 @@ class Response:
 
     @property
     def filename(self):
-        filename = ''
         content_disposition = self.headers.get('Content-Disposition', '')
-        if content_disposition:
-            # 'attachment;filename=%E6%A0%87%E9%A1%B9%E4.pdf'
-            # "attachment;filename*=utf-8'zh_cn'%E6%8B%9B%E6%A0%87%E6%96%87%E4%BB%B6%E6%AD%A3%E6%96%87.pdf"
-            # 'attachment; filename="æ\x88\x90äº¤å\x85¬å\x91\x8a.pdf"'
-            filename = list(filter(lambda x: "file" in x, content_disposition.split(";")))
-            filename = filename[0] if filename else ""
-            filename = unquote(filename.split("=")[-1].replace("utf-8'zh_cn'", '')).strip('"').strip("'")
+        # 'attachment;filename=%E6%A0%87%E9%A1%B9%E4.pdf'
+        # "attachment;filename*=utf-8'zh_cn'%E6%8B%9B%E6%A0%87%E6%96%87%E4%BB%B6%E6%AD%A3%E6%96%87.pdf"
+        # 'attachment; filename="æ\x88\x90äº¤å\x85¬å\x91\x8a.pdf"'
+        filename = list(filter(lambda x: "file" in x, content_disposition.split(";")))
+        filename = filename[0] if filename else ""
+        filename = unquote(filename.split("=")[-1].replace("utf-8'zh_cn'", '')).strip('"').strip("'")
         return filename.strip()
 
     @property
     def filetype(self):
-        filetype = self.meta.get('filetype') or self.filename.split(".")[-1]
-        if not filetype:
-            content_type = self.headers.get('Content-Type', '')
-            maybe_filetype = list(filter(lambda x: x.startswith("."), content_type.split(";")))
-            if maybe_filetype:
-                filetype = maybe_filetype[0].split(".")[-1].strip('"').strip("'")
-            elif "application/msword" in content_type:
-                filetype = "doc"
-            elif "application/ms-download" in content_type:
-                filetype = "pdf"
-            elif "application/pdf" in content_type:
-                filetype = "pdf"
-            elif content_type == "application/x-rar-compressed":
-                filetype = "rar"
-        return filetype
+        if self.meta.get('filetype', ''):
+            return self.meta['filetype']
 
-    def fail(self, reason):
-        self.reason = reason
-        self._success = False
+        filetype = self.url.rsplit('.', maxsplit=1)[-1].split('?')[0]
+        content_type = self.headers.get('Content-Type', '')
+        maybe_filetype = list(filter(lambda x: x.startswith("."), content_type.split(";")))
+        if maybe_filetype:
+            filetype = maybe_filetype or filetype
+
+        for each in content_type.split(';'):
+            if each == 'application/ms-download':
+                filetype = filetype or 'pdf'
+            else:
+                filetype = mimetypes.guess_extension(each) or filetype
+            if filetype:
+                return filetype.split('.', maxsplit=1)[-1]
+        return self.filename.split(".", maxsplit=1)[-1]
 
     @property
     def apparent_encoding(self):
         return charset_normalizer.detect(self.content)["encoding"]
 
     def read(self) -> bytes:
-        """
-        Read and return the response content.
-        """
+        """Read and return the response content."""
         return self.content
 
     def iter_content(self, chunk_size=1, decode_unicode=False):
@@ -233,14 +276,8 @@ class Response:
             if hasattr(self.raw, "stream"):
                 try:
                     yield from self.raw.stream(chunk_size, decode_content=True)
-                except ProtocolError as e:
-                    raise ChunkedEncodingError(e)
-                except DecodeError as e:
-                    raise ContentDecodingError(e)
-                except ReadTimeoutError as e:
-                    raise ConnectionError(e)
-                except SSLError as e:
-                    raise RequestsSSLError(e)
+                except Exception as e:
+                    raise ResponseReadError(e)
             elif self.raw is not None:
                 # Standard file-like object.
                 while True:
@@ -252,19 +289,17 @@ class Response:
             self._content_consumed = True
 
         if self._content_consumed and isinstance(self._content, bool):
-            raise StreamConsumedError()
+            raise ResponseStreamConsumed()
         elif chunk_size is not None and not isinstance(chunk_size, int):
             raise TypeError("chunk_size must be an int, it is instead a %s." % type(chunk_size))
 
         # simulate reading small chunks of the content
-        reused_chunks = iter_slices(self._content, chunk_size)
-
-        stream_chunks = generate()
-
-        chunks = reused_chunks if self._content_consumed else stream_chunks
-
+        if self._content_consumed:
+            chunks = iter_slices(self._content, chunk_size)
+        else:
+            chunks = generate()
         if decode_unicode:
-            chunks = stream_decode_response_unicode(chunks, self)
+            chunks = stream_decode_response_unicode(chunks, self.encoding)
 
         return chunks
 
@@ -295,8 +330,7 @@ class Response:
         encoding = self.encoding or self.apparent_encoding
         # Decode unicode from given encoding.
         try:
-            # text = self.content.decode(encoding, errors="replace")
-            text = str(self.content, encoding, errors="replace")
+            text = self.content.decode(encoding, errors="replace")
         except (LookupError, TypeError):
             # A LookupError is raised if the encoding was not found which could
             # indicate a misspelling or similar mistake.
@@ -309,11 +343,49 @@ class Response:
         self._cached_text = text
         return self._cached_text
 
-    @property
-    def trimmed_text(self):
+    def clean_text(self, remove_base64=True, shield_a=False):
         text = self.text
         for special_character_pattern in SPECIAL_CHARACTER_PATTERNS:
             text = special_character_pattern.sub("", text)
+        text = html_unescape(text).replace("<!DOCTYPE html>", "")
+
+        soup = None
+        invalid_tags = []
+        # noinspection PyBroadException
+        try:
+            soup = BeautifulSoup(text, "lxml")
+            for tag in soup(lambda t: t.name in ('style', 'script', 'input')):
+                tag.extract()
+            for tag in soup.find_all(recursive=True):
+                if shield_a and tag.name == 'a':
+                    tag.name = 'p'
+                if tag.name == 'div' and not tag.find_all(recursive=False):
+                    tag.extract()
+                if tag.attrs.get("href"):
+                    if tag['href'] == "javascript:void(0);":
+                        tag.attrs.pop("href")
+                        if tag.name in ('iframe', 'img', 'a'):
+                            invalid_tags.append(tag)
+                    else:
+                        tag['href'] = self.urljoin(tag['href'])
+                if tag.get("src"):
+                    if remove_base64 and tag["src"].startswith("data:image"):
+                        tag.extract()
+                    else:
+                        tag["src"] = self.urljoin(tag["src"])
+                if tag.attrs.get("class"):
+                    if "el-loading-mask" in tag.attrs["class"]:
+                        tag.attrs["class"].remove("el-loading-mask")
+                style = tag.attrs.pop("style", "").replace(' ', '')
+                if 'display:none' in style:
+                    invalid_tags.append(tag)
+                tag.attrs.pop("rel", None)
+            for tag in invalid_tags:
+                tag.extract()
+            invalid_tags[:] = []
+            text = str(soup)
+        finally:
+            soup and soup.clear(decompose=True)
         return text
 
     def json(self, **kwargs):
@@ -328,7 +400,7 @@ class Response:
                     # and the server didn't bother to tell us what codec *was*
                     # used.
                     pass
-        return json.loads(self.trimmed_text, **kwargs)
+        return json.loads(self.text, **kwargs)
 
     @property
     def selector(self):
@@ -349,30 +421,54 @@ class Response:
     def re(self, regex, replace_entities=True, flags=re.S):
         return self.selector.re(regex, replace_entities, flags)
 
-    def retry(self, reset_proxy=True, **kwargs):
-        # old version error:
+    def retry(self, reset_proxy=True, keep_cookies=False, **kwargs):
+        # bug in old version:
         # callback must be specified if using retry in promise,
         # otherwise the callback maybe `Promise._then` which will
         # cause fatal error like recursion error.
-        # request will be closed after retry, so using `replace`
-        # to create a new request
-        parse_times = self.meta.get('parse_times', 0) + 1
+        if reset_proxy:
+            self.request.invalidate_proxy()
+
         meta = dict(self.meta)
         meta.pop('promise_node', None)
         meta.pop('promise_then', None)
+        parse_times = meta.get('parse_times', 0) + 1
         meta.update(retry_times=0, parse_times=parse_times)
-        if reset_proxy:
-            self.request.forbid_proxy()
-        request = self.request.replace(priority=self.request.priority+1,
-                                       meta=meta, dup_check=False, **kwargs)
+
+        headers = kwargs.pop('headers', None) or self.request.headers
+        headers = dict(headers or {})
+        if not keep_cookies:
+            headers.pop('Cookie', None)
+            meta['merge_cookies'] = False
+        # request will be closed after parsed, so using `replace`
+        # to create a new request.
+        request = self.request.replace(meta=meta, dup_check=False, headers=headers, **kwargs)
         return request
 
-    def follow(self, url, callback=None, cb_kwargs=None, **kwargs):
+    def follow(self, url, callback=None, errback=None, cb_kwargs=None,
+               headers=None, cookies=None, proxies=None, proxy_schema=None, **kwargs):
+        h = self.request.headers.copy()
+        h.pop('Cookie', None)
+        h.update(headers or {})
+
+        # may contain cookies from redirects in request.session_cookies.
+        session_cookies = merge_cookies(RequestsCookieJar(), self.request.session_cookies)
+        # # copy cookies to avoid conflict with brother requests.
+        session_cookies = merge_cookies(session_cookies, self.cookies)
+        # user cookies will override the cookies in request tree.
+        session_cookies = merge_cookies(session_cookies, cookies)
+
         url = self.urljoin(url)
-        return Request(
+        # cookies here will override cookies in session.
+        yield self.request.replace(
             url=url,
             callback=callback,
+            errback=errback,
             cb_kwargs=cb_kwargs,
+            headers=h,
+            cookies=session_cookies,
+            proxies=proxies,
+            proxy_schema=proxy_schema,
             **kwargs
         )
 
@@ -393,6 +489,10 @@ class Response:
         self._cached_text = None
         self._cached_selector = None
 
+        # break references.
+        self.headers = None
+        self.cookies = None
+
     def close(self):
         raw, self.raw = self.raw, None
         if raw is not None:
@@ -401,37 +501,9 @@ class Response:
                 # if connection pool is closed, the connection will be closed.
                 raw.drain_conn()
             elif getattr(raw, "close", None):
-                try:
-                    raw.close()
-                except AttributeError:
-                    pass
-        if getattr(raw, "release_conn", None):
-            raw.release_conn()
+                raw.close()
         self._clear_caches()
-        self.request and self.request.close()
+        if self._error:
+            self._error.__traceback__ = None
+        self._error = None
         self.request = None
-
-
-class DummyResponse:
-    def __init__(self, url, text, encoding=None):
-        self.url = url
-        self.text = text
-        self.encoding = encoding
-        self._cached_selector = None
-
-    @property
-    def selector(self):
-        if self._cached_selector is None:
-            from tider.selector import Selector
-            self._cached_selector = Selector(text=self.text)
-        return self._cached_selector
-
-    def xpath(self, query, **kwargs):
-        return self.selector.xpath(query, **kwargs)
-
-    def css(self, query):
-        return self.selector.css(query)
-
-    def close(self):
-        self.text = None
-        self._cached_selector = None

@@ -40,9 +40,13 @@ def _get_current_app():
         #: creates the global fallback app instance.
         from tider.base import Tider
         set_default_app(Tider(
-            None, main='default', set_as_current=False,
+            main='default', set_as_current=False,
         ))
     return _tls.current_app or default_app
+
+
+def _set_current_app(app):
+    _tls.current_app = app
 
 
 if os.environ.get('T_STRICT_APP'):  # pragma: no cover
@@ -61,10 +65,6 @@ else:
 
 #: Proxy to current app.
 current_app = Proxy(get_current_app)
-
-
-def _set_current_app(app):
-    _tls.current_app = app
 
 
 def _register_app(app):

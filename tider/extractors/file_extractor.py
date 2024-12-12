@@ -1,9 +1,9 @@
 import re
-import logging
 
 from tider.extractors.link_extractor import LinkExtractor
+from tider.utils.log import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class FileExtExtractor:
@@ -146,6 +146,7 @@ class FileExtractor(LinkExtractor):
 
     def _extension_allowed(self, link):
         title, url = link['title'], link['url']
+        link['ext'] = ''
         ext_from_title = self.ext_extractor.extract(title, 'text')
         ext_from_url = self.ext_extractor.extract(url, 'url')
         link['ext'] = ext_from_title or ext_from_url

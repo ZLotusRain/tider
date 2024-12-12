@@ -1,13 +1,13 @@
 import hashlib
-import logging
 import importlib
 
 from typing import Iterable
 from pkgutil import iter_modules
 
-logger = logging.getLogger(__name__)
+from tider.utils.log import get_logger
 
-# 待添加Item
+logger = get_logger(__name__)
+
 _ITERABLE_SINGLE_VALUES = dict, str, bytes
 
 
@@ -157,25 +157,22 @@ def try_import(module, default=None):
         return default
 
 
-def create_instance(objcls, settings=None, tider=None, *args, **kwargs):
-    """Construct a class instance using its ``from_settings`` constructors, if available.
+def build_from_crawler(objcls, crawler, *args, **kwargs):
+    """Construct a class instance using its ``from_crawler`` constructor.
 
-    ``*args`` and ``**kwargs`` are forwarded to the constructors.
+    ``*args`` and ``**kwargs`` are forwarded to the constructor.
 
-    Raises ``ValueError`` if both ``settings`` and ``tider`` are ``None``.
-
-    Raises ``TypeError`` if the resulting instance is ``None`` (e.g. if an
-    extension has not been implemented correctly).
+    Raises ``TypeError`` if the resulting instance is ``None``.
     """
-    if tider and hasattr(objcls, 'from_tider'):
-        instance = objcls.from_tider(tider, *args, **kwargs)
-        method_name = 'from_tider'
-    elif settings and hasattr(objcls, 'from_settings'):
-        instance = objcls.from_settings(settings, *args, **kwargs)
-        method_name = 'from_settings'
+    if hasattr(objcls, "from_crawler"):
+        instance = objcls.from_crawler(crawler, *args, **kwargs)
+        method_name = "from_crawler"
+    elif hasattr(objcls, "from_settings"):
+        instance = objcls.from_settings(crawler.settings, *args, **kwargs)
+        method_name = "from_settings"
     else:
         instance = objcls(*args, **kwargs)
-        method_name = '__new__'
+        method_name = "__new__"
     if instance is None:
         raise TypeError(f"{objcls.__qualname__}.{method_name} returned None")
     return instance

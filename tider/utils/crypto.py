@@ -1,7 +1,6 @@
 import sys
 import html
 import re
-import logging
 import base64
 import hashlib
 import urllib.parse
@@ -10,7 +9,9 @@ from Crypto.Cipher import AES, DES
 from Crypto.Util.Padding import pad, unpad
 from binascii import b2a_hex, a2b_hex
 
-logger = logging.getLogger(__name__)
+from tider.utils.log import get_logger
+
+logger = get_logger(__name__)
 
 
 def unescape(string):

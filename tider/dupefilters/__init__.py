@@ -1,4 +1,4 @@
-from tider.network import Request
+from tider import Request
 
 
 class BaseDupeFilter:
@@ -9,11 +9,9 @@ class BaseDupeFilter:
     def request_seen(self, request: Request) -> bool:
         return False
 
-    def open(self):
-        pass
-
     def close(self, reason: str):
         pass
 
-    def log(self, request):
+    def log(self, request, spider):
+        """Log that a request has been filtered"""
         pass

@@ -1,10 +1,24 @@
-import logging
-from urllib3.util import parse_url
+from typing import cast
+from urllib3.util.url import parse_url as urllib3_parse_url
+from urllib.parse import urlparse, urlunparse, unquote, ParseResult
 
-logger = logging.getLogger(__name__)
+from tider.utils.log import get_logger
+
+logger = get_logger(__name__)
 
 
-def parse_url_params(url=None, query=None):
+def parse_url(url, encoding=None) -> ParseResult:
+    """Return urlparsed url from the given argument (which could be an already
+    parsed url)
+    """
+    if isinstance(url, ParseResult):
+        return url
+    if isinstance(url, bytes):
+        url = url.decode(encoding or 'utf-8', errors='strict')
+    return cast(ParseResult, urlparse(url))
+
+
+def map_query(url=None, query=None):
     params = {}
 
     query = query or parse_url(url).query or ""
@@ -19,14 +33,7 @@ def parse_url_params(url=None, query=None):
 
 
 def parse_url_host(url):
-    host = ""
-    try:
-        host = parse_url(url).host
-        port = parse_url(url).port
-        host = f"{host}:{port}" if port else host
-    except Exception as e:
-        logger.error(f"Unable to parse {url}: {e}")
-    return host or ""
+    return parse_url(url).netloc.lower()
 
 
 def url_is_from_any_domain(url, domains):
@@ -44,3 +51,48 @@ def url_is_from_any_domain(url, domains):
 
 def url_has_any_extension(url, extensions):
     return url.split(".")[-1] in extensions
+
+
+def get_auth_from_url(url):
+    """Given an url with authentication components, extract them into a tuple of
+    username,password.
+
+    :rtype: (str,str)
+    """
+    parsed = urlparse(url)
+
+    try:
+        auth = (unquote(parsed.username), unquote(parsed.password))
+    except (AttributeError, TypeError):
+        auth = ("", "")
+
+    return auth
+
+
+def prepend_scheme_if_needed(url, new_scheme):
+    """Given a URL that may or may not have a scheme, prepend the given scheme.
+    Does not replace a present scheme with the one provided as an argument.
+
+    :rtype: str
+    """
+    parsed = urllib3_parse_url(url)
+    scheme, auth, host, port, path, query, fragment = parsed
+
+    # A defect in urlparse determines that there isn't a netloc present in some
+    # urls. We previously assumed parsing was overly cautious, and swapped the
+    # netloc and path. Due to a lack of tests on the original defect, this is
+    # maintained with parse_url for backwards compatibility.
+    netloc = parsed.netloc
+    if not netloc:
+        netloc, path = path, netloc
+
+    if auth:
+        # parse_url doesn't provide the netloc with auth
+        # so we'll add it ourselves.
+        netloc = "@".join([auth, netloc])
+    if scheme is None:
+        scheme = new_scheme
+    if path is None:
+        path = ""
+
+    return urlunparse((scheme, netloc, path, "", query, fragment))

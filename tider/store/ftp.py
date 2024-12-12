@@ -3,7 +3,7 @@ from io import BytesIO
 from ftplib import FTP
 from urllib.parse import urlparse
 
-from tider import Response
+from tider.network import Response
 from tider.utils.ftp import ftp_store_file
 
 

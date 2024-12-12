@@ -1,6 +1,5 @@
 import click
 
-from tider import Tider
 from tider.spiders import Spider
 from tider.network import Request
 
@@ -21,5 +20,7 @@ class _BenchSpider(Spider):
 @click.command()
 @click.pass_context
 def bench(ctx):
-    tider = Tider(spider=_BenchSpider, settings=ctx.obj.settings)
-    tider.crawl()
+    app = ctx.obj.app
+    crawler = app.Crawler(_BenchSpider)
+    crawler.crawl()
+    ctx.exit(crawler.exitcode)

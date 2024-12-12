@@ -71,5 +71,12 @@ class TaskPool(BasePool, ABC):
         return len(self._pool)
 
     def on_stop(self):
-        self._pool.join()
-        super(TaskPool, self).on_stop()
+        if self._pool is not None:
+            self._pool.join()
+
+    def on_terminate(self):
+        if self._pool is not None:
+            for greenlet in list(self._pool.greenlets):
+                self._pool.discard(greenlet)
+                greenlet.kill()
+            self._pool.join()

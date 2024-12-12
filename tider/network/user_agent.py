@@ -1,9 +1,10 @@
 import random
 
+from tider import __version__
+
 __all__ = ('get_random_ua', 'set_default_ua', 'default_user_agent')
 
-DEFAULT_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/118.0.0.0 Safari/537.36")
+DEFAULT_USER_AGENT = '%s/%s' % ('Tider', __version__)
 
 USER_AGENTS = {
     "chrome": [

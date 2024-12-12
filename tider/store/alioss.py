@@ -1,5 +1,4 @@
 import os
-import logging
 from contextlib import contextmanager
 from typing import Union
 
@@ -8,9 +7,11 @@ from oss2 import Bucket, Service
 from oss2.models import PartInfo
 from oss2 import determine_part_size, SizedFileAdapter
 
-from tider.network import Response
 
-logger = logging.getLogger(__name__)
+from tider.network import Response
+from tider.utils.log import get_logger
+
+logger = get_logger(__name__)
 
 
 class AliOSSFilesStore:

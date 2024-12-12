@@ -40,5 +40,7 @@ def runspider(ctx, filename, **kwargs):
     if not spclasses:
         raise click.UsageError(f"No spider found in file: {filename}\n")
     spidercls = spclasses.pop()
-    crawler_process = ctx.obj
-    crawler_process.crawl(spidercls, **kwargs)
+    app = ctx.obj.app
+    crawler = app.Crawler(spidercls)
+    crawler.crawl()
+    ctx.exit(crawler.exitcode)

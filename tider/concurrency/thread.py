@@ -2,7 +2,7 @@
 
 import os
 import queue
-import weakref
+import threading
 from abc import ABC
 from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor, wait
 
@@ -22,7 +22,8 @@ class ApplyResult:
 
 class ThreadPoolExecutor(_ThreadPoolExecutor):
 
-    def __init__(self, max_workers=None, **kwargs):
+    def __init__(self, max_workers=None, thread_name_prefix='',
+                 initializer=None, initargs=()):
         if max_workers is None:
             # ThreadPoolExecutor is often used to:
             # * CPU bound task which releases GIL
@@ -32,15 +33,36 @@ class ThreadPoolExecutor(_ThreadPoolExecutor):
             # But we limit it to 32 to avoid consuming surprisingly large resource
             # on many core machine.
             max_workers = min(32, (os.cpu_count() or 1) + 4)
-        super(ThreadPoolExecutor, self).__init__(max_workers=max_workers * 2, **kwargs)
-        self._work_queue = queue.Queue(maxsize=self._max_workers)
-        self._threads = weakref.WeakSet()
+        if max_workers <= 0:
+            raise ValueError("max_workers must be greater than 0")
+
+        if initializer is not None and not callable(initializer):
+            raise TypeError("initializer must be a callable")
+
+        self._max_workers = max_workers  # dynamically adjust.
+        # + 1 to avoid stuck in _python_exit due to waiting for putting None
+        self._work_queue = queue.Queue(maxsize=self._max_workers + 1)
+        self._idle_semaphore = threading.Semaphore(0)
+        self._threads = set()
+        self._broken = False
+        self._shutdown = False
+        self._shutdown_lock = threading.Lock()
+        self._thread_name_prefix = (thread_name_prefix or
+                                    ("ThreadPoolExecutor-%d" % self._counter()))
+        self._initializer = initializer
+        self._initargs = initargs
+
+    def maybe_wakeup(self):
+        # Send a wake-up to prevent threads calling
+        # _work_queue.get(block=True) from permanently blocking.
+        if self._work_queue.empty():
+            self._work_queue.put(None)
 
 
 class TaskPool(BasePool, ABC):
     """Thread Task Pool."""
+    limit: int
 
-    name = "thread"
     body_can_be_buffer = True
     signal_safe = False
 
@@ -58,3 +80,6 @@ class TaskPool(BasePool, ABC):
     def on_stop(self):
         self.executor.shutdown()
         super(TaskPool, self).on_stop()
+
+    def maybe_shutdown(self):
+        self.executor.maybe_wakeup()

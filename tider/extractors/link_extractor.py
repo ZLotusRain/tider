@@ -84,7 +84,10 @@ class LinkExtractor:
                 url = self.callback(attr_val)
                 if url is None or 'javascript:void(0)' in url:
                     continue
-            url = safe_url_string(url, encoding=response_encoding)
+            try:
+                url = safe_url_string(url, encoding=response_encoding)
+            except ValueError:
+                pass
             url = urljoin(response_url, url)
             if el.attrib.get("title"):
                 title = el.attrib.get("title")

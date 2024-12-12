@@ -1,43 +1,22 @@
-import os
 import sys
-import pprint
-import logging
 import threading
-from uuid import uuid4
+from datetime import datetime
 from operator import attrgetter
+from click.exceptions import Exit
 
 from kombu import Connection
-from kombu.common import oid_from
+from kombu.clocks import LamportClock
 from kombu.utils import cached_property
 
 from tider import platforms
+from tider.spiders import Spider
 from tider._state import (_register_app, _deregister_app,
                           get_current_app, _set_current_app, set_default_app)
-from tider.spiders import Spider
-from tider.concurrency import get_implementation
-from tider.settings import Settings, overridden_settings
-from tider.utils.log import (
-    configure_logging,
-    get_tider_root_handler,
-    install_tider_root_handler
-)
-from tider.utils.nodenames import gethostname, nodename
-from tider.utils.misc import symbol_by_name, create_instance
+from tider.settings import Settings
+from tider.utils.misc import symbol_by_name
+from tider.utils.time import to_utc, timezone
 
 __all__ = ('Tider',)
-
-logger = logging.getLogger(__name__)
-
-MP_MAIN_FILE = os.environ.get('MP_MAIN_FILE')
-
-
-def uuid(_uuid=uuid4):
-    """Generate unique id in UUID4 format.
-
-    See Also:
-        For now this is provided by :func:`uuid.uuid4`.
-    """
-    return str(_uuid())
 
 
 def _unpickle(cls, kwargs):
@@ -46,6 +25,7 @@ def _unpickle(cls, kwargs):
 
 def _unpickle_appattr(reverse_name, args):
     """Unpickle app."""
+    # noinspection PyProtectedMember
     # Given an attribute name and a list of args, gets
     # the attribute from the current app and calls it.
     return get_current_app()._rgetattr(reverse_name)(*args)
@@ -54,42 +34,6 @@ def _unpickle_appattr(reverse_name, args):
 def appstr(app):
     """String used in __repr__ etc, to id app instances."""
     return f'{app.main or "__main__"} at {id(app):#x}'
-
-
-def gen_spider_name(app, name, module_name, schema=None, spider_type='task'):
-    """Generate task name from name/module pair."""
-    module_name = module_name or '__main__'
-    try:
-        module = sys.modules[module_name]
-    except KeyError:
-        module = None
-
-    if module is not None:
-        module_name = module.__name__
-        # - If the task module is used as the __main__ script
-        # - we need to rewrite the module part of the task name
-        # - to match App.main.
-        if MP_MAIN_FILE and module.__file__ == MP_MAIN_FILE:
-            # - see celery comment about :envvar:`MP_MAIN_FILE` above.
-            module_name = '__main__'
-    if module_name == '__main__' and app.main:
-        module_name = app.main
-    if spider_type != 'task':
-        name = f"{name}[{spider_type}]"
-    return '.'.join(p for p in (module_name, schema, name) if p)
-
-
-def _evaluate_settings(settings):
-    if isinstance(settings, dict) or settings is None:
-        settings = Settings(settings)
-    elif isinstance(settings, str):
-        settings_module = settings
-        settings = Settings()
-        settings.setmodule(module=settings_module)
-    if not isinstance(settings, Settings):
-        raise ValueError(f"settings must be a `Settings|dict|str` instance or None, "
-                         f"got {type(settings)}: {settings!r}")
-    return settings.copy()
 
 
 class Tider:
@@ -103,66 +47,41 @@ class Tider:
     #:
     #: If set this will be used instead of `__main__` when automatically
     #: generating task names.
-    #: name: main.schema.spider[spider_type]@hostname
+    #: name: main.[schema.]spider[broker_type]@hostname
     main = None
 
     pool = 'threads'
 
-    loader_cls = None
-    engine_cls = 'tider.core.engine:HeartEngine'
-    stats_cls = 'tider.statscollector:MemoryStatsCollector'
-    alarm_cls = None
-    control_cls = 'tider.core.control:Control'
-    control_url = 'redis://localhost:6379/0'  # TODO set to None by default, use sleep in engine instead.
+    loader_cls = 'tider.spiderloader:SpiderLoader'
+    control_cls = 'tider.crawler.control:Control'
+    log_cls = 'tider.log:Logging'
+    control_url = 'amqp://guest:guest@localhost//'
 
-    def __init__(self, spider=None, spider_type='task', schema=None,
-                 main=None, loader=None, stats=None, alarm=None, control=None,
-                 set_as_current=True, settings=None, install_root_handler=True,
-                 processes=0, pool=None, concurrency=None):
+    crawlers = property(
+        lambda self: self._crawlers,
+        doc="Set of :class:`crawlers <tider.crawler.Crawler>` started by "
+        ":meth:`crawl` and managed by this class.",
+    )
 
-        self.spider = None
-        self.main = main or self.main
+    def __init__(self, main=None, loader=None, control=None, log=None, settings=None, set_as_current=True):
+
         self._local = threading.local()
+        self.clock = LamportClock()
 
-        if isinstance(spider, Spider):
-            raise ValueError('The spider argument must be a class or str, not an object')
+        self.main = main or self.main
+        self.loader_cls = loader or self.loader_cls
+        self.control_cls = control or self.control_cls
+        self.log_cls = log or self.log_cls
 
-        self._spider_type = spider_type  # task | worker | publisher | consumer
-        self.schema = schema
-        self.settings = _evaluate_settings(settings)
-        self.loader_cls = loader or self._get_spider_loader()
         self.set_as_current = set_as_current
 
-        if isinstance(spider, str):  # spider unique name
-            self.spidercls = self.spider_loader.load(spider)
-        else:
-            self.spidercls = spider
-        # spidercls maybe None when using control or multi
-        if self.spidercls is not None:
-            # spider loader class will be ignored here
-            self.spidercls.update_settings(self.settings)
-            if self.settings.getbool('LOG_FILE_ENABLED') and not self.settings.get("LOG_FILE"):
-                self.settings['LOG_FILE'] = f'{self.spidercls.name}.log'
-        configure_logging(self.settings, install_root_handler)
-
-        self.control_cls = control or self.control_cls
-        self.alarm_cls = alarm or self._get_alarm()
-        self.stats_cls = stats or self._get_stats()
-
-        self.processes = processes  # concurrent workers
-        self.pool = pool or self.settings.get('POOL') or self.pool
-        if pool in ('eventlet', 'gevent'):
-            self.is_green_pool = True
-        else:
-            self.is_green_pool = False
-        self.concurrency = concurrency or self.settings.getint('CONCURRENCY')
-
-        self._update_settings()
+        self._config_source = settings
+        self._conf = None
 
         if self.set_as_current:
             self.set_current()
-
-        self.crawling = False
+        self._crawlers = set()
+        # init broker to send message
         self.on_init()
         _register_app(self)
 
@@ -177,75 +96,45 @@ class Tider:
         """Make this the default app for all threads."""
         set_default_app(self)
 
-    def _get_spider_loader(self):
-        return (
-            self.settings.get('SPIDER_LOADER_CLASS') or
-            self.loader_cls or
-            'tider.spiderloader:SpiderLoader'
-        )
-
-    def _get_alarm(self):
-        return (
-            self.settings.get('ALARM_CLASS') or
-            self.alarm_cls or
-            'tider.alarm:Alarm'
-        )
-
-    def _get_stats(self):
-        return (self.settings.get('STATS_CLASS') or
-                self.alarm_cls)
-
-    def _update_settings(self):
-        self.settings.update({
-            "ALARM_CLASS": self.alarm_cls,
-            "STATS_CLASS": self.stats_cls,
-            "SPIDER_LOADER_CLASS": self.loader_cls,
-            "POOL": self.pool,
-            "CONCURRENCY": self.concurrency
-        }, priority='project')
+    def _load_config(self):
+        if isinstance(self._config_source, dict) or self._config_source is None:
+            settings = Settings(self._config_source)
+        elif isinstance(self._config_source, str):
+            settings = Settings()
+            settings.setmodule(module=self._config_source)
+        else:
+            settings = self._config_source
+        if not isinstance(settings, Settings):
+            raise ValueError(f"settings must be a `Settings|dict|str` instance or None, "
+                             f"got {type(settings)}: {settings!r}")
+        return settings.copy()
 
     @property
-    def thread_oid(self):
-        """Per-thread unique identifier for this app."""
-        try:
-            return self._local.oid
-        except AttributeError:
-            self._local.oid = new_oid = oid_from(self, threads=True)
-            return new_oid
-
-    @property
-    def spider_type(self):
-        return self._spider_type
-
-    @cached_property
-    def stats(self):
-        return symbol_by_name(self.stats_cls)(self)
-
-    @cached_property
-    def alarm(self):
-        return create_instance(symbol_by_name(self.alarm_cls), tider=self)
+    def conf(self):
+        """Current configuration."""
+        if self._conf is None:
+            self._conf = self._load_config()
+        return self._conf
 
     @cached_property
     def spider_loader(self):
-        return symbol_by_name(self.loader_cls)(self.settings, self.schema)
-
-    @property
-    def spidername(self):
-        return self.spider.name
+        return symbol_by_name(self.loader_cls)(self.conf.copy())
 
     @cached_property
-    def hostname(self):
-        return gethostname()
+    def log(self):
+        """Logging: :class:`~@log`."""
+        return symbol_by_name(self.log_cls)(app=self)
 
-    @property
-    def nodename(self):
-        name = self.spidername
-        if self.spider_type == 'worker':
-            name = f'{name}Worker{os.getpid()}'
-        return nodename(name, self.hostname)
+    # noinspection PyPep8Naming
+    @cached_property
+    def Crawler(self):
+        return self.subclass_with_self('tider.crawler.base:Crawler', attribute='app')
 
     def _rgetattr(self, path):
         return attrgetter(path)(self)
+
+    def load(self, spider: str, schema='default'):
+        return self.spider_loader.load(spider, schema=schema)
 
     def __enter__(self):
         return self
@@ -256,16 +145,20 @@ class Tider:
     def __repr__(self):
         return f'<{type(self).__name__} {appstr(self)}>'
 
-    def subclass_with_self(self, Class, name=None, attribute='tider',
+    def setup_security(self):
+        pass
+
+    # noinspection PyPep8Naming
+    def subclass_with_self(self, Class, name=None, attribute='app',
                            reverse=None, keep_reduce=False, **kw):
-        """Subclass an tider-compatible class.
+        """Subclass a tider-compatible class.
 
         Tider-compatible means that the class has a class attribute that
         provides the default tider it should use, for example:
-        ``class Foo: tider = None``.
+        ``class Foo: app = None``.
 
         Arguments:
-            Class (type): The tider-compatible class to subclass.
+            Class (type,str): The tider-compatible class to subclass.
             name (str): Custom name for the target class.
             attribute (str): Name of the attribute holding the app,
                 Default is 'tider'.
@@ -291,30 +184,27 @@ class Tider:
 
         return type(name or Class.__name__, (Class,), attrs)
 
-    def connection_for_control(self, url=None, heartbeat=120, body_encoding='base64'):
+    def connection_for_control(self, url=None, heartbeat=120, heartbeat_checkrate=3.0, **kwargs):
         """Establish connection used for controlling.
 
          Returns:
             kombu.Connection: the lazy connection instance.
         """
-        url = url or self.settings.get('CONTROL_URL') or self.control_url
-        return self._connection(url, heartbeat=heartbeat, body_encoding=body_encoding)
-
-    @staticmethod
-    def _connection(url, heartbeat=None, body_encoding='base64'):
         return Connection(
-            hostname=url,
+            hostname=url or self.conf.get('CONTROL_URL'),
             ssl=False,
             heartbeat=heartbeat,
+            heartbeat_checkrate=heartbeat_checkrate,
             login_method=None,
             failover_strategy=None,
-            transport_options={'body_encoding': body_encoding},
-            connect_timeout=4
+            transport_options={},
+            connect_timeout=4,
+            **kwargs
         )
 
     @cached_property
     def control(self):
-        return symbol_by_name(self.control_cls)(tider=self)
+        return symbol_by_name(self.control_cls)(app=self)
 
     def autodiscover_spiders(self):
         return self.spider_loader.list()
@@ -324,76 +214,91 @@ class Tider:
 
     def __reduce_keys__(self):
         """Keyword arguments used to reconstruct the object when unpickling."""
-        settings = self.settings.copy()
-        settings.frozen = False
         return {
-            'spider': self.spidercls,
-            'spider_type': self._spider_type,
-            'settings': settings,
-            'schema': self.schema,  # spider class has already been loaded
-            'install_root_handler': True,
+            'main': self.main,
             'loader': self.loader_cls,
             'control': self.control_cls,
-            'alarm': self.alarm_cls,
-            'stats': self.stats_cls,
-            'pool': self.pool,
-            'concurrency': self.concurrency,
-            'processes': self.processes
+            'log': self.log_cls,
+            'settings': self._config_source,
+            'set_as_current': self.set_as_current,
         }
 
-    @cached_property
-    def engine(self):
-        return self._create_engine()
+    def start(self, argv=None):
+        """Run :program:`tider` using `argv`.
 
-    def _create_spider(self, *args, **kwargs):
-        return self.spidercls.from_tider(self, *args, **kwargs)
+        Uses :data:`sys.argv` if `argv` is not specified.
+        """
+        from tider.bin.tider import tider
 
-    def _create_engine(self):
-        return symbol_by_name(self.engine_cls)(tider=self)
+        tider.params[0].default = self
 
-    def create_pool(self, limit=None, **kwargs):
-        limit = limit or self.concurrency
-        return get_implementation(self.pool)(limit=limit, **kwargs)
-
-    def crawl(self, *args, **kwargs):
-        self.settings.freeze()
-        d = dict(overridden_settings(self.settings))
-        logger.info("Overridden settings:\n%(settings)s",
-                    {'settings': pprint.pformat(d)})
-
-        if self.processes > 1:
-            from concurrent.futures import ProcessPoolExecutor
-            with ProcessPoolExecutor(max_workers=self.processes) as executor:
-                for _ in range(self.processes):
-                    executor.submit(self._crawl, *args, **kwargs)
-        else:
-            return self._crawl(*args, **kwargs)
-
-    def _crawl(self, *args, **kwargs):
-        if get_tider_root_handler() is None:
-            # re-initialize logging handlers in multiprocessing
-            install_tider_root_handler(self.settings)
-        if self.crawling:
-            raise RuntimeError("Crawling already taking place")
-        self.crawling = True
+        if argv is None:
+            argv = sys.argv
 
         try:
-            self.spider = self._create_spider(*args, **kwargs)
-            self.engine.open_spider(self.spider)
-            self.engine.start()
-        except Exception:
-            self.crawling = False
-            if self.engine is not None:
-                self.engine.close()
-            raise
-        else:
-            self.stop()
+            tider.main(args=argv, standalone_mode=False)
+        except Exit as e:
+            return e.exit_code
+        finally:
+            tider.params[0].default = None
+
+    def crawl_main(self, argv=None):
+        """Run :program:`tider crawl` using `argv`.
+
+        Uses :data:`sys.argv` if `argv` is not specified.
+        """
+        if argv is None:
+            argv = sys.argv
+
+        if 'crawl' not in argv:
+            raise ValueError(
+                "The crawl sub-command must be specified in argv.\n"
+                "Use tider.start() to programmatically start other commands."
+            )
+
+        self.start(argv=argv)
+
+    def crawl(self, crawler_or_spidercls, schema='default', *args, **kwargs):
+        if isinstance(crawler_or_spidercls, Spider):
+            raise ValueError(
+                "The spider argument cannot be a spider object, "
+                "it must be a spider class (or a spider name)"
+            )
+        crawler = self.create_crawler(crawler_or_spidercls, schema)
+        return self._crawl(crawler, *args, **kwargs)
+
+    def _crawl(self, crawler, *args, **kwargs):
+        self.crawlers.add(crawler)
+        crawler.crawl(*args, **kwargs)
+        self.crawlers.discard(crawler)
+
+    def create_crawler(self, crawler_or_spidercls, schema='default'):
+        """
+        Return a :class:`~tider.crawler.Crawler` object.
+        * If ``crawler_or_spidercls`` is a Crawler, it is returned as-is.
+        * If ``spider`` is a Spider subclass, a new Crawler
+          is constructed for it.
+        * If ``spider`` is a string, this function finds
+          a spider with this name in a Tider project (using spider loader),
+          then creates a Crawler instance for it.
+        """
+        if isinstance(crawler_or_spidercls, Spider):
+            raise ValueError(
+                "The crawler_or_spidercls argument cannot be a spider object, "
+                "it must be a spider class (or a Crawler object)"
+            )
+        if isinstance(crawler_or_spidercls, self.Crawler):
+            return crawler_or_spidercls
+        return self._create_crawler(crawler_or_spidercls, schema)
+
+    def _create_crawler(self, spidercls, schema='default'):
+        schema = schema or 'default'
+        if isinstance(spidercls, str):
+            spidercls = self.load(spidercls, schema=schema)
+        return self.Crawler(spidercls=spidercls, schema=schema)
 
     def stop(self):
-        """Starts a graceful stop of the tider."""
-        if self.crawling:
-            self.crawling = False
-            self.engine.stop()
+        return [c.stop() for c in list(self.crawlers)]
 
     def close(self):
         """Clean up after the application.
@@ -401,5 +306,29 @@ class Tider:
         Only necessary for dynamically created apps, and you should
         probably use the :keyword:`with` statement instead.
         """
-
+        self.stop()
         _deregister_app(self)
+
+    def now(self):
+        """Return the current time and date as a datetime."""
+        now_in_utc = to_utc(datetime.utcnow())
+        return now_in_utc.astimezone(self.timezone)
+
+    def uses_utc_timezone(self):
+        """Check if the application uses the UTC timezone."""
+        return self.timezone == timezone.utc
+
+    @cached_property
+    def timezone(self):
+        """Current timezone for this app.
+
+        This is a cached property taking the time zone from the
+        :setting:`timezone` setting.
+        """
+        conf = self.conf
+        if not conf.get('TIMEZONE'):
+            if conf.get('ENABLE_UTC'):
+                return timezone.utc
+            else:
+                return timezone.local
+        return timezone.get_timezone(conf.get('TIMEZONE'))

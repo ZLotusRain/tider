@@ -1,11 +1,12 @@
 import json
 import time
 import socket
-import logging
 import requests
 import warnings
 
-logger = logging.getLogger(__name__)
+from tider.utils.log import get_logger
+
+logger = get_logger(__name__)
 
 BASIC_MD_MESSAGE = """
 <font color="#FF0000">**Tider Alarm Message**</font>
@@ -33,11 +34,11 @@ class Alarm:
         self._topics = {}
 
     @classmethod
-    def from_tider(cls, tider):
+    def from_crawler(cls, crawler):
         return cls(
-            stats=tider.stats,
-            msg_type=tider.settings['ALARM_MESSAGE_TYPE'],
-            spidername=tider.spidername
+            stats=crawler.stats,
+            msg_type=crawler.alarm_message_type,
+            spidername=crawler.spidername
         )
 
     def alarm(self, msg,  msg_type=None, extra_infos=None):
@@ -91,14 +92,14 @@ class WeChatGRobotAlarm(Alarm):
         self.mentioned_mobile_list = mentioned_mobile_list
 
     @classmethod
-    def from_tider(cls, tider):
+    def from_crawler(cls, crawler):
         return cls(
-            stats=tider.stats,
-            msg_type=tider.settings['ALARM_MESSAGE_TYPE'],
-            spidername=tider.spidername,
-            key=tider.settings["WECHAT_ROBOT_KEY"],
-            mentioned_list=tider.settings.getlist("WECHAT_ROBOT_MENTIONED_LIST"),
-            mentioned_mobile_list=tider.settings.getlist("WECHAT_ROBOT_MENTIONED_MOBILE_LIST")
+            stats=crawler.stats,
+            msg_type=crawler.settings['ALARM_MESSAGE_TYPE'],
+            spidername=crawler.spidername,
+            key=crawler.settings["WECHAT_ROBOT_KEY"],
+            mentioned_list=crawler.settings.getlist("WECHAT_ROBOT_MENTIONED_LIST"),
+            mentioned_mobile_list=crawler.settings.getlist("WECHAT_ROBOT_MENTIONED_MOBILE_LIST")
         )
 
     def send_message(self, message, msg_type=None, infos=None):

@@ -1,9 +1,10 @@
 import logging
 import warnings
 from typing import Optional
-from weakref import proxy, ProxyType
+from weakref import proxy
 
 from tider import Response
+from tider.utils.log import get_logger
 
 
 class Spider:
@@ -24,7 +25,7 @@ class Spider:
 
     @property
     def logger(self):
-        logger = logging.getLogger(self.name)
+        logger = get_logger(self.name)
         return logging.LoggerAdapter(logger, {'spider': self})
 
     def log(self, message, level=logging.DEBUG, **kw):
@@ -37,22 +38,26 @@ class Spider:
         self.logger.log(level, message, **kw)
 
     @classmethod
-    def from_tider(cls, tider, *args, **kwargs):
+    def from_crawler(cls, crawler, *args, **kwargs):
         spider = cls(*args, **kwargs)
-        spider._set_tider(tider)
-        spider.initialize()
+        spider._set_crawler(crawler)
+        spider._initialize()
         return spider
 
-    def _set_tider(self, tider):
-        self.tider = tider if isinstance(tider, ProxyType) else proxy(tider)
-        self.settings = tider.settings
+    def _set_crawler(self, crawler):
+        from tider.crawler.base import Crawler
+        # self.crawler: Crawler | ProxyType[Crawler]
+        # use proxy will use lower memory.
+        self.crawler: Crawler = crawler  # type hint
+        self.crawler = proxy(self.crawler)
+        self.settings = crawler.settings
 
     def start_requests(self, **kwargs):
         from tider.network.request import Request  # avoid conflicts with monkey patch
         for url in self.start_urls:
             yield Request(url, dup_check=False)
 
-    def initialize(self):
+    def _initialize(self):
         self.on_init()
 
     def on_init(self):
@@ -61,7 +66,7 @@ class Spider:
     def parse(self, response: Response):
         raise NotImplementedError(f'{self.__class__.__name__}.parse callback is not defined')
 
-    def process(self, message):
+    def process(self, message, body=None):
         pass
 
     @classmethod
@@ -70,7 +75,7 @@ class Spider:
 
     def close(self, reason=None):
         self.on_close(reason)
-        del self.tider
+        del self.crawler
 
     def on_close(self, reason=None):
         pass
