@@ -109,16 +109,6 @@ class RecentlyUsedContainer(_RecentlyUsedContainer):
         super().__init__(maxsize=maxsize, dispose_func=dispose_func)
         self.clean_func = clean_func
 
-    def __getitem__(self, key):
-        item = super().__getitem__(key)
-        if hasattr(item, 'activate'):
-            item.activate()
-
-    def __setitem__(self, key, value):
-        if hasattr(value, 'deactivate'):
-            value.deactivate()
-        super().__setitem__(key, value)
-
     def clean_up(self):
         if not self.clean_func:
             return
@@ -243,6 +233,7 @@ class ConnectionPool:
                 # attempt to bypass the proxy)
                 conn = None
 
+        self.activate()
         return conn or self._new_conn()
 
     def _put_conn(self, conn):
@@ -285,7 +276,9 @@ class ConnectionPool:
                     self.host,
                     self.pool.qsize(),
                 )
-
+            if self.pool.full():
+                self.deactivate()
+        from queue import Queue
         # Connection never got put back into the pool, close it.
         if conn:
             conn.close()

@@ -21,6 +21,7 @@ from urllib3.exceptions import ProxyError as _ProxyError
 from urllib3.exceptions import ReadTimeoutError, ResponseError
 from urllib3.exceptions import SSLError as _SSLError
 from urllib3.util import parse_url, Retry, Timeout as TimeoutSauce
+from urllib3.util.ssl_ import create_urllib3_context
 
 from requests.status_codes import codes
 from requests.structures import CaseInsensitiveDict
@@ -77,6 +78,18 @@ DEFAULT_POOLSIZE = 10
 DEFAULT_RETRIES = 0
 DEFAULT_POOL_TIMEOUT = None
 
+try:
+    import ssl
+
+    _preloaded_ssl_context = create_urllib3_context()  # ssl version is set to None by default.
+    _preloaded_ssl_context.load_verify_locations(
+        extract_zipped_paths(DEFAULT_CA_BUNDLE_PATH)
+    )
+except ImportError:
+    # Bypass default SSLContext creation when Python
+    # interpreter isn't built with the ssl module.
+    _preloaded_ssl_context = None
+
 
 def _port_or_default(parsed: ParseResult):
     if parsed.port is not None:
@@ -130,14 +143,16 @@ def _urllib3_request_context(url, verify, client_cert) -> (Dict[str, Any], Dict[
     if scheme.startswith("https") and verify:
         cert_reqs = "CERT_REQUIRED"
         if isinstance(verify, str):
-            ca_certs = verify
+            if not os.path.isdir(verify):
+                pool_kwargs["ca_certs"] = verify
+            else:
+                pool_kwargs['ca_cert_dir'] = verify
         else:
-            ca_certs = extract_zipped_paths(DEFAULT_CA_BUNDLE_PATH)
+            if _preloaded_ssl_context is not None:
+                pool_kwargs["ssl_context"] = _preloaded_ssl_context
+            else:
+                pool_kwargs["ca_certs"] = extract_zipped_paths(DEFAULT_CA_BUNDLE_PATH)
 
-        if not os.path.isdir(ca_certs):
-            pool_kwargs["ca_certs"] = ca_certs
-        else:
-            pool_kwargs['ca_cert_dir'] = ca_certs
     pool_kwargs["cert_reqs"] = cert_reqs
     if client_cert is not None:
         if isinstance(client_cert, tuple) and len(client_cert) == 2:
@@ -386,9 +401,6 @@ class HTTPDownloader(RedirectMixin):
             if selected_proxy == key[1]:
                 manager = self.proxy_manager[key]
                 return manager
-        # clear proxymanager once the proxy is finalized.
-        proxy_key = (proxy.weak(), selected_proxy)
-        weakref.finalize(proxy, self._clear_invalid_proxy, selected_proxy)
 
         if selected_proxy.lower().startswith("socks"):
             username, password = get_auth_from_url(selected_proxy)
@@ -402,6 +414,10 @@ class HTTPDownloader(RedirectMixin):
                 **proxy_kwargs,
             )
         else:
+            # clear proxymanager once the proxy is finalized.
+            proxy_key = (proxy.weak(), selected_proxy)
+            weakref.finalize(proxy, self._clear_invalid_proxy, selected_proxy)
+
             proxy_headers = {}
             username, password = get_auth_from_url(selected_proxy)
             if username:
@@ -519,6 +535,9 @@ class HTTPDownloader(RedirectMixin):
             using_socks_proxy = proxy_scheme.startswith("socks")
 
         url = request.path_url
+        if url.startswith("//"):  # Don't confuse urllib3
+            url = f"/{url.lstrip('/')}"
+
         if is_proxied_http_request and not using_socks_proxy:
             url = urldefragauth(request.url)
 
@@ -564,7 +583,8 @@ class HTTPDownloader(RedirectMixin):
             # DownloadError, RuntimeError, TypeError...
             if response is None:
                 response = Response(request)
-            response.fail(error=e)
+            if not response.failed:  # maybe already failed in response.read().
+                response.fail(error=e)
             return response
         finally:
             request.proxy.disconnect()

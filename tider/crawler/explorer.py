@@ -34,8 +34,10 @@ def _transport(queue, download_func, output_handler=None, shutdown_event=None, l
     shutdown_event = shutdown_event if shutdown_event is not None else threading.Event()
     while not shutdown_event.is_set():
         try:
-            state.maybe_shutdown()
             request = queue.popleft()
+            if request.delay and time.monotonic() < request.meta.get('explore_after', 0):
+                queue.extend([request])  # append to the end of queue.
+                continue
             response = download_func(request)
             # don't use thread lock in handler if possible.
             output_handler(response)
@@ -43,15 +45,16 @@ def _transport(queue, download_func, output_handler=None, shutdown_event=None, l
             if not loop:
                 FREE_SLOTS.append(None)
                 break
-        except BaseException:
-            shutdown_event.set()
-            state.should_terminate = EX_FAILURE
-            raise
-        finally:
             # switch greenlet if using gevent
             # when the active one can't get the next request
             # to avoid keeping loop.
             time.sleep(0.01)
+        except RuntimeError:
+            break
+        except BaseException:
+            shutdown_event.set()
+            state.should_terminate = EX_FAILURE
+            raise
 
 
 class Explorer:
@@ -91,9 +94,7 @@ class Explorer:
         self.running = False
         self._shutdown.set()
 
-        self.queue.clear()
         self.pool.stop()
-        self.transferring.clear()
         self.proxypool.close()
         self.session.close()
         logger.info("Explorer closed (%(reason)s)", {'reason': reason})
@@ -166,8 +167,6 @@ class Explorer:
     def explore(self, request):
         self.transferring.add(request)
         self._crawler.stats.inc_value("request/count")
-        if request.delay:
-            time.sleep(request.delay)
         response = self._explore(request)
         if isinstance(response, Response):
             try:
@@ -201,18 +200,14 @@ class Explorer:
             if str(status_code).startswith("4"):
                 request.invalidate_proxy()
             if status_code not in ignored_status_code:
-                response = self.get_retry_request(request, response, exc=e)
-                if str(status_code) == "500":
-                    time.sleep(2)
-                elif str(status_code).startswith("5"):
-                    time.sleep(1)
+                response = self.get_retry_request(request, response, status_code=status_code, exc=e)
         except DownloadError as e:
             if isinstance(e, (ConnectionError, ProxyError, Timeout)):
                 request.invalidate_proxy()
             response = self.get_retry_request(request, response, exc=e)
         return response
 
-    def get_retry_request(self, request, response, exc):
+    def get_retry_request(self, request, response, status_code=None, exc=None):
         retry_times = request.meta.get('retry_times', 0) + 1
         max_retries = request.max_retries
         if max_retries == -1 or retry_times <= max_retries:
@@ -220,6 +215,10 @@ class Explorer:
                 "Retrying %(request)s (failed %(retry_times)d times): %(reason)s",
                 {'request': request, 'retry_times': retry_times, 'reason': str(exc)}
             )
+            if status_code and str(status_code).startswith("5"):
+                request.delay = request.delay or 2
+            if request.delay:
+                request.meta['explore_after'] = time.monotonic() + request.delay
             request.meta['retry_times'] = retry_times
             request.dup_check = False
             request.priority += self.priority_adjust

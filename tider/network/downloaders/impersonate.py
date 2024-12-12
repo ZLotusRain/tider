@@ -1,12 +1,13 @@
+import sys
 import warnings
 from types import MethodType
 
 try:
     from curl_cffi.requests import Session
     from curl_cffi.const import CurlHttpVersion
-    from curl_cffi.requests.errors import RequestsError
+    from curl_cffi.curl import CurlError
 except ImportError:
-    Session = CurlHttpVersion = RequestsError = None
+    Session = CurlHttpVersion = CurlError = None
 
 from requests.structures import CaseInsensitiveDict
 
@@ -15,6 +16,7 @@ from tider.utils.time import preferred_clock
 from tider.utils.log import get_logger
 from tider.utils.misc import try_import
 from tider.utils.network import extract_cookies_to_jar, guess_encoding_from_headers
+from tider.exceptions import ImproperlyConfigured
 
 logger = get_logger(__name__)
 
@@ -30,7 +32,7 @@ def stream(self, chunk_size=None, **_):
             chunk = self.queue.get()  # type: ignore
 
             # re-raise the exception if something wrong happened.
-            if isinstance(chunk, RequestsError):
+            if isinstance(chunk, CurlError):
                 self.curl.reset()  # type: ignore
                 raise chunk
 
@@ -72,6 +74,11 @@ class ImpersonateDownloader:
         pass
 
     def download_request(self, request: Request, session_cookies=None, max_redirects=None, **_):
+        if not Session:
+            raise ImproperlyConfigured(
+                'You need to install the curl_cffi library to use impersonate downloader.'
+            )
+
         request.proxy.connect()
         try:
             http_version = CurlHttpVersion.NONE if not request.http2 else CurlHttpVersion.V2_0
@@ -85,6 +92,9 @@ class ImpersonateDownloader:
             # Start time (approximately) of the request
             start = preferred_clock()
             with Session(thread=self._thread, trust_env=self.trust_env) as session:
+                session_kwargs = {}
+                if sys.version_info > (3, 8):
+                    session_kwargs.update(cert=request.cert)
                 # don't use stream here to avoid core dump.
                 resp = session.request(
                     method=request.method,
@@ -97,10 +107,10 @@ class ImpersonateDownloader:
                     timeout=request.timeout,
                     proxies=request.proxies,
                     verify=request.verify,
-                    cert=request.cert,
                     http_version=http_version,
                     impersonate=impersonate,
                     max_redirects=max_redirects,
+                    **session_kwargs,
                 )
             # Total elapsed time of the request (approximately)
             elapsed = preferred_clock() - start
@@ -112,14 +122,18 @@ class ImpersonateDownloader:
             if not request.stream:
                 response.read()
             return response
-        except RequestsError as e:
+        except CurlError as e:
             # https://curl.se/libcurl/c/libcurl-errors.html
             request.invalidate_proxy()
             resp = getattr(e, 'response', None)
             if resp is not None:
-                resp.close()
+                try:
+                    resp.close()
+                except AttributeError:
+                    pass
             response = Response(request)
-            response.fail(error=e)
+            if not response.failed:  # maybe already failed in response.read().
+                response.fail(error=e)
             return response
         finally:
             request.proxy.disconnect()

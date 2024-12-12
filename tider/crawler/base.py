@@ -103,7 +103,7 @@ class Crawler:
     exitcode = None
 
     def __init__(self, spidercls, schema='default', app=None, hostname=None, concurrency=None, pool_cls=None,
-                 scheduler_cls=None, explorer_cls=None, broker_transport=None,
+                 scheduler_cls=None, explorer_cls=None, data_source="", broker_transport=None,
                  broker_wait_timeout=None, stats_cls=None, alarm_cls=None, debug=False,
                  loglevel=None, logfile=None, pidfile=None, purge=False, allow_duplicates=False):
         if isinstance(spidercls, Spider):
@@ -117,6 +117,7 @@ class Crawler:
         custom_settings = spidercls.custom_settings or {}
         self.settings = Settings(defaults=[self.app.conf.copy(), custom_settings.copy()])
         self.pid = os.getpid()
+        self.data_source = data_source
         set_default_ua(self.settings.get('DEFAULT_USER_AGENT'))
 
         get, set_setting = self.settings.get, self.settings.set
@@ -204,7 +205,7 @@ class Crawler:
 
     def _default_hostname(self, hostname):
         if not hostname:
-            # [schema.]spider[.transport.broker_transport]@hostname
+            # [schema.]spider[.transport.broker_transport]@host
             name = self.spidername if self.schema == 'default' else f'{self.schema}.{self.spidername}'
             if self.broker_transport not in (None, 'default'):
                 name = f'{name}.transport.{self.broker_transport}'
@@ -216,13 +217,13 @@ class Crawler:
     def get_hostname(self, hostname):
         hostname = self._default_hostname(hostname)
         # note: do not use self.connection here to avoid connection loss in pidbox.
-        inspect = self.app.control.inspect(timeout=1.0)
+        inspect = self.app.control.inspect(timeout=2.0)
         logger.info("Checking if hostname duplicates...")
 
-        replies = inspect.sames(hostname)
+        replies = inspect.ping(destination=[hostname])
         if replies:
             if self.allow_duplicates:
-                return nodename(f'{nodesplit(hostname)[0]}.{str(os.getpid())}', nodesplit(hostname)[-1])
+                return nodename(f'{nodesplit(hostname)[0]}.{str(self.pid)}', nodesplit(hostname)[-1])
             logger.error(f"Duplicate hostname: {hostname}")
             raise RuntimeError("Can't crawl a duplicated spider.")
         return hostname
@@ -230,6 +231,14 @@ class Crawler:
     @cached_property
     def hostname(self):
         return self.get_hostname(self._source_hostname)
+
+    @cached_property
+    def svr(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
 
     def rusage(self):
         if resource is None:
@@ -256,12 +265,8 @@ class Crawler:
 
     def info(self):
         uptime = datetime.utcnow() - self.startup_time
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(('8.8.8.8', 80))
-        ip = s.getsockname()[0]
-        s.close()
         return {'pid': self.pid,
-                'server_ip': ip,
+                'server_ip': self.svr,
                 'clock': str(self.app.clock),
                 'uptime': round(uptime.total_seconds())}
 
@@ -302,7 +307,7 @@ class Crawler:
             maxbytes=get('LOG_MAX_BYTES'),
             backup_count=get('LOG_BACKUP_COUNT'),
             encoding=get('LOG_ENCODING'),
-            nodename=nodesplit(self._default_hostname(self._source_hostname))[0],
+            hostname=self.hostname,
             debug=self.debug,
         )
 
@@ -359,6 +364,8 @@ def _shutdown_handler(crawler, sig='TERM', how='Warm',
                 )
                 setattr(state, {'Warm': 'should_stop',
                                 'Cold': 'should_terminate'}[how], exitcode)
+                if how == 'Cold':
+                    crawler.engine.force_clean()
     _handle_request.__name__ = str(f'crawler_{how}')
     platforms.signals[sig] = _handle_request
 
@@ -409,7 +416,7 @@ def install_crawler_restart_handler(crawler, sig='SIGHUP'):
     def restart_crawler_sig_handler(*args):
         """Signal handler restarting the current python program."""
         set_in_sighandler(True)
-        safe_say(f"Restarting crawler ({' '.join(sys.argv)})")
+        safe_say(f"Restarting tider crawler ({' '.join(sys.argv)})")
         import atexit
         atexit.register(_reload_current_crawler)
         from tider.crawler import state

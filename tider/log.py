@@ -17,9 +17,9 @@ from logging.handlers import RotatingFileHandler
 from kombu.utils.encoding import set_default_encoding_file
 
 from tider import signals
+from tider.utils.nodenames import node_format
 from tider.utils.log import (ColorFormatter, LoggingProxy, get_logger, get_multiprocessing_logger, mlevel,
                              reset_multiprocessing_logger)
-from tider.utils.text import simple_format
 
 __all__ = ('Logging', 'set_in_sighandler', 'in_sighandler')
 
@@ -59,11 +59,11 @@ class Logging:
         self.colorize = self.app.conf.get('LOG_COLORIZE')
 
     def setup(self, loglevel=None, logfile=None, maxbytes=30*1024*1024, backup_count=1, encoding=None,
-              fmt=None, redirect_stdouts=False, redirect_level='WARNING', colorize=None, nodename=None, debug=False):
+              fmt=None, redirect_stdouts=False, redirect_level='WARNING', colorize=None, hostname=None, debug=False):
         loglevel = mlevel(loglevel)
         self.setup_logging_subsystem(
             loglevel, logfile, maxbytes=maxbytes, backup_count=backup_count,
-            encoding=encoding, fmt=fmt, colorize=colorize, nodename=nodename, debug=debug,
+            encoding=encoding, fmt=fmt, colorize=colorize, hostname=hostname, debug=debug,
         )
         if redirect_stdouts:
             self.redirect_stdouts(redirect_level)
@@ -77,13 +77,12 @@ class Logging:
         )
 
     def setup_logging_subsystem(self, loglevel=None, logfile=None, fmt=None,
-                                colorize=None, nodename=None, debug=False, **kwargs):
-        if nodename in self._setups:
+                                colorize=None, hostname=None, debug=False, **kwargs):
+        if hostname in self._setups:
             return
-        if logfile and nodename:
-            keys = dict(n=nodename)
-            logfile = simple_format(logfile, keys)
-        Logging._setups.append(nodename)
+        if logfile and hostname:
+            logfile = node_format(logfile, hostname)
+        Logging._setups.append(hostname)
         loglevel = mlevel(loglevel or self.loglevel)
         fmt = fmt or self.format
         colorize = self.supports_color(colorize, logfile)

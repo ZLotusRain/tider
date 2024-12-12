@@ -247,11 +247,9 @@ class Response:
         if self.meta.get('filetype', ''):
             return self.meta['filetype']
 
-        filetype = self.url.rsplit('.', maxsplit=1)[-1].split('?')[0]
         content_type = self.headers.get('Content-Type', '')
-        maybe_filetype = list(filter(lambda x: x.startswith("."), content_type.split(";")))
-        if maybe_filetype:
-            filetype = maybe_filetype or filetype
+        filetype = list(filter(lambda x: x.startswith("."), content_type.split(";")))
+        filetype = filetype[0] if filetype else ""
 
         for each in content_type.split(';'):
             if each == 'application/ms-download':
@@ -273,20 +271,23 @@ class Response:
     def iter_content(self, chunk_size=1, decode_unicode=False):
         def generate():
             # Special case for urllib3.
-            if hasattr(self.raw, "stream"):
-                try:
+            try:
+                if hasattr(self.raw, "stream"):
                     yield from self.raw.stream(chunk_size, decode_content=True)
-                except Exception as e:
-                    raise ResponseReadError(e)
-            elif self.raw is not None:
-                # Standard file-like object.
-                while True:
-                    chunk = self.raw.read(chunk_size)
-                    if not chunk:
-                        break
-                    yield chunk
 
-            self._content_consumed = True
+                elif self.raw is not None:
+                    # Standard file-like object.
+                    while True:
+                        chunk = self.raw.read(chunk_size)
+                        if not chunk:
+                            break
+                        yield chunk
+
+                self._content_consumed = True
+            except Exception as e:
+                error = ResponseReadError(e)
+                self.fail(error)
+                self.check_error()
 
         if self._content_consumed and isinstance(self._content, bool):
             raise ResponseStreamConsumed()
@@ -359,7 +360,7 @@ class Response:
             for tag in soup.find_all(recursive=True):
                 if shield_a and tag.name == 'a':
                     tag.name = 'p'
-                if tag.name == 'div' and not tag.find_all(recursive=False):
+                if tag.name == 'div' and not tag.find_all(recursive=False) and not tag.get_text().strip():
                     tag.extract()
                 if tag.attrs.get("href"):
                     if tag['href'] == "javascript:void(0);":
@@ -434,6 +435,7 @@ class Response:
         meta.pop('promise_then', None)
         parse_times = meta.get('parse_times', 0) + 1
         meta.update(retry_times=0, parse_times=parse_times)
+        meta.update(kwargs.pop('meta', {}))
 
         headers = kwargs.pop('headers', None) or self.request.headers
         headers = dict(headers or {})
@@ -497,11 +499,18 @@ class Response:
         raw, self.raw = self.raw, None
         if raw is not None:
             if getattr(raw, "drain_conn", None):
+                if self.failed:
+                    raw.close()
                 # special for urllib3.
                 # if connection pool is closed, the connection will be closed.
+                # Read and discard any remaining HTTP response data in the response connection.
                 raw.drain_conn()
             elif getattr(raw, "close", None):
-                raw.close()
+                try:
+                    raw.close()
+                except AttributeError:
+                    # using curl_cffi and Python version < 3.8
+                    pass
         self._clear_caches()
         if self._error:
             self._error.__traceback__ = None

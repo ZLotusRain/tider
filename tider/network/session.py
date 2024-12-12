@@ -175,7 +175,7 @@ class Session:
             except Exception:
                 logger.error(
                     'Loading "%(clspath)s" for downloader "%(downloader)s"',
-                    {"clspath": path, "scheme": downloader},
+                    {"clspath": path, "downloader": downloader},
                     exc_info=True,
                 )
                 return None

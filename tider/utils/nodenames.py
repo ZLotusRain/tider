@@ -1,6 +1,7 @@
 """Spider name utilities."""
 import socket
 from typing import Optional
+from functools import partial
 
 from kombu.utils.functional import memoize
 
@@ -26,7 +27,7 @@ def nodename(name, hostname):
 
 def nodesplit(name):
     """Split node name into tuple of name/hostname."""
-    parts = name.split(NODENAME_SEP, 1)
+    parts = name.rsplit(NODENAME_SEP, 1)
     if len(parts) == 1:
         return None, parts[0]
     return parts
@@ -42,6 +43,16 @@ def node_format(s: str, name: str, **extra: dict) -> str:
     """Format crawler node name (name@host.com)."""
     shortname, host = nodesplit(name)
     return host_format(s, host, shortname or NODENAME_DEFAULT, p=name, **extra)
+
+
+def _fmt_process_index(prefix: str = '', default: str = '0') -> str:
+    from .log import current_process_index
+
+    index = current_process_index()
+    return f'{prefix}{index}' if index else default
+
+
+_fmt_process_index_with_prefix = partial(_fmt_process_index, '-', '')
 
 
 def host_format(s: str, host: Optional[str] = None, name: Optional[str] = None, **extra: dict) -> str:
@@ -77,6 +88,8 @@ def host_format(s: str, host: Optional[str] = None, name: Optional[str] = None, 
             'h': host,
             'n': name,
             'd': domain,
+            'i': _fmt_process_index,
+            'I': _fmt_process_index_with_prefix,
         },
         **extra,
     )

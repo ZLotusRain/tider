@@ -4,7 +4,6 @@ billiard>=3.6.4.0
 click>=8.1.2,<9.0
 click-didyoumean>=0.3.0
 click-plugins>=0.7.0
-curl_cffi>=0.6.3b1
 gevent>=21.12.0
 greenlet>=3.0.1
 h2>=4.1.0

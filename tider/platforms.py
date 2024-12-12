@@ -45,6 +45,18 @@ PIDLOCKED = """ERROR: Pidfile ({0}) already exists.
 Seems we're already running? (pid: {1})"""
 
 
+SIGNAMES = {
+    sig for sig in dir(_signal)
+    if sig.startswith('SIG') and '_' not in sig
+}
+SIGMAP = {getattr(_signal, name): name for name in SIGNAMES}
+
+
+def signal_name(signum):
+    """Return name of signal from signal number."""
+    return SIGMAP[signum][3:]
+
+
 class LockFailed(Exception):
     """Raised if a PID lock can't be acquired."""
 

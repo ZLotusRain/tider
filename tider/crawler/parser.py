@@ -3,6 +3,7 @@ from collections import deque
 
 from tider import Item, Request
 from tider.crawler import state
+from tider.platforms import EX_FAILURE
 from tider.promise import EXECUTED, REJECTED
 from tider.utils.log import get_logger
 from tider.utils.functional import iter_generator
@@ -70,13 +71,13 @@ class Parser:
             try:
                 response = self.queue.popleft()
                 self.parse(response)
-                state.maybe_shutdown()
             except IndexError:
                 if not self.loop:
                     self.free_slots.append(None)
                     break
             except BaseException:
                 self.running = False
+                state.should_terminate = EX_FAILURE
                 raise
             finally:
                 # sleep to switch thread
@@ -111,12 +112,13 @@ class Parser:
                 if errback:
                     spider_outputs = errback(response)
                 self.crawler.stats.inc_value("request/count/failed")
-
             else:
                 spider_outputs = callback(response)
 
             order = 0
-            for output in iter_generator(spider_outputs):
+            # sleep to switch thread
+            for output in iter_generator(spider_outputs, sleep=self.crawler.maybe_sleep):
+                state.maybe_shutdown()
                 # iter spider outputs directly.
                 if self._spider_output_filter(output, response):
                     if node and isinstance(output, Request):
@@ -128,9 +130,7 @@ class Parser:
                             self._process_spider_output(output, request)
                     else:
                         self._process_spider_output(output, request)
-                # sleep to switch thread
-                self.crawler.maybe_sleep(0.01)
-        except Exception as e:
+        except BaseException as e:
             logger.exception(f"Parser bug processing {request}")
             self.crawler.stats.inc_value(f"parser/{e.__class__.__name__}/count")
 
@@ -138,12 +138,11 @@ class Parser:
         if node:
             node.state = EXECUTED if _success else REJECTED
             try:
-                for output in iter_generator(node.then()):
+                for output in iter_generator(node.then(), sleep=self.crawler.maybe_sleep):
+                    state.maybe_shutdown()
                     # iter node.then() directly.
                     self._process_spider_output(output, request)
-                    # sleep to switch thread
-                    self.crawler.maybe_sleep(0.01)
-            except Exception as e:
+            except BaseException as e:
                 logger.exception(f"Promise bug processing {request}")
                 self.crawler.stats.inc_value(f"promise/{e.__class__.__name__}/count")
 
@@ -179,6 +178,8 @@ class Parser:
         return True
 
     def _process_spider_output(self, output, request):
+        if not self.running:
+            return
         if isinstance(output, Request):
             self.crawler.engine.schedule_request(output)
         elif isinstance(output, (Item, dict)):
@@ -192,8 +193,6 @@ class Parser:
 
     def close(self, reason):
         self.running = False
-        self.queue.clear()
         self.itemproc.close()
         self.pool.stop()  # stop pool first
-        self.parsing = self.parsing.clear()
         logger.info("Parser closed (%(reason)s)", {'reason': reason})
