@@ -111,7 +111,7 @@ class PromiseNode:
                 # # copy request state to avoid lose cb_kwargs
                 node = promise_node.root
                 if node.parent and node.parent is not self:
-                    raise ValueError("Can't add root with parent.")
+                    raise ValueError("Can't add root from another promise.")
                 node.parent = self  # add parent promise, do not use proxy here
                 # old_request, promise_node.request = promise_node.request, request
                 # old_request.close()
