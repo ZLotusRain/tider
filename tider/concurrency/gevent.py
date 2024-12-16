@@ -36,8 +36,6 @@ class TaskPool(BasePool, ABC):
     signal_safe = False
     is_green = True
     task_join_will_block = False
-    _pool = None
-    _quick_put = None
 
     def __init__(self, *args, **kwargs):
         from gevent import spawn_raw
@@ -45,6 +43,7 @@ class TaskPool(BasePool, ABC):
         self.Pool = Pool
         self.spawn_n = spawn_raw
         self.timeout = kwargs.get('timeout')
+        self._quick_put = None
         super().__init__(*args, **kwargs)
 
     def on_start(self):

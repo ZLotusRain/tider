@@ -51,13 +51,12 @@ class BasePool:
     #: set to true if pool uses greenlets.
     is_green = False
 
-    _state = None
-    _pool = None
-
     task_join_will_block = True
     body_can_be_buffer = False
 
     def __init__(self, limit=None, **options):
+        self._pool = None
+        self._state = None
         self.limit = limit or psutil.cpu_count()
 
     def on_start(self, **kwargs):
