@@ -172,9 +172,6 @@ class DrissionPageDownloader(BrowserDownloader):
             )
 
         browser_ini_path = request.meta.get('browser_ini_path')
-        browser_channel = request.meta.get('browser_channel', 'chromium')  # default to headless
-        if browser_channel not in ('chromium', 'chrome', 'msedge', 'chrome-beta', 'msedge-beta', 'msedge-dev'):
-            raise ImproperlyConfigured("Unsupported browser channel: %s" % browser_channel)
         screenshot_path = request.meta.get('browser_screenshot_path')
 
         http_version = "HTTP/?"
