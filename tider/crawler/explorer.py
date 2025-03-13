@@ -8,18 +8,21 @@ from typing import Optional
 from tider import Request
 from tider.network import Session, ProxyPoolManager, Response
 from tider.exceptions import (
-    DownloadError,
     ConnectionError,
+    DownloadError,
     HTTPError,
     ProxyError,
+    InvalidProxy,
+    ExclusiveProxy,
     Timeout,
+    SpiderShutdown,
+    SpiderTerminate
 )
 from tider.crawler import state
 from tider.platforms import EX_FAILURE
 from tider.utils.log import get_logger
 from tider.utils.url import parse_url_host
 from tider.utils.misc import build_from_crawler
-from tider.exceptions import SpiderShutdown, SpiderTerminate
 
 logger = get_logger(__name__)
 
@@ -176,7 +179,8 @@ class Explorer:
         proxy = self.proxypool.get_proxy(
             schema=request.proxy_schema,
             proxy_args=request.proxy_params,
-            disposable=request.meta.get('new_proxy', False),
+            disposable=request.meta.get('disposable_proxy', False),
+            request=request,
         )
         request.update_proxy(proxy)
 
@@ -295,13 +299,16 @@ class Explorer:
             if status_code not in ignored_status_code:
                 response = self.get_retry_request(request, response, status_code=status_code, exc=e)
         except DownloadError as e:
-            if isinstance(e, (ConnectionError, ProxyError, Timeout)):
+            if isinstance(e, (ConnectionError, InvalidProxy, Timeout)):
                 request.invalidate_proxy()
             response = self.get_retry_request(request, response, exc=e)
         return response
 
     def get_retry_request(self, request, response, status_code=None, exc=None):
-        retry_times = request.meta.get('retry_times', 0) + 1
+        retry_times = request.meta.get('retry_times', 0)
+        if not isinstance(exc, ExclusiveProxy):
+            # re-select proxy.
+            retry_times += 1
         max_retries = request.max_retries
         if max_retries == -1 or retry_times <= max_retries:
             logger.debug(
