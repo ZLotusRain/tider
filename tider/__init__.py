@@ -134,8 +134,12 @@ def _patch_pymupdf():
             if table.TEXTPAGE:
                 table.TEXTPAGE.this = table.TEXTPAGE.parent = None
                 table.TEXTPAGE = None
+            if pymupdf.g_img_info:
+                del pymupdf.g_img_info[:]
             del table.EDGES[:], table.CHARS[:]
+            pymupdf._log_items_clear()
             # https://pymupdf.readthedocs.io/en/latest/tools.html
+            pymupdf.TOOLS.reset_mupdf_warnings()
             pymupdf.TOOLS.store_shrink(100)
         return wrapper
 
