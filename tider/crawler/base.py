@@ -121,6 +121,7 @@ class Crawler:
 
         get, set_setting = self.settings.get, self.settings.set
         self.concurrency = concurrency or get("CONCURRENCY")
+        set_setting("CONCURRENCY", self.concurrency, 'cmdline')
         self.pool_cls = pool_cls or get("POOL")
         self.broker_transport = broker_transport or get('BROKER_TRANSPORT') or 'default'
         self.broker_wait_timeout = broker_wait_timeout or get('BROKER_TIMEOUT')
