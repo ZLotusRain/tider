@@ -7,9 +7,9 @@ logger = get_logger(__name__)
 
 
 class FileExtExtractor:
-
+    # Extension refs:
+    # https://www.file-extensions.org
     # https://support.microsoft.com/en-us/windows/common-file-name-extensions-in-windows-da4a4430-8e76-89c5-59f7-1cdbbc75cb01
-    URL = "https://www.file-extensions.org"
 
     COMMON_EXTENSIONS = {
         'Archives': {
@@ -38,21 +38,21 @@ class FileExtExtractor:
             'bik', 'dat', 'h264', 'mov', 'mp4', 'mpg', 'qt', 'rm', 'swf', 'wmv',
             'm4a', 'm4v', 'flv', 'webm', 'mpeg', 'f4v', 'rmvb', 'vob', 'mkv',
         },
-        'Microsoft Office files': {
-            'xls', 'xlsx', 'ppt', 'pptx', 'pps', 'doc', 'docx',
-            'odt', 'ods', 'odg', 'odp',
+        'Office suites': {
+            'xls', 'xlsm', 'xlsx', 'xltm', 'xltx', 'potm', 'potx', 'ppt', 'pptm', 'pptx', 'pps',
+            'doc', 'docb', 'docm', 'docx', 'dotm', 'dotx', 'odt', 'ods', 'odg', 'odp', 'xps'
         },
         'Documents': {
-            'abw', 'pdf', 'djvu ', 'dotm', 'epub', 'mht', 'pages', 'vsd', 'xps'
+            'abw', 'pdf', 'djvu ', 'epub', 'mht', 'pages', 'vsd',
         },
         'Simple text files': {
-            'txt', 'csv', 'xml'
+            'txt', 'csv', 'xml', 'rb'
         },
         'Possibly dangerous files': {
             'exe', 'sys', 'com', 'bat', 'bin', 'rss',
             'dmg', 'iso', 'apk', 'ipa', 'chm', 'class',
-            'dll', 'drv', 'jar', 'js', 'lnk', 'ocx',
-            'pcx', 'scr', 'shs', 'vbs', 'vxd', 'wmf'
+            'dll', 'drv', 'jar', 'js', 'lnk', 'ocx', 'msi',
+            'pcx', 'scr', 'sh', 'shs', 'vbs', 'vxd', 'wmf', 'py'
         },
     }
 
@@ -60,60 +60,42 @@ class FileExtExtractor:
         'com', 'org', 'net', 'int', 'edu', 'gov', 'mil', 'arpa',
         'cn', 'xyz', 'info', 'icu', 'top', 'cc', 'de', 'app',
         'pub', 'do', 'action', 'sg', 'htm', 'html', 'jhtml', 'shtml', 'asp',
-        'aspx', 'jsp', 'jspx', 'php', 'css', 'js'
+        'aspx', 'jsp', 'jspx', 'php', 'css', 'js',
     }
 
-    def __init__(self, allow_untrusted=False, guess=True, update_online=False, includes=(), excludes=()):
-        self.untrusted_categories = ('Possibly dangerous files', )
-        self.allow_untrusted = allow_untrusted
+    def __init__(self, ignored_types=('Possibly dangerous files', ), guess=True, includes=(), excludes=()):
+        self.ignored_types = ignored_types
         self.guess = guess
-        if update_online:
-            self._update_online()
         self._excludes = set(excludes)
         self._includes = set(includes)
 
     @property
     def valid_extensions(self):
-        common_extensions = self.COMMON_EXTENSIONS.copy()
-        if not self.allow_untrusted:
-            [common_extensions.pop(key) for key in self.untrusted_categories]
-        valids = set()
-        for each in common_extensions.values():
-            valids = valids | each
-        valids = valids | self._includes
+        valid_extensions = set()
+        for t, extensions in self.COMMON_EXTENSIONS.items():
+            if t in self.ignored_types:
+                continue
+            valid_extensions = valid_extensions | extensions
+        valid_extensions = valid_extensions | self._includes
         for ex in list(self._excludes):
-            valids.discard(ex)
-        return valids
-
-    @property
-    def categories(self):
-        return list(self.COMMON_EXTENSIONS.keys())
-
-    def _update_online(self):
-        pass
-
-    def get_extensions(self, category=None):
-        return self.COMMON_EXTENSIONS.get(category, set())
+            valid_extensions.discard(ex)
+        return valid_extensions
 
     def extract(self, source, source_type='text'):
         # source_type: text | url
         source = source.strip().lower()
         dots_num = source.count('.')
-        splits = []
+        splits = [source]  # maybe valid extension itself.
         # whether dot in extension
         for num in range(dots_num + 1):
             splits.append(source.split('.', maxsplit=num)[-1])
+        # consider extensions like 'tar.gz'
         for each in splits:
             if each in self.valid_extensions:
                 return each
-        if not self.guess or not splits:
+        if not self.guess:
             return ""
-        if "." not in source:
-            if source in self.valid_extensions:
-                return source
-            else:
-                return ""
-        # don't consider extensions like 'tar.gz'
+
         ext = ""
         suffix = source.split(".")[-1]
         if suffix in self._excludes:
@@ -130,28 +112,24 @@ class FileExtExtractor:
 
 
 class FileExtractor(LinkExtractor):
-    """Extract file links from response.
+    """Extract file links from response."""
 
-    :param deny_extensions: (tuple) a list of strings containing extensions that
-                            should be ignored when extracting links
-    :param ignore_untrusted: (bool) ignore UNTRUSTED_EXTENSIONS if set to True
-    """
-    def __init__(self, allow_untrusted=False, guess=True, update_online=False,
-                 includes=(), excludes=(), hints=('附件', '下载', '文件', 'download', 'file', '附件下载'),
-                 unique=True, **kwargs):
+    DEFAULT_FILE_HINTS = ('附件', '下载', '文件', 'download', 'file', '附件下载')
+
+    def __init__(self, ignored_types=('Possibly dangerous files', ), guess=True,
+                 includes=(), excludes=(), hints=None, unique=True, **kwargs):
         super().__init__(unique=unique, **kwargs)
-
-        self.ext_extractor = FileExtExtractor(allow_untrusted, guess, update_online, includes, excludes)
-        self.hints = hints
+        self.ext_extractor = FileExtExtractor(ignored_types, guess, includes, excludes)
+        self.hints = hints or self.DEFAULT_FILE_HINTS
 
     def _extension_allowed(self, link):
         title, url = link['title'], link['url']
-        link['ext'] = ''
-        ext_from_title = self.ext_extractor.extract(title, 'text')
-        ext_from_url = self.ext_extractor.extract(url, 'url')
-        link['ext'] = ext_from_title or ext_from_url
-        if not ext_from_url and not ext_from_title:
+        link['ext'] = self.ext_extractor.extract(title, source_type='text')
+        if not link['ext']:
+            link['ext'] = self.ext_extractor.extract(url, source_type='url')
+        if not link['ext']:
             if title.strip() in self.hints and not url.endswith(tuple(self.ext_extractor.NETWORK_RELATED)):
+                # some file links don't end with extensions.
                 return True
             return False
         return True
