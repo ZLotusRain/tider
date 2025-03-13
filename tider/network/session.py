@@ -15,12 +15,13 @@ from requests.cookies import (
 )
 from requests.structures import CaseInsensitiveDict
 
-from tider import Request
+from tider import Request, Response
 from tider.network.proxy import Proxy
 from tider.network.user_agent import default_user_agent
 from tider.utils.log import get_logger
-from tider.utils.network import cookiejar_from_str
+from tider.utils.network import cookiejar_from_str, extract_cookies_to_jar
 from tider.utils.misc import symbol_by_name, build_from_crawler
+from tider.exceptions import ProxyError
 
 logger = get_logger(__name__)
 
@@ -204,7 +205,7 @@ class Session:
                 new_proxies = dict(request.proxies or {})
                 # Set environment's proxies.
                 # use no_proxy to avoid using proxy for specific domain.
-                no_proxy = new_proxies.get("no_proxy") if new_proxies is not None else None
+                no_proxy = new_proxies.get("no_proxy")
                 env_proxies = get_environ_proxies(request.url, no_proxy=no_proxy)
                 for (k, v) in env_proxies.items():
                     new_proxies.setdefault(k, v)
@@ -256,10 +257,19 @@ class Session:
         if not downloader:
             raise RuntimeError(f"Can't load downloader `{downloader}`")
 
-        response = downloader.download_request(request, session_cookies=request.session_cookies, trust_env=self.trust_env)
-        if request.method.upper() == 'HEAD':
-            # avoid using stream and HEAD together
-            response.read()
+        try:
+            request.proxy.connect()  # raise ProxyError if proxy is invalid
+        except ProxyError as e:
+            response = Response(request)
+            response.fail(e)
+        else:
+            response = downloader.download_request(request, trust_env=self.trust_env)
+            if request.method.upper() == 'HEAD':
+                # avoid using stream and HEAD together
+                response.read()
+            request.proxy.disconnect()
+        if response.raw:
+            extract_cookies_to_jar(request.session_cookies, request.prepared, response.raw)
         return response
 
     def close(self):
