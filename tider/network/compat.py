@@ -18,7 +18,8 @@ from urllib3.util.connection import is_connection_dropped
 from tider.utils.log import get_logger
 
 __all__ = ('CookieCompatRequest', 'CookieCompatResponse', 'RecentlyUsedContainer',
-           'HTTPConnectionPool', 'HTTPSConnectionPool', 'close_expired_connections')
+           'HTTPConnectionPool', 'HTTPSConnectionPool', 'ExpirableHTTPSConnection',
+           'ExpirableHTTPConnection', 'close_expired_connections')
 
 urllib3_log = get_logger('urllib3.connectionpool')
 
