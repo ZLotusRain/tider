@@ -71,13 +71,12 @@ class ImpersonateDownloader:
     def close_expired_connections(self):
         pass
 
-    def download_request(self, request: Request, session_cookies=None, trust_env=True):
+    def download_request(self, request: Request, trust_env=True):
         if not Session:
             raise ImproperlyConfigured(
                 'You need to install the curl_cffi library to use impersonate downloader.'
             )
 
-        request.proxy.connect()
         try:
             http_version = CurlHttpVersion.NONE if not request.http2 else CurlHttpVersion.V2_0
             if isinstance(request.impersonate, str):
@@ -118,7 +117,6 @@ class ImpersonateDownloader:
             resp.stream = MethodType(stream, resp)  # hijack stream
             response = self.build_response(request, resp)
             response.elapsed = elapsed
-            extract_cookies_to_jar(session_cookies, request.prepared, resp)
             if not request.stream:
                 response.read()
             return response
@@ -135,8 +133,6 @@ class ImpersonateDownloader:
             if not response.failed:  # maybe already failed in response.read().
                 response.fail(error=e)
             return response
-        finally:
-            request.proxy.disconnect()
 
     def build_response(self, request, resp):
         response = Response(request)
