@@ -24,12 +24,12 @@ import h2.exceptions
 import h2.settings
 
 from urllib3.util import Timeout
-from urllib3.connection import HTTPSConnection
 from urllib3.exceptions import ProtocolError, ConnectTimeoutError, ProxyError, HTTPError
 
 from .stream import SOCKET_OPTION, Stream, create_stream
 from .models import (Origin, URL, enforce_bytes,
                      enforce_headers, enforce_stream, Lock, Semaphore)
+from tider.network.compat import ExpirableHTTPSConnection
 
 _Default = Timeout(connect=5.0, read=5.0)
 
@@ -917,7 +917,7 @@ class TunnelHTTPConnection:
         keepalive_expiry: Optional[float] = None,
         socket_options: Optional[Iterable[SOCKET_OPTION]] = None,
     ):
-        self._connection = HTTPSConnection(
+        self._connection = ExpirableHTTPSConnection(
             host=proxy_origin.host.decode("ascii"),
             port=proxy_origin.port,
             ssl_context=proxy_ssl_context,
@@ -934,7 +934,7 @@ class TunnelHTTPConnection:
         self._connect_lock = Lock()
         self._connected = False
 
-    def _prepare_proxy(self, conn: HTTPSConnection, timeout=None, sni_hostname=None):
+    def _prepare_proxy(self, conn: ExpirableHTTPSConnection, timeout=None, sni_hostname=None):
         """
         Establishes a tunnel connection through HTTP CONNECT.
 
@@ -942,7 +942,7 @@ class TunnelHTTPConnection:
         improperly set Host: header to proxy's IP:port.
         """
 
-        proxy_headers = {b'Host': self._remote_origin.host.decode('ascii'), b'Accept': b'*/*'}
+        proxy_headers = {'Host': self._remote_origin.host.decode('ascii'), 'Accept': '*/*'}
         proxy_headers.update({k.decode('ascii'): v.decode('ascii') for k, v in self._proxy_headers})
         conn.set_tunnel(self._remote_origin.host.decode('ascii'), self._remote_origin.port, proxy_headers)
 
