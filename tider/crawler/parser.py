@@ -137,6 +137,7 @@ class Parser:
                 if errback:
                     spider_outputs = errback(response)
                 self.crawler.stats.inc_value("request/count/failed")
+                self.crawler.stats.add_failure(failure=response)
             else:
                 spider_outputs = callback(response)
 
@@ -159,7 +160,7 @@ class Parser:
             raise
         except Exception as e:
             logger.exception(f"Parser bug processing {request}")
-            self.crawler.stats.inc_value(f"parser/{e.__class__.__name__}/count")
+            self.crawler.stats.add_error(reason=e, request_or_response=response)
         finally:
             del callback, errback
 
@@ -175,7 +176,7 @@ class Parser:
                 raise
             except Exception as e:
                 logger.exception(f"Promise bug processing {request}")
-                self.crawler.stats.inc_value(f"promise/{e.__class__.__name__}/count")
+                self.crawler.stats.add_error(reason=e, request_or_response=response)
 
         response.close()
         request.close()
@@ -194,6 +195,7 @@ class Parser:
                     "Ignoring link (depth > %(maxdepth)d): %(requrl)s ",
                     {'maxdepth': self.max_depth, 'requrl': request.url},
                 )
+                self.crawler.stats.add_error(reason="Exceed max depth", request_or_response=request)
                 return False
 
             if 'parse_times' not in request.meta:
@@ -205,6 +207,7 @@ class Parser:
                     "Ignoring link (parse_times > %(max_parse_times)d): %(requrl)s ",
                     {'max_parse_times': self.max_depth, 'requrl': request.url},
                 )
+                self.crawler.stats.add_error(reason="Exceed max parse times", request_or_response=request)
                 return False
         return True
 
