@@ -270,6 +270,8 @@ class Response:
                 filetype = filetype or 'pdf'
             elif each == 'image/webp':
                 filetype = filetype or 'png'
+            elif each == 'application/octet-stream':
+                continue
             else:
                 filetype = mimetypes.guess_extension(each) or filetype
             if filetype:
@@ -394,7 +396,7 @@ class Response:
                         tag.attrs.pop("href")
                         if tag.name in ('iframe', 'img', 'a'):
                             invalid_tags.append(tag)
-                    else:
+                    elif not tag['href'].startswith(("javascript", 'ftp:', 'window.')):
                         try:
                             tag['href'] = self.urljoin(tag['href'])
                         except ValueError:
