@@ -49,7 +49,7 @@ from tider.exceptions import (
     InvalidSchema,
     InvalidURL,
     ProtocolError,
-    ProxyError,
+    InvalidProxy,
     ReadTimeout,
     RetryError,
     SSLError,
@@ -77,6 +77,8 @@ DEFAULT_POOLBLOCK = False
 DEFAULT_POOLSIZE = 10
 DEFAULT_RETRIES = 0
 DEFAULT_POOL_TIMEOUT = None
+
+URLLIB3_SUPPORTS_HTTPS = tuple(urllib3.__version__.split('.')) > ('1', '26')
 
 try:
     import ssl
@@ -399,6 +401,8 @@ class HTTPDownloader(RedirectMixin):
         :returns: ProxyManager
         :rtype: urllib3.ProxyManager
         """
+        if URLLIB3_SUPPORTS_HTTPS and selected_proxy.startswith('http'):
+            selected_proxy = selected_proxy.replace('https', 'http')
         for key in self.proxy_manager:
             if selected_proxy == key[1]:
                 manager = self.proxy_manager[key]
@@ -547,7 +551,7 @@ class HTTPDownloader(RedirectMixin):
 
         return url
 
-    def download_request(self, request: Request, session_cookies=None, trust_env=True, max_redirects=None):
+    def download_request(self, request: Request, trust_env=True, max_redirects=None):
         timeout = request.timeout
         if isinstance(timeout, tuple):
             try:
@@ -567,7 +571,6 @@ class HTTPDownloader(RedirectMixin):
         try:
             # Start time (approximately) of the request
             start = preferred_clock()
-            request.proxy.connect()  # raise ProxyError if proxy is invalid
             resp = self.resolve_redirects(request.prepared,
                                           allow_redirects=request.allow_redirects,
                                           max_redirects=max_redirects,
@@ -579,7 +582,6 @@ class HTTPDownloader(RedirectMixin):
 
             response = self.build_response(request, resp)
             response.elapsed = timedelta(seconds=elapsed)
-            extract_cookies_to_jar(session_cookies, request.prepared, resp)
             if not request.stream:
                 response.read()
             return response
@@ -590,8 +592,6 @@ class HTTPDownloader(RedirectMixin):
             if not response.failed:  # maybe already failed in response.read().
                 response.fail(error=e)
             return response
-        finally:
-            request.proxy.disconnect()
 
     def send(self, request, http2=False, timeout=None, verify=True, cert=None, proxy=None):
         """Sends PreparedRequest object. Returns Response-like object."""
@@ -639,7 +639,7 @@ class HTTPDownloader(RedirectMixin):
 
             if isinstance(e.reason, _ProxyError):
                 proxy.invalidate()
-                raise ProxyError(e)
+                raise InvalidProxy(e)
 
             if isinstance(e.reason, _SSLError):
                 # This branch is for urllib3 v1.22 and later.
@@ -653,7 +653,7 @@ class HTTPDownloader(RedirectMixin):
 
         except _ProxyError as e:
             proxy.invalidate()
-            raise ProxyError(e)
+            raise InvalidProxy(e)
 
         except (_SSLError, _HTTPError) as e:
             if isinstance(e, _SSLError):
