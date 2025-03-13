@@ -46,12 +46,12 @@ class LinkExtractor:
     _csstranslator = HTMLTranslator()
 
     def __init__(self, allow=(), deny=(), allow_domains=(), deny_domains=(), restrict_xpaths=(),
-                 tags=('a', 'area'), attrs=('href',), on_url_extracted=None, unique=False,
+                 tags=('a', 'area'), attrs=('href',), on_extract=None, unique=False,
                  deny_extensions=None, restrict_css=(), strip=True):
         self.tags, self.attrs = set(arg_to_iter(tags)), set(arg_to_iter(attrs))
         self.scan_tags = partial(operator.contains, self.tags)
         self.scan_attrs = partial(operator.contains, self.attrs)
-        self.on_url_extracted = on_url_extracted if callable(on_url_extracted) else _identity
+        self.on_extract = on_extract if callable(on_extract) else _identity
         self.unique = unique
         self.strip = strip
 
@@ -125,7 +125,7 @@ class LinkExtractor:
             except ValueError:
                 continue  # skipping bogus links
             else:
-                url = self.on_url_extracted(attr_val)
+                url = self.on_extract(attr_val)
                 if url is None or 'javascript:void(0)' in url:
                     continue
             try:
