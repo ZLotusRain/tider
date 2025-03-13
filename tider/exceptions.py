@@ -94,6 +94,14 @@ class ProxyError(DownloadError):
     """An error occurred while establishing a proxy connection."""
 
 
+class InvalidProxy(ProxyError):
+    """Try to connect to an invalid proxy."""
+
+
+class ExclusiveProxy(ProxyError):
+    """Try to connect to a exclusive proxy."""
+
+
 class ProtocolError(DownloadError):
     """The protocol was violated."""
 
