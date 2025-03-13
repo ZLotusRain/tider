@@ -36,7 +36,6 @@ class WgetDownloader:
         cmd = self.to_wget(request, output=ntf.name)
         timeout = request.timeout or 60
         timeout = max(timeout, 100)
-        request.proxy.connect()
         try:
             subprocess.run(cmd, timeout=timeout, check=True, stdout=DEVNULL, stderr=DEVNULL)
             response = self.build_response(request, ntf)
@@ -47,7 +46,6 @@ class WgetDownloader:
             ntf.close()
             response = Response(request)
             response.fail(error=e)
-        request.proxy.disconnect()
         return response
 
     def to_wget(self, request, output):
