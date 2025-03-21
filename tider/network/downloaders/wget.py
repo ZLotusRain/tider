@@ -6,6 +6,18 @@ from subprocess import DEVNULL
 from tider import Request, Response
 
 
+class WgetResponse:
+
+    def __init__(self, fp):
+        fp.flush()
+        fp.seek(0)
+        self._fp = fp
+        self.status_code = 200
+
+    def read(self, chunk_size=None):
+        return self._fp.read(chunk_size)
+
+
 class WgetDownloader:
 
     lazy = True
@@ -21,16 +33,6 @@ class WgetDownloader:
         return cls(output_dir=settings.get('DOWNLOADER_WGET_DIR'),
                    quiet=settings.getbool('DOWNLOADER_WGET_QUIET'),)
 
-    def build_response(self, request, resp):
-        response = Response(request)
-        resp.flush()
-        resp.seek(0)
-        response.raw = resp
-        response.url = request.url
-        response.status_code = 200
-
-        return response
-
     def download_request(self, request: Request):
         ntf = tempfile.NamedTemporaryFile(dir=self.output_dir)
         cmd = self.to_wget(request, output=ntf.name)
@@ -38,7 +40,7 @@ class WgetDownloader:
         timeout = max(timeout, 100)
         try:
             subprocess.run(cmd, timeout=timeout, check=True, stdout=DEVNULL, stderr=DEVNULL)
-            response = self.build_response(request, ntf)
+            response = Response.from_origin_resp(resp=WgetResponse(fp=ntf), request=request)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             returncode = getattr(e, 'returncode', None)
             if returncode in (1, 4, 5, 7, 8) or isinstance(e, subprocess.TimeoutExpired):

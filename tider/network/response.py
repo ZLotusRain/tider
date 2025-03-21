@@ -15,6 +15,7 @@ from requests.utils import guess_json_utf
 
 from tider import Request
 from tider.utils.log import get_logger
+from tider.utils.network import extract_cookies_to_jar, guess_encoding_from_headers
 from tider.exceptions import DownloadError, HTTPError, ResponseReadError, ResponseStreamConsumed
 
 logger = get_logger(__name__)
@@ -105,6 +106,36 @@ class Response:
         elif text:
             response._cached_text = text
         response.encoding = encoding or 'utf-8'
+        return response
+
+    @classmethod
+    def from_origin_resp(cls, resp, request):
+        response = cls(request)
+
+        # Fallback to None if there's no status_code, for whatever reason.
+        response.status_code = getattr(resp, "status", None) or getattr(resp, "status_code", None)  # for compat.
+
+        # Make headers case-insensitive.
+        response.headers = CaseInsensitiveDict(getattr(resp, "headers", {}))
+
+        # Set encoding.
+        response.encoding = guess_encoding_from_headers(response.headers)
+        version = getattr(resp, 'version', None) or getattr(resp, 'http_version', None)  # for compat.
+        if isinstance(version, int) and version == 11:
+            response.version = "HTTP/1.1"
+        elif isinstance(version, int) and version == 10:
+            response.version = "HTTP/1.0"
+        elif version:
+            response.version = version
+        else:
+            response.version = "HTTP/?"
+        response.raw = resp
+        response.reason = getattr(resp, 'reason', None)
+        response.url = request.url
+
+        # Add new cookies from the server.
+        extract_cookies_to_jar(response.cookies, request.prepared, resp)
+        # response.downloader = downloader
         return response
 
     @property
@@ -282,7 +313,7 @@ class Response:
     def apparent_encoding(self):
         return charset_normalizer.detect(self.content)["encoding"]
 
-    def read(self, ignore_errors=False) -> bytes:
+    def read(self, ignore_errors=False) -> Optional[bytes]:
         """Read and return the response content."""
         try:
             return self.content
