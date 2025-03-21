@@ -9,13 +9,10 @@ try:
 except ImportError:
     Session = CurlHttpVersion = CurlError = None
 
-from requests.structures import CaseInsensitiveDict
-
 from tider import Request, Response
 from tider.utils.time import preferred_clock
 from tider.utils.log import get_logger
 from tider.utils.misc import try_import
-from tider.utils.network import extract_cookies_to_jar, guess_encoding_from_headers
 from tider.exceptions import ImproperlyConfigured
 
 logger = get_logger(__name__)
@@ -115,7 +112,7 @@ class ImpersonateDownloader:
             elapsed = preferred_clock() - start
 
             resp.stream = MethodType(stream, resp)  # hijack stream
-            response = self.build_response(request, resp)
+            response = Response.from_origin_resp(resp=resp, request=request)
             response.elapsed = elapsed
             if not request.stream:
                 response.read()
@@ -133,35 +130,6 @@ class ImpersonateDownloader:
             if not response.failed:  # maybe already failed in response.read().
                 response.fail(error=e)
             return response
-
-    def build_response(self, request, resp):
-        response = Response(request)
-
-        # Fallback to None if there's no status_code, for whatever reason.
-        response.status_code = getattr(resp, "status_code", None)
-
-        # Make headers case-insensitive.
-        response.headers = CaseInsensitiveDict(getattr(resp, "headers", {}))
-
-        # Set encoding.
-        response.encoding = guess_encoding_from_headers(response.headers)
-        if isinstance(resp.http_version, int) and resp.http_version == 11:
-            response.version = "HTTP/1.1"
-        elif isinstance(resp.http_version, int) and resp.http_version == 2:
-            response.version = "HTTP/2"
-        elif resp.http_version:
-            response.version = resp.http_version
-        else:
-            response.version = "HTTP/?"
-        response.raw = resp
-        response.reason = response.raw.reason
-        response.url = request.url
-
-        # Add new cookies from the server.
-        extract_cookies_to_jar(response.cookies, request.prepared, resp)
-
-        # response.downloader = self
-        return response
 
     def close(self):
         pass

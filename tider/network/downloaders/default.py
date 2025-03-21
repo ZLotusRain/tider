@@ -24,7 +24,6 @@ from urllib3.util import parse_url, Retry, Timeout as TimeoutSauce
 from urllib3.util.ssl_ import create_urllib3_context
 
 from requests.status_codes import codes
-from requests.structures import CaseInsensitiveDict
 from requests.utils import (
     extract_zipped_paths,
     get_environ_proxies,
@@ -57,7 +56,7 @@ from tider.exceptions import (
 )
 from tider.utils.time import preferred_clock
 from tider.utils.text import enforce_str
-from tider.utils.network import copy_cookie_jar, extract_cookies_to_jar, guess_encoding_from_headers
+from tider.utils.network import copy_cookie_jar, extract_cookies_to_jar
 from tider.utils.url import get_auth_from_url
 
 try:
@@ -438,35 +437,6 @@ class HTTPDownloader(RedirectMixin):
 
         return manager
 
-    def build_response(self, request: Request, resp):
-        response = Response(request)
-
-        # Fallback to None if there's no status_code, for whatever reason.
-        response.status_code = getattr(resp, "status", None)
-
-        # Make headers case-insensitive.
-        response.headers = CaseInsensitiveDict(getattr(resp, "headers", {}))
-
-        # Set encoding.
-        response.encoding = guess_encoding_from_headers(response.headers)
-        if isinstance(resp.version, int) and resp.version == 11:
-            response.version = "HTTP/1.1"
-        elif isinstance(resp.version, int) and resp.version == 10:
-            response.version = "HTTP/1.0"
-        elif resp.version:
-            response.version = resp.version
-        else:
-            response.version = "HTTP/?"
-        response.raw = resp
-        response.reason = response.raw.reason
-        response.url = request.url
-
-        # Add new cookies from the server.
-        extract_cookies_to_jar(response.cookies, request.prepared, resp)
-
-        # response.downloader = self
-        return response
-
     def get_connection(self, url, proxy=None, http2=False, verify=False, cert=None):
         """Returns a urllib3 connection pool for the given URL."""
         http2_pool_kwargs = {'http2': http2, 'verify': verify, 'cert': cert}
@@ -580,7 +550,7 @@ class HTTPDownloader(RedirectMixin):
             # Total elapsed time of the request (approximately)
             elapsed = preferred_clock() - start
 
-            response = self.build_response(request, resp)
+            response = Response.from_origin_resp(resp=resp, request=request)
             response.elapsed = timedelta(seconds=elapsed)
             if not request.stream:
                 response.read()
