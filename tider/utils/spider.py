@@ -26,7 +26,7 @@ def iter_spider_classes(module):
             inspect.isclass(obj)
             and issubclass(obj, Spider)
             and obj.__module__ == module.__name__
-            and not getattr(obj, 'skip_load', False)
+            and not obj.__dict__.get('skip_load', False)  # only check current class.
             # and getattr(obj, 'name', None)
         ):
             yield obj
