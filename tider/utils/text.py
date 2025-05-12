@@ -94,10 +94,9 @@ def simple_format(
 
 
 def _get_emojis_from_file(fp):
-    line = fp.readline()
-    while line:
+    # memory efficient, fast.
+    for line in fp:
         if line.startswith("#") or not line.strip():
-            line = fp.readline()
             continue
         codes = line.split('; ')[0].strip()
         if ".." in codes:
@@ -122,7 +121,6 @@ def _get_emojis_from_file(fp):
                     code = rf"\u{code.rjust(4, '0')}"
                 result += code
             yield result
-        line = fp.readline()
 
 
 def _get_emojis():
