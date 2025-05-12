@@ -34,7 +34,7 @@ def str_to_list(s: Union[str, List]) -> List[str]:
 
 def str_to_unicode(string: str) -> str:
     """Convert string to unicode."""
-    return ''.join(rf'\u{ord(x):04x}' if len(str(ord(x))) <= 4 else rf'\U{ord(x):08x}' for x in string)
+    return ''.join(rf'\u{ord(x):04x}' if len(hex(ord(x))[2:]) <= 4 else rf'\U{ord(x):08x}' for x in string)
 
 
 def indent(t, indent=0, sep='\n'):
