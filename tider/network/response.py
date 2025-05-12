@@ -479,6 +479,9 @@ class Response:
     def css(self, query):
         return self.selector.css(query)
 
+    def jmespath(self, query):
+        return self.selector.jmespath(query)
+
     def soup(self, features="html.parser", parse_only=None, **kwargs):
         return BeautifulSoup(self.text, features=features, parse_only=parse_only, **kwargs)
 
