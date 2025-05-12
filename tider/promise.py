@@ -143,6 +143,7 @@ class PromiseNode:
             self.state = NodeState.SCHEDULED
         except IndexError:
             if is_executed(self.state):
+                # maybe conflict with next_nodes() or update_state()
                 self.on_executed()
         else:
             if not self._is_root:
@@ -192,8 +193,12 @@ class PromiseNode:
 
     def on_executed(self):
         if not self._is_root:
-            if self.root.promise == self.promise:
-                self.promise = None
+            try:
+                if self.root.promise == self.promise:
+                    self.promise = None
+            except AttributeError:
+                if not is_resolved(self.state) and not is_rejected(self.state):
+                    raise
             if not self.children and self.state not in (NodeState.RESOLVED, NodeState.REJECTED):
                 self.state = NodeState.RESOLVED
                 self.clear()
