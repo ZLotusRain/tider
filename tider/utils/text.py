@@ -32,6 +32,11 @@ def str_to_list(s: Union[str, List]) -> List[str]:
     return s
 
 
+def str_to_unicode(string: str) -> str:
+    """Convert string to unicode."""
+    return ''.join(rf'\u{ord(x):04x}' if len(str(ord(x))) <= 4 else rf'\U{ord(x):08x}' for x in string)
+
+
 def indent(t, indent=0, sep='\n'):
     # type: (str, int, str) -> str
     """Indent text."""
@@ -86,3 +91,22 @@ def simple_format(
 
         return pattern.sub(resolve, s)
     return s
+
+
+def remove_emojis(text):
+    """Remove emojis from text."""
+    emoji_pattern = re.compile("["
+                               u"\U0001F600-\U0001F64F"  # emoticons
+                               u"\U0001F300-\U0001F5FF"  # symbols & pictographs
+                               u"\U0001F680-\U0001F6FF"  # transport & map symbols
+                               u'\U0001F700-\U0001F77F'  # alchemical symbols
+                               u'\U0001F800-\U0001F8FF'  # Supplemental Arrows-C
+                               u'\U0001F900-\U0001F9FF'  # Supplemental Symbols and Pictographs
+                               u'\U0001F780-\U0001F7FF'  # Geometric Shapes Extended
+                               u"\U0001F1E0-\U0001F1FF"  # flags (iOS)
+                               u'\U0001FA70-\U0001FAFF'  # Symbols and Pictographs Extended-A
+                               u'\U00002702-\U000027B0'  # Dingbats
+                               u"\U0001F000-\U0001F251"
+                               # u"\U0000fe0f"
+                               "]+", flags=re.UNICODE)
+    return emoji_pattern.sub(r'', text)
