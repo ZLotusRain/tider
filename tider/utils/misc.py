@@ -1,3 +1,4 @@
+import sys
 import hashlib
 import importlib
 
@@ -188,6 +189,7 @@ def walk_modules(path):
     """
 
     mods = []
+    sys.modules.pop(path, None)  # reload
     mod = importlib.import_module(path)
     mods.append(mod)
     if hasattr(mod, '__path__'):
