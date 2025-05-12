@@ -93,20 +93,51 @@ def simple_format(
     return s
 
 
+def _get_emojis_from_file(fp):
+    line = fp.readline()
+    while line:
+        if line.startswith("#") or not line.strip():
+            line = fp.readline()
+            continue
+        codes = line.split('; ')[0].strip()
+        if ".." in codes:
+            start, end = codes.split('..')
+            if len(start) > 4:
+                start = rf"\U{start.rjust(8, '0')}"
+            else:
+                start = rf"\u{start.rjust(4, '0')}"
+            if len(end) > 4:
+                end = rf"\U{end.rjust(8, '0')}"
+            else:
+                end = rf"\u{end.rjust(4, '0')}"
+            yield f"{start}-{end}"
+        else:
+            result = ""
+            codes = codes.split(' ')
+            for code in codes:
+                # padding_length = (4 - (len(end) % 4)) % 4
+                if len(code) > 4:
+                    code = rf"\U{code.rjust(8, '0')}"
+                else:
+                    code = rf"\u{code.rjust(4, '0')}"
+                result += code
+            yield result
+        line = fp.readline()
+
+
+def _get_emojis():
+    curr_dir = __file__.rsplit('\\', maxsplit=1)[0].rsplit('/', maxsplit=1)[0]
+    with open(f"{curr_dir}/emoji-sequences.txt", 'r', encoding='utf-8') as fo:
+        for emoji in _get_emojis_from_file(fo):
+            yield emoji
+    with open(f"{curr_dir}/emoji-zwj-sequences.txt", "r", encoding='utf-8') as fo:
+        for emoji in _get_emojis_from_file(fo):
+            yield emoji
+
+
 def remove_emojis(text):
     """Remove emojis from text."""
-    emoji_pattern = re.compile("["
-                               u"\U0001F600-\U0001F64F"  # emoticons
-                               u"\U0001F300-\U0001F5FF"  # symbols & pictographs
-                               u"\U0001F680-\U0001F6FF"  # transport & map symbols
-                               u'\U0001F700-\U0001F77F'  # alchemical symbols
-                               u'\U0001F800-\U0001F8FF'  # Supplemental Arrows-C
-                               u'\U0001F900-\U0001F9FF'  # Supplemental Symbols and Pictographs
-                               u'\U0001F780-\U0001F7FF'  # Geometric Shapes Extended
-                               u"\U0001F1E0-\U0001F1FF"  # flags (iOS)
-                               u'\U0001FA70-\U0001FAFF'  # Symbols and Pictographs Extended-A
-                               u'\U00002702-\U000027B0'  # Dingbats
-                               u"\U0001F000-\U0001F251"
-                               # u"\U0000fe0f"
-                               "]+", flags=re.UNICODE)
-    return emoji_pattern.sub(r'', text)
+    for emoji in _get_emojis():
+        emoji_pattern = re.compile(pattern=emoji, flags=re.UNICODE)
+        text = emoji_pattern.sub(r'', text)
+    return text
