@@ -76,7 +76,7 @@ def hello(state, from_node, **kwargs):
         }
 
 
-@inspect_command(default_timeout=0.2)
+@inspect_command(default_timeout=3.0)
 def ping(state, **kwargs):
     """Ping crawler(s)."""
     return ok('pong')
@@ -87,13 +87,13 @@ def settings(state, **kwargs):
     return state.crawler.settings.table(with_defaults=True, censored=True)
 
 
-@inspect_command(default_timeout=1)
+@inspect_command(default_timeout=3.0)
 def stats(state, **kwargs):
     s = state.crawler.dump_stats()
     return s
 
 
-@inspect_command(default_timeout=5)
+@inspect_command(default_timeout=5.0)
 def transferring(state):
     results = []
     requests = list(state.crawler.engine.explorer.transferring)
@@ -108,7 +108,7 @@ def transferring(state):
     return results
 
 
-@inspect_command(default_timeout=5)
+@inspect_command(default_timeout=5.0)
 def parsing(state):
     results = []
     requests = list(state.crawler.engine.parser.parsing)
@@ -123,14 +123,14 @@ def parsing(state):
     return results
 
 
-@inspect_command(default_timeout=5)
+@inspect_command(default_timeout=5.0)
 def slots(state):
     priority_queue = state.crawler.engine.scheduler.priority_queue
     pqueues = dict(priority_queue.pqueues)
     return {slot: len(pqueues[slot]) for slot in pqueues}
 
 
-@inspect_command(default_timeout=1)
+@inspect_command(default_timeout=3.0)
 def engine(state, **kwargs):
     result = {
         'time()-crawler.engine.start_time': time.time() - state.crawler.engine.start_time,
@@ -147,13 +147,12 @@ def engine(state, **kwargs):
     return result
 
 
-@inspect_command(default_timeout=3)
+@inspect_command(default_timeout=3.0)
 def sse(state, **kwargs):
     s1 = state.crawler.settings.table(with_defaults=True, censored=True)
     s2 = state.crawler.dump_stats()
     e = {
         'time()-crawler.engine.start_time': time.time() - state.crawler.engine.start_time,
-        'crawler.engine.active()': state.crawler.engine.active(),
         'crawler.engine._overload()': state.crawler.engine._overload(),
         'crawler.engine._spider_closed.is_set()': state.crawler.engine._spider_closed.is_set(),
         'crawler.engine.explorer.needs_backout()': state.crawler.engine.explorer.needs_backout(),
