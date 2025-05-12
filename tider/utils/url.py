@@ -1,10 +1,47 @@
 from typing import cast
+from collections.abc import Mapping
+from typing import NamedTuple
 from urllib3.util.url import parse_url as urllib3_parse_url
-from urllib.parse import urlparse, urlunparse, unquote, ParseResult
+from urllib.parse import parse_qsl, urlparse, urlunparse, unquote, ParseResult
 
 from tider.utils.log import get_logger
 
 logger = get_logger(__name__)
+
+
+class urlparts(NamedTuple):
+    """Named tuple representing parts of the URL."""
+
+    scheme: str
+    hostname: str
+    port: int
+    username: str
+    password: str
+    path: str
+    query: Mapping
+
+
+def url_to_parts(url):
+    # type: (str) -> urlparts
+    """Parse URL into :class:`urlparts` tuple of components."""
+    scheme = urlparse(url).scheme
+    schemeless = url[len(scheme) + 3:]
+    # parse with HTTP URL semantics
+    parts = urlparse('http://' + schemeless)
+    path = parts.path or ''
+    path = path[1:] if path and path[0] == '/' else path
+    return urlparts(
+        scheme,
+        unquote(parts.hostname or '') or None,
+        parts.port,
+        unquote(parts.username or '') or None,
+        unquote(parts.password or '') or None,
+        unquote(path or '') or None,
+        dict(parse_qsl(parts.query)),
+    )
+
+
+_parse_url = url_to_parts
 
 
 def parse_url(url, encoding=None) -> ParseResult:
