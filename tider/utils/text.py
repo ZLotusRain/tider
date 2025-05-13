@@ -136,6 +136,10 @@ def _get_emojis():
 def remove_emojis(text):
     """Remove emojis from text."""
     for emoji in _get_emojis():
-        emoji_pattern = re.compile(pattern=emoji, flags=re.UNICODE)
+        if '-' in emoji:
+            pattern = f"[{emoji}]+"
+        else:
+            pattern = emoji
+        emoji_pattern = re.compile(pattern=pattern, flags=re.UNICODE)
         text = emoji_pattern.sub(r'', text)
     return text
