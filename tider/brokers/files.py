@@ -4,7 +4,7 @@ import json
 import xlrd
 import zipfile
 import openpyxl
-from io import BytesIO
+from io import BytesIO, TextIOWrapper
 
 from kombu.message import Message as KombuMessage
 
@@ -42,12 +42,10 @@ class FilesBroker(Broker):
         filename = None
         if hasattr(file, 'name'):
             filename = file.name
-        line = file.readline()
-        while line:
+        for line in file:
             lineno += 1
             message = Message(filename=filename, lineno=lineno, tell=file.tell(), body=line, content_type='application/json')
             on_message and on_message(message=message, payload=message.payload, no_ack=True)
-            line = file.readline()
             on_message_consumed and on_message_consumed()
 
     def _consume_xlsx(self, file, on_message=None, on_message_consumed=None):
@@ -85,11 +83,12 @@ class FilesBroker(Broker):
                 invalid_count = 0
 
     def _consume_csv(self, file, on_message=None, on_message_consumed=None):
-        reader = csv.DictReader(file)
-        for message in reader:
-            message.pop(None, None)
-            on_message and on_message(message=message, payload=message, no_ack=True)
-            on_message_consumed and on_message_consumed()
+        with TextIOWrapper(file, encoding='utf-8') as csvfile:
+            reader = csv.DictReader(csvfile)
+            for message in reader:
+                message.pop(None, None)
+                on_message and on_message(message=message, payload=message, no_ack=True)
+                on_message_consumed and on_message_consumed()
 
     def _consume_rar(self, file, on_message=None, on_message_consumed=None):
         if not rarfile:
