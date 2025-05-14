@@ -136,7 +136,7 @@ def _get_emojis():
 def remove_emojis(text):
     """Remove emojis from text."""
     for emoji in _get_emojis():
-        if '-' in emoji:
+        if '-' in emoji or 'FE0F' in emoji:
             pattern = f"[{emoji}]+"
         else:
             pattern = emoji
