@@ -137,7 +137,6 @@ class Parser:
                 if errback:
                     spider_outputs = errback(response)
                 self.crawler.stats.inc_value("request/count/failed")
-                self.crawler.stats.add_failure(failure=response)
             else:
                 spider_outputs = callback(response)
 
