@@ -19,7 +19,7 @@ from tider import platforms, signals
 from tider.spiders import Spider
 from tider.settings import Settings, overridden_settings
 from tider.crawler import state
-from tider.crawler.control import Pidbox
+from tider.crawler.control import Pidbox, gPidbox
 from tider.concurrency import get_implementation
 from tider.platforms import EX_FAILURE, EX_OK, create_pidlock
 from tider.network.user_agent import set_default_ua
@@ -159,7 +159,7 @@ class Crawler:
         self.crawling = False
 
     def on_start(self):
-        self.pidbox = Pidbox(self)
+        self.pidbox = (gPidbox if getattr(self.Pool, 'is_green', False) else Pidbox)(self)
         self.pidbox.start()
         self.pidfile = node_format(self.pidfile, self.hostname, g=self.group)
         if self.pidfile:
@@ -224,6 +224,7 @@ class Crawler:
         inspect = self.app.control.inspect(timeout=1.0)
         print("Checking if hostname duplicates...")
 
+        # illegal address: not allowed address
         replies = inspect.ping(destination=[hostname])
         if replies or (self.pidfile and os.path.exists(node_format(self.pidfile, hostname, g=hostname))):
             # avoid duplicates in multi start.

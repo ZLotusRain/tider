@@ -52,6 +52,7 @@ class HeartEngine:
         self.running = False
         self.paused = False
         self.polling = False
+        self.connection = MockConnection() if getattr(self.crawler.Pool, 'is_green', False) else self.crawler.connection
 
         self._spider_closed = Event()
         self._is_shutdown = Event()
@@ -225,7 +226,7 @@ class HeartEngine:
                 state.maybe_shutdown()
                 # maybe stuck here when using threads
                 # and gevent monkey patch at the same time
-                self.crawler.connection.drain_events(timeout=2.0)
+                self.connection.drain_events(timeout=2.0)
             except socket.timeout:
                 pass
             except (SpiderShutdown, SpiderTerminate):  # control shutdown
