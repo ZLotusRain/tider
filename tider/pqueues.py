@@ -3,7 +3,6 @@ import threading
 from abc import abstractmethod
 from typing import Any, Optional, Dict, List, Iterable
 
-from tider.utils.url import parse_url_host
 from tider.utils.collections import DummyLock
 from tider.utils.misc import build_from_crawler
 
@@ -141,25 +140,21 @@ class ExplorerInterface:
         self.explorer = crawler.engine.explorer
 
     def stats(self, possible_slots: Iterable[str]):
-        return [(self._dispatched_concurrency(slot), slot) for slot in possible_slots]
+        return [(self._dispatched_concurrency(slot), slot) for slot in possible_slots if self._dispatched_concurrency(slot)]
 
     def get_slot_key(self, request) -> str:
-        url = request.url
-        domain = parse_url_host(url)
-        if domain in self.explorer.domain_concurrency:
-            return domain
-        if url in self.explorer.api_concurrency:
-            return url
-
+        matched = self.explorer.climits.match(request)
+        if matched:
+            matched = min(matched)
+            return ":".join((matched[1], matched[2]))
         return 'unlimited'
 
     def _dispatched_concurrency(self, slot):
         if slot == 'unlimited':
             return self.explorer.concurrency
-        if slot in self.explorer.domain_concurrency:
-            return len(self.explorer.domain_concurrency[slot]) or self.explorer.concurrency + 1
+        limit_type, pattern = slot.split(':', maxsplit=1)
         # maybe not available
-        return len(self.explorer.api_concurrency[slot]) or self.explorer.concurrency + 1
+        return min(self.explorer.climits.qsize(limit_type, pattern), self.explorer.concurrency)
 
 
 class ExplorerAwarePriorityQueue:
@@ -244,7 +239,8 @@ class ExplorerAwarePriorityQueue:
             return slot_queue.peek()
 
     def close(self) -> Dict[str, List[int]]:
-        active = {slot: q.close() for slot, q in self.pqueues.items()}
+        # dictionary changed size during iteration
+        active = {slot: q.close() for slot, q in dict(self.pqueues).items()}
         self.pqueues.clear()
         return active
 
