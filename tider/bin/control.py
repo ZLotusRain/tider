@@ -54,7 +54,7 @@ def _compile_arguments(action, args):
 @click.option('-t',
               '--timeout',
               type=float,
-              default=1.0,
+              default=3.0,
               help='Timeout in seconds waiting for reply.')
 @click.option('-d',
               '--destination',
