@@ -159,6 +159,7 @@ class Parser:
             raise
         except Exception as e:
             logger.exception(f"Parser bug processing {request}")
+            self.crawler.stats.inc_value(f"parser/{e.__class__.__name__}/count")
         finally:
             del callback, errback
 
@@ -174,6 +175,7 @@ class Parser:
                 raise
             except Exception as e:
                 logger.exception(f"Promise bug processing {request}")
+                self.crawler.stats.inc_value(f"promise/{e.__class__.__name__}/count")
 
         response.close()
         request.close()
@@ -203,7 +205,6 @@ class Parser:
                     "Ignoring link (parse_times > %(max_parse_times)d): %(requrl)s ",
                     {'max_parse_times': self.max_depth, 'requrl': request.url},
                 )
-                self.crawler.stats.add_error(reason="Exceed max parse times", request_or_response=request)
                 return False
         return True
 
