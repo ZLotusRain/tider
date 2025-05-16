@@ -153,10 +153,10 @@ class Control:
             'tidercontrol',
             type='fanout',
             accept=('json', ),
-            queue_ttl=300.0,
-            reply_queue_ttl=300.0,
-            queue_expires=10.0,
-            reply_queue_expires=10.0
+            queue_ttl=self.app.conf.get('CONTROL_QUEUE_TTL'),
+            reply_queue_ttl=self.app.conf.get('CONTROL_QUEUE_TTL'),
+            queue_expires=self.app.conf.get('CONTROL_QUEUE_EXPIRES'),
+            reply_queue_expires=self.app.conf.get('CONTROL_QUEUE_EXPIRES')
         )
         register_after_fork(self, _after_fork_cleanup_control)
 
