@@ -19,6 +19,7 @@ from tider.bin.multi import multi
 from tider.bin.bench import bench
 from tider.bin.runspider import runspider
 from tider.bin.control import control, inspect, status
+from tider.bin.startproject import startproject
 from tider.bin.base import TiderOption, CLIContext
 from tider.utils.app import find_app
 
@@ -169,6 +170,7 @@ tider.add_command(control)
 tider.add_command(inspect)
 tider.add_command(status)
 tider.add_command(runspider)
+tider.add_command(startproject)
 
 
 def main() -> int:
