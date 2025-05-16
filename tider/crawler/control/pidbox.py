@@ -1,7 +1,13 @@
 """Crawler Pidbox (remote control)."""
+import time
+import socket
+import threading
+from gevent import spawn_raw
 from kombu.common import ignore_errors
 from kombu.utils.encoding import safe_str, safe_repr
 
+from tider.crawler import state
+from tider.exceptions import SpiderShutdown, SpiderTerminate
 from tider.crawler.control.panel import Panel
 from tider.utils.text import truncate
 from tider.utils.log import get_logger
@@ -24,7 +30,7 @@ def dump_body(m, body):
 
 
 class Pidbox:
-    """Spider mailbox."""
+    """Crawler mailbox."""
 
     consumer = None
 
@@ -46,6 +52,12 @@ class Pidbox:
         # have a valid clock to adjust with.
         self._forward_clock()
         try:
+            header = message.headers.get
+            expires = header('expires')
+            if expires and time.time() > expires:
+                # kombu.exceptions.OperationalError: Command  # 1 of pipeline caused error:
+                # command not allowed when used memory > 'maxmemory'.
+                return
             self.node.handle_message(body, message)
         except KeyError as exc:
             logger.error('No such control command: %s', exc)
@@ -89,3 +101,55 @@ class Pidbox:
             logger.debug('Canceling broadcast consumer...')
             ignore_errors(self.crawler.connection, self.node.channel.close)
         self.stop()
+
+
+class gPidbox(Pidbox):
+    """Crawler pidbox (greenlet)."""
+
+    _node_shutdown = None
+    _node_stopped = None
+    _resets = 0
+
+    def start(self):
+        spawn_raw(self.loop)
+
+    def on_stop(self):
+        if self._node_stopped:
+            self._node_shutdown.set()
+            logger.debug('Waiting for broadcast thread to shutdown...')
+            self._node_stopped.wait()
+            self._node_stopped = self._node_shutdown = None
+
+    def reset(self):
+        self._resets += 1
+
+    def _do_reset(self, connection):
+        self._close_channel()
+        self.node.channel = connection.channel()
+        self.consumer = self.node.listen(callback=self.on_message)
+        self.consumer.consume()
+
+    def loop(self):
+        resets = [self._resets]
+        shutdown = self._node_shutdown = threading.Event()
+        stopped = self._node_stopped = threading.Event()
+        try:
+            with self.crawler.app.connection_for_control() as connection:
+                self._do_reset(connection)
+                while not shutdown.is_set():
+                    if resets[0] < self._resets:
+                        resets[0] += 1
+                        self._do_reset(connection)
+                    try:
+                        # maybe spend more time than timeout value.
+                        connection.drain_events(timeout=2.0)
+                    except socket.timeout:
+                        pass
+                    except SpiderShutdown:
+                        state.should_stop = True
+                        raise
+                    except SpiderTerminate:
+                        state.should_terminate = True
+                        raise
+        finally:
+            stopped.set()
