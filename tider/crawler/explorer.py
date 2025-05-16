@@ -1,5 +1,6 @@
 """execute `Request`."""
 
+import re
 import time
 from queue import Full
 from collections import deque
@@ -21,7 +22,6 @@ from tider.exceptions import (
 from tider.crawler import state
 from tider.platforms import EX_FAILURE
 from tider.utils.log import get_logger
-from tider.utils.url import parse_url_host
 from tider.utils.misc import build_from_crawler
 
 logger = get_logger(__name__)
@@ -34,17 +34,77 @@ def _dummy_handler(response):
     logger.info(f"Downloaded {request} and got {response}.")
 
 
+class LimitsAllowed:
+
+    def __init__(self, allowed, backtracks=None):
+        self.allowed = allowed
+        self.backtracks = backtracks or []
+
+    def __bool__(self):
+        return bool(self.allowed)
+
+
+class ConcurrencyLimits:
+
+    def __init__(self, limits=None):
+        self._limits = {'url': {}, 'downloader': {}}
+
+        limits = dict(limits or {})
+        for limit_type in limits:
+            if limit_type not in ('url', 'downloader'):
+                continue
+            for pattern, limit in limits[limit_type].items():
+                self._limits[limit_type][pattern] = {
+                    'pattern': re.compile(pattern),
+                    'limit': limit,
+                    'free_slots': deque([None] * int(limit))
+                }
+        self._global_limits = None  # fetched from redis.
+
+    def allow(self, request):
+        backtracks = []  # [(limit_type, pattern, request)], maybe processed in `on_response`
+        for limit_type in self._limits:
+            limits = self._limits[limit_type]
+            attr = getattr(request, limit_type)
+            if not attr:
+                continue  # default downloader
+            for pattern in limits:
+                if limits[pattern]['pattern'].match(attr):
+                    try:
+                        limits[pattern]['free_slots'].pop()
+                        backtracks.append((limit_type, pattern))
+                    except IndexError:
+                        self.backtrack(backtracks)
+                        return LimitsAllowed(False)
+        return LimitsAllowed(allowed=True, backtracks=backtracks)
+
+    def backtrack(self, backtracks):
+        for limit_type, pattern in backtracks:
+            self._limits[limit_type][pattern]['free_slots'].append(None)
+
+    def match(self, request):
+        matched = []  # [(limit_type, pattern, request)]
+        for limit_type in self._limits:
+            limits = self._limits[limit_type]
+            attr = getattr(request, limit_type)
+            if not attr:
+                continue  # default downloader
+            for pattern in limits:
+                if limits[pattern]['pattern'].match(attr):
+                    matched.append((limits[pattern]['limit'], limit_type, pattern))
+        return matched
+
+    def qsize(self, limit_type, pattern):
+        return len(self._limits[limit_type][pattern]['free_slots'])
+
+
 class Explorer:
 
-    def __init__(self, crawler, concurrency=4, domain_concurrency=None, api_concurrency=None,
-                 priority_adjust=0):
+    def __init__(self, crawler, concurrency=4, concurrency_limits=None, priority_adjust=0):
         self._crawler = crawler
         self.concurrency = concurrency
         self.pool = crawler.create_pool(limit=concurrency, thread_name_prefix="ExplorerWorker")
-        domain_concurrency = domain_concurrency or {}
-        self.domain_concurrency = {domain: deque([None] * int(domain_concurrency[domain])) for domain in domain_concurrency}
-        api_concurrency = api_concurrency or {}
-        self.api_concurrency = {api: deque([None] * int(api_concurrency[api])) for api in api_concurrency}
+        self.climits = ConcurrencyLimits(concurrency_limits)
 
         self.session: Optional[Session] = build_from_crawler(Session, crawler)
         self.proxypool = build_from_crawler(ProxyPoolManager, crawler)
@@ -62,8 +122,7 @@ class Explorer:
         return cls(
             crawler=crawler,
             concurrency=crawler.concurrency,
-            domain_concurrency=crawler.settings.getdict('EXPLORER_DOMAIN_CONCURRENCY'),
-            api_concurrency=crawler.settings.getdict('EXPLORER_API_CONCURRENCY'),
+            concurrency_limits=crawler.settings.getdict('EXPLORER_CONCURRENCY_LIMITS'),
             priority_adjust=crawler.settings.getint('EXPLORER_RETRY_PRIORITY_ADJUST')
         )
 
@@ -125,7 +184,7 @@ class Explorer:
         return len(self.queue) >= self.concurrency * 2
 
     def _on_response_consumed(self, response):
-        FREE_SLOTS.append(None)
+        FREE_SLOTS.append(None)  # release slot to control concurrency.
         self.transferring.discard(response.request)
 
     def _transport(self, queue, download_func, output_handler=_dummy_handler, transferring=None, loop=False):
@@ -209,13 +268,6 @@ class Explorer:
                 kwargs={'transferring': transferring, 'loop': self.loop},
             )
 
-    def on_response_consumed(self, response, url, domain, append_domain=False, append_api=False):
-        self.transferring.discard(response.request)
-        if append_api:
-            self.api_concurrency[url].append(None)
-        if append_domain:
-            self.domain_concurrency[domain].append(None)
-
     def try_explore(self, method, url, params=None, data=None, headers=None, cookies=None,
                     files=None, auth=None, timeout=None, allow_redirects=True, proxies=None,
                     proxy_schema=0, stream=None, verify=None, cert=None, json=None,
@@ -240,24 +292,9 @@ class Explorer:
             raise
 
     def explore(self, request):
-        url = request.url
-        domain = parse_url_host(url)
-        append_domain = append_api = False
-        if domain in self.domain_concurrency:
-            # don't use `if xxx.get()` in case that domain isn't limited.
-            try:
-                self.domain_concurrency[domain].pop()
-                append_domain = True
-            except IndexError:
-                return request
-        if url in self.api_concurrency:
-            try:
-                self.api_concurrency[url].pop()
-                append_api = True
-            except IndexError:
-                if append_domain:
-                    self.domain_concurrency[domain].append(None)
-                return request
+        allowed = self.climits.allow(request)
+        if not allowed:
+            return request
         self.transferring.add(request)
         response = self._explore(request)
         if isinstance(response, Response):
@@ -270,10 +307,7 @@ class Explorer:
                     "%(reason)s",
                     {'request': request, 'retry_times': retry_times, 'reason': e}
                 )
-        if append_api:
-            self.api_concurrency[url].append(None)
-        if append_domain:
-            self.domain_concurrency[domain].append(None)
+        self.climits.backtrack(allowed.backtracks)
         self.transferring.discard(request)
         return response
 
