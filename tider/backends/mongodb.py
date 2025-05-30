@@ -1,8 +1,10 @@
+import re
 from datetime import datetime, timedelta
 from kombu.utils import cached_property
 from kombu.utils.url import urlparse, maybe_sanitize_url
+from kombu.exceptions import EncodeError
 
-from tider.backends.base import Backend
+from tider.backends.base import BaseBackend, State
 from tider.exceptions import ImproperlyConfigured
 
 try:
@@ -11,19 +13,45 @@ except ImportError:
     pymongo = None
 
 if pymongo:
+    try:
+        from bson.binary import Binary
+    except ImportError:
+        from pymongo.binary import Binary
+    from pymongo import ReadPreference
+    from pymongo.errors import InvalidDocument
+
     SUPPORTS_MONGODB32 = tuple(int(v) if v.isdigit() else v
                                for v in pymongo.__version__.split('.')) < (4, 0, 0)
 else:
+    Binary = None
     SUPPORTS_MONGODB32 = False
 
+    class ReadPreference:
+        pass
 
-class MongoBackend(Backend):
-    """MongoDB result backend.
+    class InvalidDocument(Exception):
+        pass
+
+__all__ = ('MongoBackend',)
+
+BINARY_CODECS = frozenset(['pickle', 'msgpack'])
+
+
+class MongoBackend(BaseBackend):
+    """MongoDB stats backend.
 
     Raises:
         tider.exceptions.ImproperlyConfigured:
             if module :pypi:`pymongo` is not available.
     """
+
+    MODES = {
+        'primary': ReadPreference.PRIMARY,
+        'primaryPreferred': ReadPreference.PRIMARY_PREFERRED,
+        'secondary': ReadPreference.SECONDARY,
+        'secondaryPreferred': ReadPreference.SECONDARY_PREFERRED,
+        'nearest': ReadPreference.NEAREST,
+    }
 
     mongo_host = None
     host = 'localhost'
@@ -31,8 +59,7 @@ class MongoBackend(Backend):
     username = None
     password = None
     database_name = 'tider'
-    statsmeta_collection = 'tider_stats'
-    taskmeta_collection = 'tider_taskmeta'
+    crawlermeta_collection = 'tider_crawlermeta'
     max_pool_size = 10
     options = None
 
@@ -40,9 +67,8 @@ class MongoBackend(Backend):
 
     _connection = None
 
-    def __init__(self, crawler=None, **kwargs):
+    def __init__(self, crawler=None, replica_set=None, read_preference=None, **kwargs):
         self.options = {}
-
         super().__init__(crawler, **kwargs)
 
         if not pymongo:
@@ -53,6 +79,8 @@ class MongoBackend(Backend):
         # Set option defaults
         for key, value in self._prepare_client_options().items():
             self.options.setdefault(key, value)
+        self.replica_set = replica_set
+        self.read_preference = read_preference
 
         # update conf with mongo uri data, only if uri was given
         if self.url:
@@ -73,7 +101,7 @@ class MongoBackend(Backend):
             self.options.update(uri_data['options'])
 
         # update conf with specific settings
-        config = self.crawler.settings.get('BACKEND_SETTINGS')
+        config = self.crawler.settings.get(f'{self.config_namespace}_MONGODB_SETTINGS')
         if config is not None:
             if not isinstance(config, dict):
                 raise ImproperlyConfigured(
@@ -87,14 +115,13 @@ class MongoBackend(Backend):
             self.host = config.pop('host', self.host)
             self.port = config.pop('port', self.port)
             self.mongo_host = config.pop('mongo_host', self.mongo_host)
-            self.username = config.pop('user', self.username)
+            self.username = config.pop('username', self.username)
             self.password = config.pop('password', self.password)
             self.database_name = config.pop('database', self.database_name)
-            self.taskmeta_collection = config.pop(
-                'taskmeta_collection', self.taskmeta_collection,
-            )
-            self.statsmeta_collection = config.pop(
-                'statsmeta_collection', self.statsmeta_collection,
+            self.replica_set = config.pop('replica_set', self.replica_set)
+            self.read_preference = config.pop('read_preference', self.read_preference)
+            self.crawlermeta_collection = config.pop(
+                'crawlermeta_collection', self.crawlermeta_collection,
             )
 
             self.options.update(config.pop('options', {}))
@@ -138,26 +165,101 @@ class MongoBackend(Backend):
             # don't change self.options
             conf = dict(self.options)
             conf['host'] = host
-            if self.username:
-                conf['username'] = self.username
-            if self.password:
-                conf['password'] = self.password
+            if self.read_preference:
+                conf['read_preference'] = self.MODES.get(self.read_preference)
+            conf['replicaSet'] = self.replica_set
 
             self._connection = MongoClient(**conf)
 
         return self._connection
+
+    def encode(self, data):
+        if self.serializer == 'bson':
+            # mongodb handles serialization
+            return data
+        payload = super().encode(data)
+
+        # serializer which are in an unsupported format (pickle/binary)
+        if self.serializer in BINARY_CODECS:
+            payload = Binary(payload)
+        return payload
+
+    def decode(self, data):
+        if self.serializer == 'bson':
+            return data
+        return super().decode(data)
+
+    def _store_result(self, result, state, traceback=None, **kwargs):
+        """Store stats of a crawler."""
+        meta = self._gen_crawler_meta(result=self.encode(result), state=state, traceback=traceback)
+        # Add the _id for mongodb
+        meta['_id'] = self.crawler.hostname
+
+        try:
+            self.collection.replace_one({'_id': self.crawler.hostname}, meta, upsert=True)
+        except InvalidDocument as exc:
+            raise EncodeError(exc)
+
+    def _get_crawler_meta(self):
+        """Get crawler meta-data."""
+        obj = self.collection.find_one({'_id': self.crawler.hostname})
+        if obj:
+            return self.meta_from_decoded({
+                'crawler_id': obj['_id'],
+                'status': obj['status'],
+                'stats': self.decode(obj['stats']),
+                'date_done': obj['date_done'],
+                'traceback': obj['traceback'],
+            })
+        return {'status': State.PENDING, 'result': None}
+
+    def _get_group_meta(self):
+        """Get all the meta-datas for a group."""
+        objs = self.collection.find({'_id': {"$regex": re.compile(f'{self.crawler.group}.*')}}) or []
+        result = {}
+        for obj in objs:
+            meta = self.meta_from_decoded({
+                '_id': obj['_id'],
+                'schema': obj['schema'],
+                'spidername': obj['spidername'],
+                'pid': obj['pid'],
+                'server': obj['server'],
+                'group': obj['group'],
+                'status': obj['status'],
+                'stats': self.decode(obj['stats']),
+                'failures': obj['failures'],
+                'errors': obj['errors'],
+                'traceback': obj['traceback'],
+                'date_done': obj['date_done'],
+            })
+            _id = meta.pop('_id')
+            result[_id] = meta
+        return result
+
+    def _delete_group(self):
+        """Delete a group."""
+        self.collection.delete_many({'_id': {"$regex": re.compile(f'{self.crawler.group}.*')}})
+
+    def _forget(self):
+        """Remove result from MongoDB.
+
+        Raises:
+            pymongo.exceptions.OperationsError:
+                if the data could not be removed.
+        """
+        # By using safe=True, this will wait until it receives a response from
+        # the server.  Likewise, it will raise an OperationsError if the
+        # response was unable to be completed.
+        self.collection.delete_one({'_id': self.crawler.hostname})
 
     def cleanup(self):
         """Delete expired meta-data."""
         if not self.expires:
             return
 
-        self.stats_collection.delete_many(
-            {'date_done': {'$lt': self.crawler.tider.now() - self.expires_delta}},
+        self.collection.delete_many(
+            {'date_done': {'$lt': self.crawler.app.now() - self.expires_delta}},
         )
-        # self.group_collection.delete_many(
-        #     {'date_done': {'$lt': self.crawler.tider.now() - self.expires_delta}},
-        # )
 
     def __reduce__(self, args=(), kwargs=None):
         kwargs = {} if not kwargs else kwargs
@@ -166,7 +268,10 @@ class MongoBackend(Backend):
 
     def _get_database(self):
         conn = self._get_connection()
-        return conn[self.database_name]
+        database = conn[self.database_name]
+        if self.username or self.password:
+            database.authenticate(self.username, self.password)
+        return database
 
     @cached_property
     def database(self):
@@ -176,22 +281,10 @@ class MongoBackend(Backend):
         """
         return self._get_database()
 
-    def _save_stats(self, spider_id, spider_name, stats, schema=None):
-        """Save the stats."""
-        meta = {
-            '_id': spider_id,
-            'spider': spider_name,
-            'schema': schema,
-            'stats': stats,
-            'date_done': datetime.utcnow(),
-        }
-        self.stats_collection.replace_one({'_id': spider_id}, meta, upsert=True)
-        return stats
-
     @cached_property
-    def stats_collection(self):
-        """Get the stats collection."""
-        collection = self.database[self.stats_collection]
+    def collection(self):
+        """Get the meta-data crawler collection."""
+        collection = self.database[self.crawlermeta_collection]
 
         # Ensure an index on date_done is there, if not process the index
         # in the background.  Once completed cleanup will be much faster
@@ -218,3 +311,8 @@ class MongoBackend(Backend):
 
         uri1, remainder = self.url.split(',', 1)
         return ','.join([maybe_sanitize_url(uri1), remainder])
+
+    def close(self):
+        if self._connection is None:
+            return
+        self._connection.close()
