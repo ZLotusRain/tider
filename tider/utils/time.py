@@ -1,4 +1,5 @@
 import sys
+import random
 import time as _time
 from datetime import date, datetime, timedelta
 from datetime import timezone as datetime_timezone
@@ -19,6 +20,7 @@ else:
 __all__ = (
     'preferred_clock', 'LocalTimezone', 'timezone',
     'is_naive', 'make_aware', 'to_utc', 'localize', 'maybe_make_aware', 'humanize_seconds',
+    'get_exponential_backoff_interval'
 )
 
 # Preferred clock, based on which one is more accurate on a given system.
@@ -233,3 +235,20 @@ def humanize_seconds(
         return '{prefix}{sep}{0:.2f} seconds'.format(
             secs, sep=sep, prefix=prefix)
     return now
+
+
+def get_exponential_backoff_interval(
+    factor: int,
+    retries: int,
+    maximum: int,
+    full_jitter: bool = False
+) -> int:
+    """Calculate the exponential backoff wait time."""
+    # Will be zero if factor equals 0
+    countdown = min(maximum, factor * (2 ** retries))
+    # Full jitter according to
+    # https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+    if full_jitter:
+        countdown = random.randrange(countdown + 1)
+    # Adjust according to maximum wait time and account for negative values.
+    return max(0, countdown)
