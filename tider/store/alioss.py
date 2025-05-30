@@ -12,7 +12,7 @@ from oss2 import determine_part_size, SizedFileAdapter
 
 from tider.network import Response
 from tider.utils.log import get_logger
-from tider.exceptions import DownloadError, StoreError
+from tider.exceptions import DownloadError, FileStoreError
 
 logger = get_logger(__name__)
 oss_logger = logging.getLogger('oss2.api')
@@ -248,7 +248,7 @@ class AliOSSFilesStore:
                 raise ValueError(f"Unsupported buffer type: {type(buf)}")
             return "%s/%s" % (self._domain, path)
         except oss2.exceptions.OssError as e:
-            raise StoreError(e)
+            raise FileStoreError(e)
 
     def stat_file(self, path, bucket_name=None, **_):
         bucket = self.get_bucket(bucket_name)
