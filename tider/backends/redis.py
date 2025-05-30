@@ -2,83 +2,296 @@ import time
 import redis
 import logging
 import datetime
+from functools import partial
+from urllib.parse import unquote
+from ssl import CERT_NONE, CERT_OPTIONAL, CERT_REQUIRED
 
-from tider.utils.functional import retry_over_time
+from kombu.utils.objects import cached_property
+
+try:
+    import redis.connection
+    from kombu.transport.redis import get_redis_error_classes
+except ImportError:
+    redis = None
+    get_redis_error_classes = None
+
+from tider.backends.base import KeyValueStoreBackend
+from tider.utils.url import url_to_parts
+from tider.utils.time import humanize_seconds
+from tider.utils.functional import retry_over_time, dictfilter
+from tider.exceptions import ImproperlyConfigured, BackendStoreError
+
+E_REDIS_MISSING = """
+You need to install the redis library in order to use \
+the Redis result store backend.
+"""
+
+E_REDIS_LOST = 'Connection to Redis lost: Retry (%s/%s) %s.'
 
 E_REDIS_SSL_PARAMS_AND_SCHEME_MISMATCH = """
 SSL connection parameters have been provided but the specified URL scheme \
 is redis://. A Redis SSL connection URL should use the scheme rediss://.
 """
 
+E_REDIS_SSL_CERT_REQS_MISSING_INVALID = """
+A rediss:// URL must have parameter ssl_cert_reqs and this must be set to \
+CERT_REQUIRED, CERT_OPTIONAL, or CERT_NONE
+"""
+
+W_REDIS_SSL_CERT_OPTIONAL = """
+Setting ssl_cert_reqs=CERT_OPTIONAL when connecting to redis means that \
+tider might not validate the identity of the redis broker when connecting. \
+This leaves you vulnerable to man in the middle attacks.
+"""
+
+W_REDIS_SSL_CERT_NONE = """
+Setting ssl_cert_reqs=CERT_NONE when connecting to redis means that tider \
+will not validate the identity of the redis broker when connecting. This \
+leaves you vulnerable to man in the middle attacks.
+"""
+
 logger = logging.getLogger(__name__)
 
 
-class RedisBackend:
-    """
-    redis://[:password]@host:port/db
-    """
+class RedisBackend(KeyValueStoreBackend):
+    """Redis crawler meta store like `redis://[:password]@host:port/db`."""
 
     #: Maximum number of connections in the pool.
     max_connections = None
+
+    supports_autoexpire = True
+    supports_native_join = True
 
     #: Maximal length of string value in Redis.
     #: 512 MB - https://redis.io/topics/data-types
     _MAX_STR_VALUE_SIZE = 536870912
 
-    def __init__(self, url=None, max_connections=None, **connection_kwargs):
-        _get = connection_kwargs.get
+    def __init__(self, host=None, port=None, db=None, password=None,
+                 max_connections=None, url=None, connection_pool=None, **kwargs):
+        super().__init__(expires_type=int, **kwargs)
+        if redis is None:
+            raise ImproperlyConfigured(E_REDIS_MISSING.strip())
 
-        self.url = url
-        self.max_connections = max_connections or self.max_connections
+        _get = self.crawler.settings.get
+        if host and '://' in host:
+            url, host = host, None
 
-        socket_timeout = _get('redis_socket_timeout')
-        socket_connect_timeout = _get('redis_socket_connect_timeout')
-        retry_on_timeout = _get('redis_retry_on_timeout')
+        self.max_connections = max_connections or _get(f'{self.config_namespace}_REDIS_MAX_CONNECTIONS') or self.max_connections
+        socket_timeout = _get(f'{self.config_namespace}_REDIS_SOCKET_TIMEOUT')
+        socket_connect_timeout = _get(f'{self.config_namespace}_REDIS_SOCKET_CONNECT_TIMEOUT')
+        retry_on_timeout = _get(f'{self.config_namespace}_REDIS_RETRY_ON_TIMEOUT')
+        socket_keepalive = _get(f'{self.config_namespace}_REDIS_SOCKET_KEEPALIVE')
+        health_check_interval = _get(f'{self.config_namespace}_REDIS_HEALTH_CHECK_INTERVAL')
 
         self.connection_kwargs = {
-            'host': _get('host') or 'localhost',
-            'port': _get('port') or 6379,
-            'db': _get('redis_db') or _get('db') or _get('index') or 0,
-            'password': _get('redis_password') or _get('auth') or _get('password'),
+            'host': host or _get(f'{self.config_namespace}_REDIS_HOST') or 'localhost',
+            'port': port or _get(f'{self.config_namespace}_REDIS_PORT') or 6379,
+            'db': db or _get(f'{self.config_namespace}_REDIS_DB') or 0,
+            'password': password or _get(f'{self.config_namespace}_REDIS_PASSWORD'),
             'max_connections': self.max_connections,
             'socket_timeout': socket_timeout and float(socket_timeout),
             'retry_on_timeout': retry_on_timeout or False,
             'socket_connect_timeout':
                 socket_connect_timeout and float(socket_connect_timeout),
-            'encoding': _get('encoding') or 'utf-8',
-            'encoding_errors': _get('encoding_errors') or 'replace'
+            'encoding': _get(f'{self.config_namespace}_REDIS_ENCODING') or 'utf-8',
+            'encoding_errors': _get(f'{self.config_namespace}_REDIS_ENCODING_ERRORS') or 'replace'
         }
+        username = _get(f'{self.config_namespace}_REDIS_USERNAME')
+        if username:
+            # We're extra careful to avoid including this configuration value
+            # if it wasn't specified since older versions of py-redis
+            # don't support specifying a username.
+            # Only Redis>6.0 supports username/password authentication.
+            self.connection_kwargs['username'] = username
+        if health_check_interval:
+            self.connection_kwargs["health_check_interval"] = health_check_interval
 
-        self.client = self._create_client(**self.connection_kwargs)
-    
-    def _create_client(self, **params):
-        if self.url:
-            return redis.StrictRedis(
-                connection_pool=redis.ConnectionPool.from_url(url=self.url, **params),
-            )
+        # absent in redis.connection.UnixDomainSocketConnection
+        if socket_keepalive:
+            self.connection_kwargs['socket_keepalive'] = socket_keepalive
+
+        # "redis_backend_use_ssl" must be a dict with the keys:
+        # 'ssl_cert_reqs', 'ssl_ca_certs', 'ssl_certfile', 'ssl_keyfile'
+        # (the same as "broker_use_ssl")
+        ssl = _get(f'{self.config_namespace}_REDIS_USE_SSL')
+        if ssl:
+            self.connection_kwargs.update(ssl)
+            self.connection_kwargs['connection_class'] = redis.SSLConnection if redis else None
+
+        # "ssl_config" must be a dict with the keys:
+        # 'ssl_cert_reqs', 'ssl_ca_certs', 'ssl_certfile', 'ssl_keyfile'
+        ssl = _get(f'{self.config_namespace}_REDIS_SSL_CONFIG')
+        if ssl:
+            self.connection_kwargs.update(ssl)
+            self.connection_kwargs['connection_class'] = redis.SSLConnection
+        if url:
+            self.connection_kwargs = self._params_from_url(url, self.connection_kwargs)
+
+        # If we've received SSL parameters, check ssl_cert_reqs is valid. If set
+        # via query string ssl_cert_reqs will be a string so convert it here
+        if ('connection_class' in self.connection_kwargs and
+                issubclass(self.connection_kwargs['connection_class'], redis.SSLConnection)):
+            ssl_cert_reqs_missing = 'MISSING'
+            ssl_string_to_constant = {'CERT_REQUIRED': CERT_REQUIRED,
+                                      'CERT_OPTIONAL': CERT_OPTIONAL,
+                                      'CERT_NONE': CERT_NONE,
+                                      'required': CERT_REQUIRED,
+                                      'optional': CERT_OPTIONAL,
+                                      'none': CERT_NONE}
+            ssl_cert_reqs = self.connection_kwargs.get('ssl_cert_reqs', ssl_cert_reqs_missing)
+            ssl_cert_reqs = ssl_string_to_constant.get(ssl_cert_reqs, ssl_cert_reqs)
+            if ssl_cert_reqs not in ssl_string_to_constant.values():
+                raise ValueError(E_REDIS_SSL_CERT_REQS_MISSING_INVALID)
+
+            if ssl_cert_reqs == CERT_OPTIONAL:
+                logger.warning(W_REDIS_SSL_CERT_OPTIONAL)
+            elif ssl_cert_reqs == CERT_NONE:
+                logger.warning(W_REDIS_SSL_CERT_NONE)
+            self.connection_kwargs['ssl_cert_reqs'] = ssl_cert_reqs
+
+        self.url = url
+        self._client = None
+        self._connection_pool = connection_pool
+        self.connection_errors, _ = get_redis_error_classes() if get_redis_error_classes else ((), ())
+
+    def _params_from_url(self, url, defaults):
+        scheme, host, port, username, password, path, query = url_to_parts(url)
+        connparams = dict(
+            defaults, **dictfilter({
+                'host': host, 'port': port, 'username': username,
+                'password': password, 'db': query.pop('virtual_host', None)})
+        )
+
+        if scheme == 'socket':
+            # use 'path' as path to the socket… in this case
+            # the database number should be given in 'query'
+            connparams.update({
+                'connection_class': redis.UnixDomainSocketConnection,
+                'path': '/' + path,
+            })
+            # host+port are invalid options when using this connection type.
+            connparams.pop('host', None)
+            connparams.pop('port', None)
+            connparams.pop('socket_connect_timeout')
         else:
-            return redis.StrictRedis(
-                connection_pool=self._get_pool(**params),
-            )
+            connparams['db'] = path
+
+        ssl_param_keys = ['ssl_ca_certs', 'ssl_certfile', 'ssl_keyfile',
+                          'ssl_cert_reqs']
+
+        if scheme == 'redis':
+            # If connparams or query string contain ssl params, raise error
+            if (any(key in connparams for key in ssl_param_keys) or
+                    any(key in query for key in ssl_param_keys)):
+                raise ValueError(E_REDIS_SSL_PARAMS_AND_SCHEME_MISMATCH)
+
+        if scheme == 'rediss':
+            connparams['connection_class'] = redis.SSLConnection
+            # The following parameters, if present in the URL, are encoded. We
+            # must add the decoded values to connparams.
+            for ssl_setting in ssl_param_keys:
+                ssl_val = query.pop(ssl_setting, None)
+                if ssl_val:
+                    connparams[ssl_setting] = unquote(ssl_val)
+
+        # db may be string and start with / like in kombu.
+        db = connparams.get('db') or 0
+        db = db.strip('/') if isinstance(db, str) else db
+        connparams['db'] = int(db)
+
+        for key, value in query.items():
+            if key in redis.connection.URL_QUERY_ARGUMENT_PARSERS:
+                query[key] = redis.connection.URL_QUERY_ARGUMENT_PARSERS[key](
+                    value
+                )
+
+        # Query parameters override other parameters
+        connparams.update(query)
+        return connparams
+
+    def exception_safe_to_retry(self, exc):
+        if isinstance(exc, self.connection_errors):
+            return True
+        return False
+
+    @cached_property
+    def retry_policy(self):
+        retry_policy = super().retry_policy
+        if "retry_policy" in self._transport_options:
+            retry_policy = retry_policy.copy()
+            retry_policy.update(self._transport_options['retry_policy'])
+        return retry_policy
+
+    @cached_property
+    def _transport_options(self):
+        return self.crawler.settings.get(f'{self.config_namespace}_TRANSPORT_OPTIONS', {})
+
+    def _create_client(self, **params):
+        return redis.StrictRedis(
+            connection_pool=self._get_pool(**params),
+        )
     
     @staticmethod
     def _get_pool(**params):
         return redis.ConnectionPool(**params)
 
-    def close(self):
-        self.client.close()
+    @property
+    def client(self):
+        if self._client is None or not getattr(self._client, 'connection', None):
+            self._client = self._create_client(**self.connection_kwargs)
+        return self._client
 
-    def _maybe_reconnect(self):
+    def close(self):
+        if self._client is None:
+            return
+        self._client.close()
+
+    def ensure(self, fun, *args, **policy):
+        retry_policy = dict(self.retry_policy, **policy)
+        max_retries = retry_policy.get('max_retries')
+        return retry_over_time(
+            fun, self.connection_errors, args, {},
+            callback=partial(self.on_connection_error, max_retries),
+        )
+
+    def on_connection_error(self, max_retries, exc, intervals, retries):
+        tts = next(intervals)
+        logger.error(
+            E_REDIS_LOST.strip(),
+            retries, max_retries or 'Inf', humanize_seconds(tts, 'in '))
         if not self.client.ping():
             time.sleep(2)
             self.client.close()
-            self.client = self._create_client(**self.connection_kwargs)
+        return tts
 
-    def ensure(self, fun, *args, **kwargs):
-        return retry_over_time(
-            fun, Exception, args, kwargs,
-            callback=self._maybe_reconnect
-        )
+    def get(self, key):
+        return self.ensure(self.client.get, key)
+
+    def mget(self, keys):
+        return self.ensure(self.client.mget, keys)
+
+    def scan(self, pattern, count=1000):
+        cursor = 0
+        while True:
+            cursor, keys = self.client.scan(cursor, match=pattern, count=1000)
+            for key in keys:
+                yield key
+            if cursor == 0:
+                break
+
+    def set(self, key, value, **retry_policy):
+        if isinstance(value, str) and len(value) > self._MAX_STR_VALUE_SIZE:
+            raise BackendStoreError('value too large for Redis backend')
+        return self.ensure(self._set, (key, value), **retry_policy)
+
+    def _set(self, key, value):
+        with self.client.pipeline() as pipe:
+            if self.expires:
+                pipe.setex(key, self.expires, value)
+            else:
+                pipe.set(key, value)
+            pipe.publish(key, value)
+            pipe.execute()
 
     def sadd(self, key, values):
         return self.ensure(self._sadd, key, values)
@@ -100,7 +313,8 @@ class RedisBackend:
         if not pop:
             result = self.client.srandmember(key, count)
         else:
-            count = count if count <= self.get_set_length(key) else self.get_set_length(key)
+            set_len = self.client.scard(key)
+            count = count if count <= set_len else set_len
             if count > 1:
                 with self.client.pipeline() as pipe:
                     pipe.multi()
@@ -110,9 +324,6 @@ class RedisBackend:
             elif count:
                 result.append(self.client.spop(key))
         return result
-
-    def smembers(self, key):
-        return self.ensure(self.client.smembers, key)
 
     def srem(self, key, values):
         return self.ensure(self._srem, key, values)
@@ -127,11 +338,8 @@ class RedisBackend:
         else:
             self.client.srem(key, values)
 
-    def get_set_length(self, key):
-        return self.client.scard(key)
-
     def zadd(self, key, values=None, scores=None, mapping=None):
-        return self.ensure(self.zadd, key, values, scores, mapping)
+        return self.ensure(self._zadd, key, values, scores, mapping)
 
     def _zadd(self, key, values=None, scores=None, mapping=None):
         if not key:
@@ -163,14 +371,6 @@ class RedisBackend:
             results, *count = pipe.execute()
         return results
 
-    def get_zset_length(self, key):
-        return self.ensure(self._zset_length, key)
-
-    def _zset_length(self, key):
-        if not key:
-            raise KeyError(f"Key must be a specific string, not blank.")
-        return self.client.zcard(key)
-
     def rpush(self, key, values):
         return self.ensure(self._rpush, key, values)
 
@@ -189,7 +389,8 @@ class RedisBackend:
 
     def _rpop(self, key, count=1):
         result = []
-        count = count if count <= self.get_list_length(key) else self.get_list_length(key)
+        length = self.client.llen(key)
+        count = count if count <= length else length
         if count > 1:
             with self.client.pipeline() as pipe:
                 pipe.multi()
@@ -218,7 +419,8 @@ class RedisBackend:
 
     def _lpop(self, key, count=1):
         result = None
-        count = count if count <= self.get_list_length(key) else self.get_list_length(key)
+        length = self.client.llen(key)
+        count = count if count <= length else length
         if count > 1:
             with self.client.pipeline() as pipe:
                 pipe.multi()
@@ -228,9 +430,6 @@ class RedisBackend:
         elif count:
             result = self.client.lpop(key)
         return result
-
-    def get_list_length(self, key):
-        return self.client.llen(key)
 
     def hset(self, key, field, value, expire=-1):
         with self.client.pipeline() as pipe:
@@ -266,17 +465,11 @@ class RedisBackend:
     def hdel(self, key, *fields):
         self.client.hdel(key, *fields)
 
-    def delete(self, key):
-        self.client.delete(key)
+    def delete(self, keys):
+        return self.ensure(self.client.delete, *keys)
 
     def incr(self, key):
         return self.client.incr(key)
 
     def expire(self, key, value):
-        return self.client.expire(key, value)
-
-    def publish(self, channel, message):
-        return self.ensure(self.client.publish, channel, message)
-
-    def pubsub(self, **kwargs):
-        return self.client.pubsub(**kwargs)
+        return self.ensure(self.client.expire, key, value)
