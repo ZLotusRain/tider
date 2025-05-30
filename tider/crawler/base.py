@@ -17,6 +17,7 @@ from kombu.utils.encoding import safe_str
 from tider import Tider, __version__
 from tider import platforms, signals
 from tider.spiders import Spider
+from tider.lock import WatchDogLock
 from tider.settings import Settings, overridden_settings
 from tider.crawler import state
 from tider.crawler.control import Pidbox, gPidbox
@@ -196,7 +197,7 @@ class Crawler:
 
     @cached_property
     def spidername(self):
-        return self.spidercls.name
+        return self.spidercls.name or self.spidercls.__name__
 
     @cached_property
     def extensions(self):
@@ -286,6 +287,17 @@ class Crawler:
         info = self.info()
         info.update(self.stats.get_stats())
         return info
+
+    def lock(self, name=None, timeout=None, sleep=0, blocking=None,
+             blocking_timeout=None, thread_local=None, extend_timeout=None):
+        """Distributed lock.
+        Refer:https://redis.io/docs/latest/develop/use/patterns/distributed-locks/#the-redlock-algorithm
+        """
+        return WatchDogLock(
+            self, name=name, timeout=timeout, sleep=sleep,
+            blocking=blocking, blocking_timeout=blocking_timeout,
+            thread_local=thread_local, extend_timeout=extend_timeout
+        )
 
     def maybe_sleep(self, seconds):
         getattr(self.Pool, 'is_green', False) and time.sleep(seconds)
