@@ -1,3 +1,4 @@
+import sys
 import contextlib
 from click import ClickException
 from typing import Iterator, Mapping, Type
@@ -11,6 +12,15 @@ def reraise(tp, value, tb=None):
     if value.__traceback__ is not tb:
         raise value.with_traceback(tb)
     raise value
+
+
+def raise_with_context(exc):
+    exc_info = sys.exc_info()
+    if not exc_info:
+        raise exc
+    elif exc_info[1] is exc:
+        raise
+    raise exc from exc_info[1]
 
 
 @contextlib.contextmanager
@@ -74,7 +84,7 @@ class SecurityError(TiderException):
     """Security related exception."""
 
 
-class StoreError(TiderException):
+class FileStoreError(TiderException):
     """Failed to persist file."""
 
 
@@ -238,3 +248,19 @@ class RemoteProtocolError(DownloadError):
     """
     compat for `httpcore.RemoteProtocolError`
     """
+
+
+class BackendError(TiderException):
+    """An issue writing or reading to/from the backend."""
+
+
+class BackendReadError(BackendError):
+    """An issue reading from the backend."""
+
+
+class BackendStoreError(BackendError):
+    """An issue writing to the backend."""
+
+
+class CrawlerRevokedError(TiderException):
+    """The crawler has been revoked."""
