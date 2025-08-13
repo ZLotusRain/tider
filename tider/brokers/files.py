@@ -1,4 +1,5 @@
 import os
+import re
 import csv
 import json
 import xlrd
@@ -49,11 +50,33 @@ class FilesBroker(Broker):
             on_message_consumed and on_message_consumed()
 
     def _consume_xlsx(self, file, on_message=None, on_message_consumed=None):
-        wb = openpyxl.load_workbook(file)
+        fp = BytesIO()
+        zout = zipfile.ZipFile(fp, "w")
+        zin = zipfile.ZipFile(file, "r")
+        for item in zin.infolist():
+            buffer = zin.read(item.filename)
+            if item.filename == "xl/styles.xml":
+                styles = buffer.decode("utf-8")
+                styles = styles.replace("<x:fill />", "")
+                # https://learn.microsoft.com/zh-cn/dotnet/api/documentformat.openxml.spreadsheet.fills?view=openxml-3.0.1
+                styles = styles.replace('<fills count="1"><fill/></fills>', '').replace('<fill/>', '')
+                cell_styles = re.findall(r'(<cellStyle\s*xfId.*?/>)', styles)
+                for style in cell_styles:
+                    if not re.findall(r'(name=".*?")', style):
+                        new_style = style.replace("/>", ' name=""/>')
+                        styles = styles.replace(style, new_style)
+                buffer = styles.encode("utf-8")
+            zout.writestr(item, buffer)
+        zin.close()
+        zout.close()
+
+        wb = openpyxl.load_workbook(fp, read_only=True, data_only=True, keep_links=False, keep_vba=False)
         for name in wb.sheetnames:
             sheet = wb[name]
             titles = None
             for idx, row in enumerate(sheet.iter_rows(values_only=True)):
+                if all([x is None for x in row]):
+                    continue
                 if idx == 0:
                     titles = row
                     continue
@@ -61,6 +84,7 @@ class FilesBroker(Broker):
                 message.pop(None, None)
                 on_message and on_message(message=message, payload=message, no_ack=True)
                 on_message_consumed and on_message_consumed()
+        fp.close()
 
     def _consume_xls(self, file, on_message=None, on_message_consumed=None):
         wb = xlrd.open_workbook(file_contents=file, on_demand=True)
@@ -83,7 +107,7 @@ class FilesBroker(Broker):
                 invalid_count = 0
 
     def _consume_csv(self, file, on_message=None, on_message_consumed=None):
-        with TextIOWrapper(file, encoding='utf-8') as csvfile:
+        with TextIOWrapper(file, encoding='utf-8-sig') as csvfile:
             reader = csv.DictReader(csvfile)
             for message in reader:
                 message.pop(None, None)
