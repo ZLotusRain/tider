@@ -6,22 +6,55 @@ import contextlib
 from urllib.parse import urlparse
 
 from requests.cookies import cookiejar_from_dict
-from requests.utils import proxy_bypass, get_environ_proxies, get_encoding_from_headers
+from requests.utils import proxy_bypass, get_environ_proxies
 
 from tider.network.compat import CookieCompatRequest, CookieCompatResponse
 
 
+def _parse_content_type_header(header):
+    """Returns content type and parameters from given header
+
+    :param header: string
+    :return: tuple containing content type and dictionary of
+         parameters
+    """
+
+    tokens = header.split(";")
+    content_type, params = tokens[0].strip(), tokens[1:]
+    params_dict = {}
+    items_to_strip = "\"' "
+
+    for param in params:
+        param = param.strip()
+        if param:
+            key, value = param, True
+            index_of_equals = param.find("=")
+            if index_of_equals != -1:
+                key = param[:index_of_equals].strip(items_to_strip)
+                value = param[index_of_equals + 1 :].strip(items_to_strip)
+            params_dict[key.lower()] = value
+    return content_type, params_dict
+
+
 def guess_encoding_from_headers(headers):
     content_type = headers.get("Content-Type", "")
-    charset = list(filter(lambda x: "charset" in x, content_type.split(";")))
+    if not content_type:
+        return None
 
-    if not charset:
-        encoding = get_encoding_from_headers(headers)
-        if "text" in content_type:
-            encoding = 'utf-8'  # maybe "ISO-8859-1" or 'UTF-8'
-    else:
-        encoding = charset[0].split("=")[-1]
-    return encoding
+    content_type, params = _parse_content_type_header(content_type)
+
+    if "charset" in params:
+        charset = params["charset"].strip("'\"")
+        if not charset.startswith("GB"):
+            # maybe not standardized when using GB
+            return params["charset"].strip("'\"")
+
+    if "text" in content_type:
+        return ""  # maybe "ISO-8859-1" or 'UTF-8' or "GB18030"
+
+    if "application/json" in content_type:
+        # Assume UTF-8 based on RFC 4627: https://www.ietf.org/rfc/rfc4627.txt since the charset was unset
+        return "utf-8"
 
 
 def cookiejar_from_str(s: str):
