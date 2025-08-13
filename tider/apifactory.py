@@ -1,9 +1,4 @@
-import logging
-
 from tider.network.request import Request
-
-
-logger = logging.getLogger(__name__)
 
 
 class ApiFactory:
