@@ -3,7 +3,7 @@ import json
 import codecs
 import mimetypes
 import charset_normalizer
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment
 from html import unescape as html_unescape
 from urllib.parse import urljoin, unquote
 from typing import Optional, Callable
@@ -120,6 +120,10 @@ class Response:
 
         # Set encoding.
         response.encoding = guess_encoding_from_headers(response.headers)
+        if response.encoding:
+            response.encoding = response.encoding.split(',')[0].strip()
+        if response.encoding == 'yaml.null':
+            response.encoding = 'utf-8'
         version = getattr(resp, 'version', None) or getattr(resp, 'http_version', None)  # for compat.
         if isinstance(version, int) and version == 11:
             response.version = "HTTP/1.1"
@@ -404,20 +408,29 @@ class Response:
         self._cached_text = text
         return self._cached_text
 
-    def clean_text(self, remove_base64=True, shield_a=False):
+    def clean_text(self, shield_a=False, remove_input=True, remove_comment=False, remove_base64=True):
         text = self.text
         for special_character_pattern in SPECIAL_CHARACTER_PATTERNS:
             text = special_character_pattern.sub("", text)
         text = html_unescape(text).replace("<!DOCTYPE html>", "")
+        if remove_comment:
+            # comment bug
+            text = re.sub(r'<!--[.\s\S]*?-->', '', text)
 
         soup = None
         invalid_tags = []
         # noinspection PyBroadException
         try:
             soup = BeautifulSoup(text, "lxml")
-            for tag in soup(lambda t: t.name in ('style', 'script', 'input')):
-                tag.extract()
             for tag in soup.find_all(recursive=True):
+                for each in tag.contents or []:
+                    if isinstance(each, Comment) and remove_comment:
+                        each.extract()
+                if isinstance(tag, Comment) and remove_comment:
+                    tag.extract()
+                if tag.name in ('style', 'script', 'input'):
+                    if tag.name != 'input' or remove_input:
+                        tag.extract()
                 if shield_a and tag.name == 'a':
                     tag.name = 'p'
                 if tag.name == 'div' and not tag.find_all(recursive=False) and not tag.get_text().strip():
