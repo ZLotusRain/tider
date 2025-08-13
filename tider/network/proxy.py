@@ -224,7 +224,7 @@ class ProxyContainer:
         self.stats = stats
         self.lock = RLock() if use_lock else DummyLock()
 
-    def _new_proxy(self, disposable=False, on_discard=None, **kwargs):
+    def _new_proxy(self, disposable=False, on_discard=None, request=None, **kwargs):
         """arguments are only used if a new proxy is created."""
         result = None
         while result is None:
@@ -272,7 +272,7 @@ class ProxyContainer:
                 valids.append(proxy)
         return max(valids, key=lambda x: x.elapsed)
 
-    def get_proxy(self, disposable=False, on_discard=None, **kwargs):
+    def get_proxy(self, disposable=False, on_discard=None, request=None, **kwargs):
         if disposable:
             return self._new_proxy(disposable, on_discard, **kwargs)
         with self.lock:
