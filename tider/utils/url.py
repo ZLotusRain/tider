@@ -58,7 +58,12 @@ def parse_url(url, encoding=None) -> ParseResult:
 def map_query(url=None, query=None):
     params = {}
 
-    query = query or parse_url(url).query or ""
+    if not query:
+        result = parse_url(url)
+        query = result.query
+        if not query and result.fragment:
+            # https://example.com/#/?query=query
+            query = parse_url(result.fragment).query
     query = query.split("&")
     for each in query:
         if "=" not in each:
