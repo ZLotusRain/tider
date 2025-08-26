@@ -5,6 +5,8 @@ import importlib
 from typing import Iterable
 from pkgutil import iter_modules
 
+from sympy.abc import lamda
+
 from tider.item import Item
 from tider.utils.log import get_logger
 
@@ -39,17 +41,19 @@ def str_to_list(s, sep=",", maxsplit=-1):
     return s
 
 
-def unique_list(list_, key=lambda x: x):
+def unique_list(list_, key=lambda x: x, prefer=lambda x: x):
     """efficient function to uniquify a list preserving item order"""
-    seen = set()
-    result = []
+    seen = {}
     for item in list_:
         seenkey = key(item)
-        if seenkey in seen:
+        if seenkey not in seen:
+            seen[seenkey] = item
             continue
-        seen.add(seenkey)
-        result.append(item)
-    return result
+        existing = seen[seenkey]
+        if not prefer(existing) and prefer(item):
+            seen[seenkey] = item
+
+    return list(seen.values())
 
 
 def evaluate_callable(callback):
