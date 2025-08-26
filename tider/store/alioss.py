@@ -223,8 +223,7 @@ class AliOSSFilesStore:
                 result = self._ensure_read(bucket.upload_part, filename, upload_id, part_number, upload_chunk)
                 parts.append(PartInfo(part_number, result.etag, size=len(upload_chunk)))
                 part_number += 1
-                # reset
-                del upload_chunk[:]
+                upload_chunk = []  # reset
                 upload_chunk_length = 0
             if upload_chunk:
                 upload_chunk = b''.join(upload_chunk)
