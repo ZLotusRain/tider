@@ -299,7 +299,7 @@ class LinkExtractor:
 
     def _deduplicate_if_needed(self, links):
         if self.unique:
-            return unique_list(links, key=lambda link: link["url"])
+            return unique_list(links, key=lambda link: link["url"], prefer=lambda link: link["title"] or link["text"])
         return links
 
     def _extract_links(self, selector, response_url, response_encoding):
@@ -354,4 +354,6 @@ class LinkExtractor:
         for doc in docs:
             links = self._extract_links(doc, response_url, encoding)
             all_links.extend(self._process_links(links))
-        return unique_list(all_links, key=lambda link: link["url"])
+        if self.unique:
+            return unique_list(all_links, key=lambda link: link["url"], prefer=lambda link: link["title"] or link["text"])
+        return all_links
