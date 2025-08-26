@@ -301,8 +301,7 @@ class Request:
 
     def update_proxy(self, proxy: Proxy):
         # discard disposable proxy when switching to a new proxy.
-        if self.proxy.disposable:
-            self.invalidate_proxy()
+        self._proxy and self._proxy.unbind(self)
         self._proxy = proxy
 
     def invalidate_proxy(self):
@@ -410,9 +409,9 @@ class Request:
         return d
 
     def close(self):
-        if self.proxies and self.proxy.disposable:
-            self.invalidate_proxy()
-        self._proxy = None
+        if self._proxy is not None:
+            self._proxy.unbind(self)
+            self._proxy = None
         # don't use clear to avoid destroy cb_kwargs in promise
         self._cb_kwargs = {}
         self._meta = {}
