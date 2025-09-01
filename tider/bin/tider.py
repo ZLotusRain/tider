@@ -99,8 +99,13 @@ class TiderSettings(ParamType):
 APP = App()
 TIDER_SETTINGS = TiderSettings()
 
+try:
+    plugins = entry_points().get('tider.commands', [])
+except AttributeError:
+    plugins = list(entry_points().select(name='tider.commands'))
 
-@with_plugins(entry_points().get('tider.commands', []))
+
+@with_plugins(plugins)
 @click.group(cls=DYMGroup, invoke_without_command=True)
 @click.option('-A',
               '--app',
