@@ -1,7 +1,5 @@
 import re
-import parsel
 from lxml import etree
-from parsel import selector
 from parsel import Selector as _ParselSelector
 from w3lib.html import replace_entities as w3lib_replace_entities
 
@@ -41,21 +39,6 @@ def extract_regex(regex, text, replace_entities=True, flags=0):
             values.append(w3lib_replace_entities(value, keep=["lt", "amp"]))
 
     return values
-
-
-def create_root_node(text, parser_cls, base_url=None):
-    """Create root node for text using given parser class.
-    """
-    body = text.strip().replace("\x00", "").encode("utf8", errors='replace') or b"<html/>"
-    parser = parser_cls(recover=True, encoding="utf8", huge_tree=True)
-    root = etree.fromstring(body, parser=parser, base_url=base_url)
-    if root is None:
-        root = etree.fromstring(b"<html/>", parser=parser, base_url=base_url)
-    return root
-
-
-if parsel.__version__ < "1.7.0":
-    selector.create_root_node = create_root_node
 
 
 class SelectorList(_ParselSelector.selectorlist_cls):
