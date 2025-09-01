@@ -14,50 +14,22 @@ from tider.exceptions import (
     BackendReadError, BackendStoreError,
     CrawlerRevokedError, SecurityError
 )
-from tider.utils.time import get_exponential_backoff_interval
 from tider.utils.serialization import (
     create_exception_cls, ensure_serializable,
     get_pickleable_exception, get_pickled_exception
 )
+from tider.utils.time import get_exponential_backoff_interval
 
-__all__ = ('backend_serializer_registry', 'BaseBackend', 'KeyValueStoreBackend', 'State')
+__all__ = (
+    'backend_serializer_registry', 'State',
+    'BaseBackend', 'KeyValueStoreBackend', 'DisabledBackend',
+)
 
 EXCEPTION_ABLE_CODECS = frozenset({'pickle'})
-
-E_NO_BACKEND = """
-No backend is configured.
-Please see the documentation for more information.
-"""
-
-# None represents the precedence of an unknown state.
-# Lower index means higher precedence.
-PRECEDENCE = [
-    'SUCCESS',
-    'FAILURE',
-    None,
-    'REVOKED',
-    'STARTED',
-    'PENDING',
-]
-
-#: Hash lookup of PRECEDENCE to index
-PRECEDENCE_LOOKUP = dict(zip(PRECEDENCE, range(0, len(PRECEDENCE))))
-NONE_PRECEDENCE = PRECEDENCE_LOOKUP[None]
 
 # use backend_serializer_registry.register to
 # register any custom serialization method.
 backend_serializer_registry = serializer_registry
-
-
-def precedence(state: str) -> int:
-    """Get the precedence index for state.
-
-    Lower index means higher precedence.
-    """
-    try:
-        return PRECEDENCE_LOOKUP[state]
-    except KeyError:
-        return NONE_PRECEDENCE
 
 
 class State(str, enum.Enum):
@@ -65,25 +37,14 @@ class State(str, enum.Enum):
     PENDING = 'PENDING'
     #: Crawler was started.
     STARTED = 'STARTED'
+    #: Crawler running
+    RUNNING = 'RUNNING'
     #: Crawler succeeded
     SUCCESS = 'SUCCESS'
     #: Crawler failed
     FAILURE = 'FAILURE'
     #: Crawler was revoked.
     REVOKED = 'REVOKED'
-    IGNORED = 'IGNORED'
-
-    def __gt__(self, other: str) -> bool:
-        return precedence(self) < precedence(other)
-
-    def __ge__(self, other: str) -> bool:
-        return precedence(self) <= precedence(other)
-
-    def __lt__(self, other: str) -> bool:
-        return precedence(self) > precedence(other)
-
-    def __le__(self, other: str) -> bool:
-        return precedence(self) >= precedence(other)
 
 
 class Backend:
@@ -112,28 +73,30 @@ class Backend:
     }
 
     def __init__(self, crawler, serializer=None, accept=None, expires=None, expires_type=None, url=None):
-        self.crawler = crawler  # allow_dup
-        settings = self.crawler.settings
-        self.serializer = serializer or settings.get(f'{self.config_namespace}_SERIALIZER', 'json')
-        (self.content_type,
-         self.content_encoding,
-         self.encoder) = serializer_registry._encoders[self.serializer]
+        self.crawler = crawler
+
+        self.serializer = serializer or self.get_config('SERIALIZER', 'json')
+        self.content_type, self.content_encoding, self.encoder = serializer_registry._encoders[self.serializer]
         self.expires = self.prepare_expires(expires, expires_type)
 
-        # precedence: accept, conf.result_accept_content
-        self.accept = settings.get(f"{self.config_namespace}_ACCEPT_CONTENT") if accept is None else accept
+        self.accept = accept or self.get_config("ACCEPT_CONTENT")
         self.accept = prepare_accept_content(self.accept)
-
-        self.always_retry = settings.get(f'{self.config_namespace}_ALWAYS_RETRY', False)
-        self.max_sleep_between_retries_ms = settings.get(f'{self.config_namespace}_MAX_SLEEP_BETWEEN_RETRIES_MS', 10000)
-        self.base_sleep_between_retries_ms = settings.get(f'{self.config_namespace}_BASE_SLEEP_BETWEEN_RETRIES_MS', 10)
-        self.max_retries = settings.get(f'{self.config_namespace}_MAX_RETRIES', float("inf"))
-        self.thread_safe = settings.get(f'{self.config_namespace}_THREAD_SAFE', False)
 
         self.url = url
 
+        self.always_retry = self.get_config('ALWAYS_RETRY', False)
+        self.max_sleep_between_retries_ms = self.get_config('MAX_SLEEP_BETWEEN_RETRIES_MS', 10000)
+        self.base_sleep_between_retries_ms = self.get_config(f'BASE_SLEEP_BETWEEN_RETRIES_MS', 10)
+        self.max_retries = self.get_config(f'MAX_RETRIES', float("inf"))
+        self.thread_safe = self.get_config(f'THREAD_SAFE', False)
+
+    def get_config(self, key, default=None):
+        settings = self.crawler.settings
+        key = key.upper()
+        return settings.get(f'{self.config_namespace}_{key}', default)
+
     def as_uri(self, include_password=False):
-        """Return the backend as an URI, sanitizing the password or not."""
+        """Return the backend as a URI, sanitizing the password or not."""
         # when using maybe_sanitize_url(), "/" is added
         # we're stripping it for consistency
         if include_password:
@@ -144,6 +107,10 @@ class Backend:
     def mark_as_started(self):
         """Mark crawler as started."""
         return self.store_result(self.crawler.stats.get_stats(), State.STARTED)
+
+    def mark_as_running(self):
+        """Mark crawler as running."""
+        return self.store_result(self.crawler.stats.get_stats(), State.RUNNING)
 
     def mark_as_done(self, store_result=True, state=State.SUCCESS):
         """Mark crawler as successfully executed."""
@@ -240,10 +207,6 @@ class Backend:
 
         return exc
 
-    def prepare_value(self, result):
-        """Prepare value for storage."""
-        return result
-
     def encode(self, data):
         _, _, payload = self._encode(data)
         return payload
@@ -268,6 +231,10 @@ class Backend:
                      content_encoding=self.content_encoding,
                      accept=self.accept)
 
+    def prepare_value(self, result):
+        """Prepare value for storage."""
+        return result
+
     def prepare_expires(self, value, exp_type=None):
         if value is None:
             value = self.crawler.settings.get(f'{self.config_namespace}_EXPIRES', 7 * 86400)
@@ -283,7 +250,7 @@ class Backend:
         persistent = self.crawler.settings.get(f'{self.config_namespace}_PERSISTENT')
         return self.persistent if persistent is None else persistent
 
-    def encode_result(self, result, state):
+    def prepare_result(self, result, state):
         if state in self.EXCEPTION_STATES and isinstance(result, Exception):
             return self.prepare_exception(result)
         return self.prepare_value(result)
@@ -319,7 +286,7 @@ class Backend:
         if always_retry_backend_operation is activated, in the event of a recoverable exception,
         then retry operation with an exponential backoff until a limit has been reached.
         """
-        result = self.encode_result(result, state)  # stats, errors, failures.
+        result = self.prepare_result(result, state)  # stats, errors, failures.
         retries = 0
         while True:
             try:
@@ -352,11 +319,11 @@ class Backend:
         raise NotImplementedError('backend does not implement forget.')
 
     def get_state(self):
-        """Get the state of a task."""
+        """Get the state of a crawler."""
         return self.get_meta()['status']
 
     def get_traceback(self):
-        """Get the traceback for a failed task."""
+        """Get the traceback for a failed crawler."""
         return self.get_meta().get('traceback')
 
     def get_stats(self):
@@ -547,4 +514,22 @@ class KeyValueStoreBackend(Backend):
         meta = self._gen_crawler_meta(result=result, state=state, traceback=traceback)
         meta['hostname'] = self.crawler.hostname
         self.set(self.get_crawler_key(), self.encode(meta))
-        return result
+
+
+class DisabledBackend(BaseBackend):
+    """Dummy result backend."""
+
+    def store_result(self, *args, **kwargs):
+        pass
+
+    def forget(self, group=False):
+        pass
+
+    def _is_disabled(self, *args, **kwargs):
+        pass
+
+    def as_uri(self, *args, **kwargs):
+        return 'disabled://'
+
+    get_state = get_stats = get_errors = get_failures = get_traceback = _is_disabled
+    _get_crawler_meta = _get_group_meta = _is_disabled
