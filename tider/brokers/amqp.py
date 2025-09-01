@@ -192,6 +192,7 @@ def create_channel(self, connection, raw_create_channel):
     chan = raw_create_channel(connection)
     # tricky way to process messages from non-kombu queues.
     chan.__class__.__bases__ = (RawMessageChannel,)
+    chan.Message = RawMessage  # patch again to void overwriting
     # type(chan).mro()[1].basic_consume = MethodType(basic_consume, chan)
     # RawMessageChannel.__dict__ = type(chan).mro()[1].__dict__
     # type(chan).mro()[1] = type(class_.__name__, (class_,), attrs)
@@ -218,8 +219,12 @@ class RawMessage(Message):
                     'delivery_tag': str(uuid4()),
                     'delivery_info': {'exchange': None, 'routing_key': queue}
                 },
-                'content-type': None
+                'content-type': None,
             }
+            if 'topic' in payload['body']:
+                payload['topic'] = payload['body']['topic']
+
+        self.topic = payload.get('topic')
         super(RawMessage, self).__init__(payload, channel, **kwargs)
 
 
