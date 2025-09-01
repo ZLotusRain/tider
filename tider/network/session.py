@@ -231,6 +231,13 @@ class Session:
         request.cert = merge_setting(request.cert, self.cert)
 
     def download_request(self, request: Request):
+        downloader = request.downloader
+        if request.impersonate and not downloader:
+            downloader = 'impersonate'
+        downloader = self._get_downloader(downloader or 'default')
+        if not downloader:
+            raise RuntimeError(f"Can't load downloader `{downloader}`")
+
         request.prepared.prepare_headers(merge_setting(request.headers, self.headers))
 
         h_cookie = request.headers.pop("Cookie", None)
@@ -248,17 +255,10 @@ class Session:
             request.prepared.auth = auth
             request.prepared.prepare_auth(auth)
 
-        self.merge_environment_settings(request)
-
-        downloader = request.downloader
-        if request.impersonate and not downloader:
-            downloader = 'impersonate'
-        downloader = self._get_downloader(downloader or 'default')
-        if not downloader:
-            raise RuntimeError(f"Can't load downloader `{downloader}`")
-
         try:
-            request.proxy.connect()  # raise ProxyError if proxy is invalid
+            # raise ProxyError if proxy is invalid
+            self.merge_environment_settings(request)
+            request.proxy.connect()
         except ProxyError as e:
             response = Response(request)
             response.fail(e)
