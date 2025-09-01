@@ -72,31 +72,34 @@ class RedisBackend(KeyValueStoreBackend):
         if redis is None:
             raise ImproperlyConfigured(E_REDIS_MISSING.strip())
 
-        _get = self.crawler.settings.get
         if host and '://' in host:
             url, host = host, None
 
-        self.max_connections = max_connections or _get(f'{self.config_namespace}_REDIS_MAX_CONNECTIONS') or self.max_connections
-        socket_timeout = _get(f'{self.config_namespace}_REDIS_SOCKET_TIMEOUT')
-        socket_connect_timeout = _get(f'{self.config_namespace}_REDIS_SOCKET_CONNECT_TIMEOUT')
-        retry_on_timeout = _get(f'{self.config_namespace}_REDIS_RETRY_ON_TIMEOUT')
-        socket_keepalive = _get(f'{self.config_namespace}_REDIS_SOCKET_KEEPALIVE')
-        health_check_interval = _get(f'{self.config_namespace}_REDIS_HEALTH_CHECK_INTERVAL')
+        config = self.get_config('REDIS_SETTINGS', {})
+        self.max_connections = (
+                max_connections or self.get_config('REDIS_MAX_CONNECTIONS')
+                or config.get('max_connections', self.max_connections)
+        )
+        socket_timeout = self.get_config('REDIS_SOCKET_TIMEOUT') or config.get('socket_timeout')
+        socket_connect_timeout = self.get_config('REDIS_SOCKET_CONNECT_TIMEOUT') or config.get('socket_connect_timeout')
+        retry_on_timeout = self.get_config('REDIS_RETRY_ON_TIMEOUT') or config.get('retry_on_timeout')
+        socket_keepalive = self.get_config('REDIS_SOCKET_KEEPALIVE') or config.get('socket_keepalive')
+        health_check_interval = self.get_config('REDIS_HEALTH_CHECK_INTERVAL') or config.get('health_check_interval')
 
         self.connection_kwargs = {
-            'host': host or _get(f'{self.config_namespace}_REDIS_HOST') or 'localhost',
-            'port': port or _get(f'{self.config_namespace}_REDIS_PORT') or 6379,
-            'db': db or _get(f'{self.config_namespace}_REDIS_DB') or 0,
-            'password': password or _get(f'{self.config_namespace}_REDIS_PASSWORD'),
+            'host': host or self.get_config('REDIS_HOST') or config.get('host', 'localhost'),
+            'port': port or self.get_config('REDIS_PORT') or config.get('port', 6379),
+            'db': db or self.get_config('REDIS_DB') or config.get('db', 0),
+            'password': password or self.get_config('REDIS_PASSWORD') or config.get('password'),
             'max_connections': self.max_connections,
             'socket_timeout': socket_timeout and float(socket_timeout),
             'retry_on_timeout': retry_on_timeout or False,
             'socket_connect_timeout':
                 socket_connect_timeout and float(socket_connect_timeout),
-            'encoding': _get(f'{self.config_namespace}_REDIS_ENCODING') or 'utf-8',
-            'encoding_errors': _get(f'{self.config_namespace}_REDIS_ENCODING_ERRORS') or 'replace'
+            'encoding': self.get_config('REDIS_ENCODING') or config.get('encoding', 'utf-8'),
+            'encoding_errors': self.get_config('REDIS_ENCODING_ERRORS') or config.get('encoding_errors', 'replace')
         }
-        username = _get(f'{self.config_namespace}_REDIS_USERNAME')
+        username = self.get_config('REDIS_USERNAME') or config.get('username')
         if username:
             # We're extra careful to avoid including this configuration value
             # if it wasn't specified since older versions of py-redis
@@ -110,17 +113,9 @@ class RedisBackend(KeyValueStoreBackend):
         if socket_keepalive:
             self.connection_kwargs['socket_keepalive'] = socket_keepalive
 
-        # "redis_backend_use_ssl" must be a dict with the keys:
-        # 'ssl_cert_reqs', 'ssl_ca_certs', 'ssl_certfile', 'ssl_keyfile'
-        # (the same as "broker_use_ssl")
-        ssl = _get(f'{self.config_namespace}_REDIS_USE_SSL')
-        if ssl:
-            self.connection_kwargs.update(ssl)
-            self.connection_kwargs['connection_class'] = redis.SSLConnection if redis else None
-
         # "ssl_config" must be a dict with the keys:
         # 'ssl_cert_reqs', 'ssl_ca_certs', 'ssl_certfile', 'ssl_keyfile'
-        ssl = _get(f'{self.config_namespace}_REDIS_SSL_CONFIG')
+        ssl = self.get_config('REDIS_SSL_CONFIG') or config.get('ssl_config')
         if ssl:
             self.connection_kwargs.update(ssl)
             self.connection_kwargs['connection_class'] = redis.SSLConnection
@@ -246,7 +241,7 @@ class RedisBackend(KeyValueStoreBackend):
             return
         self._client.close()
 
-    def ensure(self, fun, *args, **policy):
+    def ensure(self, fun, args, **policy):
         retry_policy = dict(self.retry_policy, **policy)
         max_retries = retry_policy.get('max_retries')
         return retry_over_time(
@@ -265,10 +260,10 @@ class RedisBackend(KeyValueStoreBackend):
         return tts
 
     def get(self, key):
-        return self.ensure(self.client.get, key)
+        return self.ensure(self.client.get, args=(key, ))
 
     def mget(self, keys):
-        return self.ensure(self.client.mget, keys)
+        return self.ensure(self.client.mget, args=(keys, ))
 
     def scan(self, pattern, count=1000):
         cursor = 0
@@ -294,7 +289,7 @@ class RedisBackend(KeyValueStoreBackend):
             pipe.execute()
 
     def sadd(self, key, values):
-        return self.ensure(self._sadd, key, values)
+        return self.ensure(self._sadd, args=(key, values))
 
     def _sadd(self, key, values):
         if isinstance(values, list):
@@ -306,7 +301,7 @@ class RedisBackend(KeyValueStoreBackend):
             return self.client.sadd(key, values)
 
     def sget(self, key, count=1, pop=True):
-        return self.ensure(self._sget, key, count, pop)
+        return self.ensure(self._sget, args=(key, count, pop))
 
     def _sget(self, key, count=1, pop=True):
         result = []
@@ -326,7 +321,7 @@ class RedisBackend(KeyValueStoreBackend):
         return result
 
     def srem(self, key, values):
-        return self.ensure(self._srem, key, values)
+        return self.ensure(self._srem, args=(key, values))
 
     def _srem(self, key, values):
         if isinstance(values, list):
@@ -339,7 +334,7 @@ class RedisBackend(KeyValueStoreBackend):
             self.client.srem(key, values)
 
     def zadd(self, key, values=None, scores=None, mapping=None):
-        return self.ensure(self._zadd, key, values, scores, mapping)
+        return self.ensure(self._zadd, args=(key, values, scores, mapping))
 
     def _zadd(self, key, values=None, scores=None, mapping=None):
         if not key:
@@ -355,7 +350,7 @@ class RedisBackend(KeyValueStoreBackend):
         return self.client.zadd(key, mapping)
 
     def zget(self, key, count=1, pop=True):
-        return self.ensure(self._zget, key, count, pop)
+        return self.ensure(self._zget, args=(key, count, pop))
 
     def _zget(self, key, count=1, pop=True):
         """less score, higher priority"""
@@ -372,7 +367,7 @@ class RedisBackend(KeyValueStoreBackend):
         return results
 
     def rpush(self, key, values):
-        return self.ensure(self._rpush, key, values)
+        return self.ensure(self._rpush, args=(key, values))
 
     def _rpush(self, key, values):
         if isinstance(values, list):
@@ -385,7 +380,7 @@ class RedisBackend(KeyValueStoreBackend):
             return self.client.rpush(key, values)
 
     def rpop(self, key, count=1):
-        return self.ensure(self._rpop, key, count)
+        return self.ensure(self._rpop, args=(key, count))
 
     def _rpop(self, key, count=1):
         result = []
@@ -402,7 +397,7 @@ class RedisBackend(KeyValueStoreBackend):
         return result
 
     def lpush(self, key, values):
-        return self.ensure(self._lpush, key, values)
+        return self.ensure(self._lpush, args=(key, values))
 
     def _lpush(self, key, values):
         if isinstance(values, list):
@@ -415,7 +410,7 @@ class RedisBackend(KeyValueStoreBackend):
             return self.client.lpush(key, values)
 
     def lpop(self, key, count=1):
-        return self.ensure(self._lpop, key, count)
+        return self.ensure(self._lpop, args=(key, count))
 
     def _lpop(self, key, count=1):
         result = None
@@ -466,10 +461,10 @@ class RedisBackend(KeyValueStoreBackend):
         self.client.hdel(key, *fields)
 
     def delete(self, keys):
-        return self.ensure(self.client.delete, *keys)
+        return self.ensure(self.client.delete, args=(keys, ))
 
     def incr(self, key):
         return self.client.incr(key)
 
     def expire(self, key, value):
-        return self.ensure(self.client.expire, key, value)
+        return self.ensure(self.client.expire, args=(key, value))

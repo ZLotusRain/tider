@@ -1,5 +1,5 @@
 import re
-from datetime import datetime, timedelta
+from datetime import timedelta
 from kombu.utils import cached_property
 from kombu.utils.url import urlparse, maybe_sanitize_url
 from kombu.exceptions import EncodeError
@@ -58,6 +58,8 @@ class MongoBackend(BaseBackend):
     port = 27017
     username = None
     password = None
+    replica_set = None
+    read_preference = None
     database_name = 'tider'
     crawlermeta_collection = 'tider_crawlermeta'
     max_pool_size = 10
@@ -67,7 +69,7 @@ class MongoBackend(BaseBackend):
 
     _connection = None
 
-    def __init__(self, crawler=None, replica_set=None, read_preference=None, **kwargs):
+    def __init__(self, crawler, **kwargs):
         self.options = {}
         super().__init__(crawler, **kwargs)
 
@@ -79,8 +81,6 @@ class MongoBackend(BaseBackend):
         # Set option defaults
         for key, value in self._prepare_client_options().items():
             self.options.setdefault(key, value)
-        self.replica_set = replica_set
-        self.read_preference = read_preference
 
         # update conf with mongo uri data, only if uri was given
         if self.url:
@@ -101,7 +101,7 @@ class MongoBackend(BaseBackend):
             self.options.update(uri_data['options'])
 
         # update conf with specific settings
-        config = self.crawler.settings.get(f'{self.config_namespace}_MONGODB_SETTINGS')
+        config = self.get_config('MONGODB_SETTINGS')
         if config is not None:
             if not isinstance(config, dict):
                 raise ImproperlyConfigured(
@@ -205,11 +205,18 @@ class MongoBackend(BaseBackend):
         obj = self.collection.find_one({'_id': self.crawler.hostname})
         if obj:
             return self.meta_from_decoded({
-                'crawler_id': obj['_id'],
+                'hostname': obj['_id'],
+                'schema': obj['schema'],
+                'spidername': obj['spidername'],
+                'pid': obj['pid'],
+                'server': obj['server'],
+                'group': obj['group'],
                 'status': obj['status'],
                 'stats': self.decode(obj['stats']),
-                'date_done': obj['date_done'],
+                'failures': obj['failures'],
+                'errors': obj['errors'],
                 'traceback': obj['traceback'],
+                'date_done': obj['date_done'],
             })
         return {'status': State.PENDING, 'result': None}
 
@@ -232,8 +239,7 @@ class MongoBackend(BaseBackend):
                 'traceback': obj['traceback'],
                 'date_done': obj['date_done'],
             })
-            _id = meta.pop('_id')
-            result[_id] = meta
+            result[meta['_id']] = meta
         return result
 
     def _delete_group(self):
@@ -288,7 +294,9 @@ class MongoBackend(BaseBackend):
 
         # Ensure an index on date_done is there, if not process the index
         # in the background.  Once completed cleanup will be much faster
-        collection.create_index('date_done', background=True, expireAfterSeconds=self.expires)
+        indexes = list(collection.list_indexes())
+        index_exists = any(index['name'] == 'date_done_1' for index in indexes)
+        not index_exists and collection.create_index('date_done', background=True, expireAfterSeconds=self.expires)
         return collection
 
     @cached_property
