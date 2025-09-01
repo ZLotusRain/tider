@@ -6,7 +6,7 @@ import socket
 import pprint
 import platform as _platform
 from typing import Optional, Type
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import partial
 from billiard.common import REMAP_SIGTERM
 from billiard.process import current_process
@@ -15,7 +15,7 @@ from kombu.utils import cached_property
 from kombu.utils.encoding import safe_str
 
 from tider import Tider, __version__
-from tider import platforms, signals
+from tider import backends, platforms, signals
 from tider.spiders import Spider
 from tider.lock import WatchDogLock
 from tider.settings import Settings, overridden_settings
@@ -97,6 +97,7 @@ class Crawler:
     pidlock = None
 
     alarm_cls = 'tider.alarm:Alarm'
+    backend_cls = None
     engine_cls = 'tider.crawler.engine:HeartEngine'
     broker_cls = 'tider.crawler.broker:BrokersManager'
 
@@ -105,7 +106,7 @@ class Crawler:
 
     def __init__(self, spidercls, schema='default', app=None, hostname=None, concurrency=None, pool_cls=None,
                  scheduler_cls=None, explorer_cls=None, data_source="", broker_transport=None,
-                 broker_wait_timeout=None, stats_cls=None, alarm_cls=None, debug=False,
+                 broker_wait_timeout=None, stats_cls=None, alarm_cls=None, backend_cls=None, debug=False,
                  loglevel=None, logfile=None, pidfile=None, purge=False, allow_duplicates=False):
         if isinstance(spidercls, Spider):
             raise ValueError("The spidercls argument must be a class, not an object")
@@ -114,50 +115,55 @@ class Crawler:
 
         self.app = app or self.app
         self._source_hostname = hostname
-        self.startup_time = datetime.utcnow()
+        self.startup_time = datetime.now(timezone.utc)
         self.settings = Settings(defaults=[self.app.conf.copy()])
         self.spidercls.update_settings(self.settings)
         self.data_source = data_source
         set_default_ua(self.settings.get('DEFAULT_USER_AGENT'))
 
-        get, set_setting = self.settings.get, self.settings.set
+        get = self.settings.get
         self.concurrency = concurrency or get("CONCURRENCY")
-        set_setting("CONCURRENCY", self.concurrency, 'cmdline')
         self.pool_cls = pool_cls or get("POOL")
         self.broker_transport = broker_transport or get('BROKER_TRANSPORT') or 'default'
         self.broker_wait_timeout = broker_wait_timeout or get('BROKER_TIMEOUT')
 
-        self.scheduler_cls = scheduler_cls or get('SCHEDULER')
-        set_setting("SCHEDULER", self.scheduler_cls, 'cmdline')
         self.explorer_cls = explorer_cls or get('EXPLORER')
-        set_setting("EXPLORER", self.explorer_cls, 'cmdline')
+        self.scheduler_cls = scheduler_cls or get('SCHEDULER')
 
+        self.backend_cls = backend_cls or get('BACKEND')
         self.stats_cls = stats_cls or get('STATS_CLASS')
-        set_setting("STATS_CLASS", self.stats_cls, 'cmdline')
         self.alarm_cls = alarm_cls or get('ALARM_CLASS')
-        set_setting("ALARM_CLASS", self.alarm_cls, 'cmdline')
         self.alarm_message_type = get('ALARM_MESSAGE_TYPE')
-        set_setting("ALARM_MESSAGE_TYPE", self.alarm_message_type, 'cmdline')
 
         logfile = logfile or get("LOG_FILE")
         self.logfile = os.path.join(get('LOG_DIRECTORY'), logfile) if logfile else logfile
         self.loglevel = loglevel or get("LOG_LEVEL")
+        self.update_settings()
 
         self.debug = debug
+        self.purge = purge
         self.allow_duplicates = allow_duplicates or get('CRAWLER_ALLOW_DUPLICATES')
 
         self.pidfile = pidfile
         if not self.concurrency:
             self.concurrency = psutil.cpu_count()
-        self.Pool = get_implementation(self.pool_cls)
         self.spider = None
         self.engine = None
-
-        self.purge = purge
+        self.Pool = get_implementation(self.pool_cls)
 
         self.pidbox = None
         self.connection = self.app.connection_for_control(url=get('CONTROL_URL'))
         self.crawling = False
+
+    def update_settings(self):
+        set_setting = partial(self.settings.set, priority='cmdline')
+        set_setting("CONCURRENCY", self.concurrency)
+        set_setting("SCHEDULER", self.scheduler_cls)
+        set_setting("EXPLORER", self.explorer_cls)
+        set_setting("STATS_CLASS", self.stats_cls)
+        set_setting("ALARM_CLASS", self.alarm_cls)
+        set_setting("ALARM_MESSAGE_TYPE", self.alarm_message_type)
+        set_setting('BACKEND', self.backend_cls)
 
     def on_start(self):
         self.pidbox = (gPidbox if getattr(self.Pool, 'is_green', False) else Pidbox)(self)
@@ -180,8 +186,13 @@ class Crawler:
 
     @cached_property
     def broker(self):
-        return symbol_by_name(self.broker_cls)(crawler=self,
-                                               custom_transports=self.settings.getdict('BROKER_TRANSPORTS'))
+        broker = symbol_by_name(self.broker_cls)
+        return broker(crawler=self, custom_transports=self.settings.getdict('BROKER_TRANSPORTS'))
+
+    @cached_property
+    def backend(self):
+        backend, url = backends.by_url(self.backend_cls)
+        return backend(crawler=self, url=url)
 
     def _create_engine(self):
         return symbol_by_name(self.engine_cls)(crawler=self, on_spider_closed=self.stop)
@@ -275,7 +286,7 @@ class Crawler:
         }
 
     def info(self):
-        uptime = datetime.utcnow() - self.startup_time
+        uptime = datetime.now(timezone.utc) - self.startup_time
         return {'pid': self.pid,
                 'server_ip': self.svr,
                 'schema': self.schema,
