@@ -25,18 +25,58 @@ __all__ = ('PlaywrightDownloader', 'DrissionPageDownloader')
 
 logger = get_logger(__name__)
 
-# https://ygp.gdzwfw.gov.cn/ggzy-portal/#/440300/new/jygg/v3/A?noticeId=4403003C522b6560fdfae04cc0bd72fca3fa55fc9f&projectCode=E4403000004a00377005&bizCode=3C52
-INIT_SCRIPT = """
-    window.elementsCreatedByVue = [];
+HACKED_CREATE_ELEMENT = """
+    // window.elementsCreatedByVue = [];
     window.elementsCreatedByDOM = [];
-    window._hooked = []
     
+    // maybe lead something always on load.
     document._createElement = document.createElement;
     document.createElement = function (name) {
-        ele = document._createElement(name);
-        window.elementsCreatedByDOM.push(ele);
-        return ele;
+       ele = document._createElement(name);
+       window.elementsCreatedByDOM.push(ele);
+       return ele;
     }
+"""
+
+HACKED_ATTACH_SHADOW = """
+    Element.prototype._attachShadow = Element.prototype.attachShadow;
+    Element.prototype.attachShadow = function() {
+        const shadowDiv = document.createElement('div');
+        this.appendChild(shadowDiv);
+        return shadowDiv;
+    };
+"""
+
+
+CREATE_HOOKED_ELEMENT = """
+    window._hooked = []
+    createHidden = function(name) {
+        if (window._hooked.includes(name)) { return; }
+        window._hooked.push(name); 
+        let newInput = document.createElement('input');
+        newInput.type = 'hidden'
+        if (name != "") {
+            newInput.id = `foo-tider-${name}`;
+        } else { newInput.id = 'foo-tider'; }
+        
+        newInput.value = 'DOM_LOAD_HOOK'
+        let lastElement = (document?.body || document?.head || document).lastElementChild;
+        lastElement.insertAdjacentElement('afterend', newInput);
+    }
+"""
+
+INIT_SCRIPT = """
+    // window._eventListeners = {};
+    // let originElementAddEventListener = Element.prototype.addEventListener
+    // Element.prototype.addEventListener = function () {
+    //     let selector = getCssSelector(this);
+    //     if (!window._eventListeners[selector]) {
+    //         window._eventListeners[selector] = [];
+    //     }
+    //     window._eventListeners[selector].push(arguments);
+    //     // difference between apply and call.
+    //     return originElementAddEventListener.apply(this, arguments);
+    // }
     
     function delay(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
@@ -54,7 +94,7 @@ INIT_SCRIPT = """
     }
     
     let lastResources = getResourceStats();
-    
+
     window.checkResourcesDone = function () {
         let resources = getResourceStats();
         if (resources.length != lastResources.length) {
@@ -74,30 +114,60 @@ INIT_SCRIPT = """
         }
     }
     
-    createHidden = function(name) {
-        if (window._hooked.includes(name)) { return; }
-        window._hooked.push(name); 
-        let newInput = document.createElement('input');
-        newInput.type = 'hidden'
-        if (name != "") {
-            newInput.id = `foo-tider-${name}`;
-        } else { newInput.id = 'foo-tider'; }
+    function getCssSelector(element) {
+        if (!(element instanceof Element)) {
+            return null;
+        }
         
-        newInput.value = 'DOM_LOAD_HOOK'
-        let lastElement = (document?.body || document?.head || document).lastElementChild;
-        lastElement.insertAdjacentElement('afterend', newInput);
+        let selector = '';
+        while (element) {
+            if (element.tagName) {
+                // maybe document;
+                let selectorPart = element.tagName.toLowerCase();
+                if (element.id) {
+                    selectorPart += '#' + element.id;
+                    selector = selectorPart + (selector ? ' > ' + selector : '');
+                    break;
+                }
+                if (element.className) {
+                      const classNames = element.className.split(' ');
+                      for (const className of classNames) {
+                          if (className) {
+                            selectorPart += '.' + className;
+                          }
+                      }
+                }
+                let parentElement = element.parentElement;
+                if (parentElement) {
+                    let index = Array.prototype.indexOf.call(parentElement.children, element);
+                    if (index && element.tagName) {
+                        index = index + 1
+                        selectorPart += ":nth-child(" + index.toString() + ")";
+                    }
+                }
+                selector = selectorPart + (selector ? ' > ' + selector : '');
+            }
+            element = element.parentNode;
+        }
+        return selector;
     }
     
-    Element.prototype._attachShadow = Element.prototype.attachShadow;
-    Element.prototype.attachShadow = function() {
-        const shadowDiv = document.createElement('div');
-        this.appendChild(shadowDiv);
-        return shadowDiv;
-    };
-"""
+    window.getSpansWithClick = function () {
+        const allElements = document.querySelectorAll('span');
+        const spans = [];
 
-# https://sinopharmzc.com/#/trade-info-detail?id=1320886088940199937&noticeType=1
+        allElements.forEach(element => {
+            if (element.onclick) {
+                spans.push(getCssSelector(element));
+            }
+        });
+        return spans;
+    }
+"""
+INIT_SCRIPT = HACKED_CREATE_ELEMENT + HACKED_ATTACH_SHADOW + CREATE_HOOKED_ELEMENT + INIT_SCRIPT
+
 STYLE_PATCH = """
+    Object.defineProperties(navigator, {webdriver:{get:()=>undefined}});
     // document.body.scrollHeight = documentElement.scrollHeight = scrollingElement.scrollHeight
     () => {
         const styleSheets = document.styleSheets;
@@ -150,16 +220,23 @@ DOM_LOAD_HOOK = f"""
     const newParagraph = document.createElement('script');
     newParagraph.textContent = '{LAST_SCRIPT}';
     const lastElement = (document?.body || document?.head || document).lastElementChild;
-    lastElement.insertAdjacentElement('afterend', newParagraph);
+    if (lastElement) {{
+        lastElement.insertAdjacentElement('afterend', newParagraph);
+    }} else {{
+        (document?.body || document?.head || document).appendChild(newParagraph);
+    }}
+    
 """
 
 
 class BrowserResponse:
 
     def __init__(self, content: str, encoding: str = 'utf-8', http_version: str = 'HTTP/1.1',
-                 status_code=None, headers=None, cookies=None, reason=None):
+                 status_code=None, headers=None, cookies=None, reason=None, browser=None, page=None):
         self._content = content
         self._encoding = encoding
+        self.page = page
+        self.browser = browser
         self.reason = reason
         self.status_code = status_code
         self.http_version = http_version
@@ -173,6 +250,12 @@ class BrowserResponse:
         if chunk_size:
             warnings.warn("chunk_size is ignored, there is no way to tell browser that.")
         yield self._content.encode(encoding=self._encoding)
+
+    def close(self):
+        if self.page is not None:
+            self.page.unroute_all(behavior='ignoreErrors')
+        if self.browser is not None:
+            self.browser.close()
 
 
 class BrowserDownloader:
@@ -235,24 +318,30 @@ class PlaywrightDownloader(BrowserDownloader):
             route.abort()
         elif name.endswith('.js') or route.request.resource_type == 'script':
             frame = route.request.frame
-            hooking = False
-            if not name.endswith('.min.js') and 'element-ui' not in name and 'ajax.js' not in name:
-                # include iframes.
-                if frame.url != 'about:blank' and frame.page.url != 'about:blank':
-                    hooking = True
-                    hooked[frame].append(name)
             original_response = None
             # Failed to load module script: Expected a JavaScript module script but the server responded with
             # a MIME type of "". Strict MIME type checking is enforced for module scripts per HTML spec.
             headers = {"content-type": "application/javascript; charset=utf-8"}  # vue?
             # original_len = original_response.headers["content-length"]
-            if os.path.exists(cached_js):
+            if self._cache_statics and os.path.exists(cached_js):
                 with open(cached_js, 'rb') as fo:
                     body = fo.read()
             else:
                 original_response = route.fetch()
                 headers.update(original_response.headers)
                 body = original_response.body()
+
+            hooking = False
+            if not name.endswith('.min.js') and 'element-ui' not in name and 'ajax.js' not in name:
+                if '.js' not in name and b'function' not in body:
+                    # some scripts maybe contain dynamic json contents.
+                    hooking = False
+                elif 'google' in route.request.url or 'baidu' in route.request.url:
+                    hooking = False
+                elif frame.url != 'about:blank' and frame.page.url != 'about:blank':
+                    # include iframes.
+                    hooking = True
+                    hooked[frame].append(name)
             if hooking:
                 body += b'\n' + VUE_DOM_LOAD_HOOK.format(name=set_md5(name)).encode('utf-8')
             # maybe replace $createElement in vue.min.js
@@ -261,7 +350,7 @@ class PlaywrightDownloader(BrowserDownloader):
                 body=body,
                 headers={**headers}
             )
-        elif os.path.exists(cached_js):
+        elif self._cache_statics and os.path.exists(cached_js):
             with open(cached_js, 'rb') as fo:
                 body = fo.read()
             route.fulfill(body=body)
@@ -271,7 +360,7 @@ class PlaywrightDownloader(BrowserDownloader):
     def on_response(self, response):
         if not self._cache_statics or response.request.method != 'GET':
             return
-        if response.request.resource_type in ('xhr', 'document', 'fetch'):
+        if response.request.resource_type in ('xhr', 'document', 'fetch', 'image', 'other', 'websocket'):
             return
         if response.frame.page.is_closed():
             # don't try to fetch response.body
@@ -284,7 +373,15 @@ class PlaywrightDownloader(BrowserDownloader):
             if not os.path.exists(host_dir):
                 os.makedirs(host_dir)
             if not os.path.exists(cached_path):
-                body = response.body()
+                # noinspection PyBroadException
+                try:
+                    body = response.body()
+                except Exception:
+                    # page refreshing
+                    return
+                if response.request.resource_type == 'script' and b'function' not in body and '.js' not in name:
+                    # some scripts maybe contain dynamic json contents.
+                    return
                 # recover modified body.
                 body = body.replace(b'\n' + VUE_DOM_LOAD_HOOK.format(name=set_md5(name)).encode('utf-8'), b'')
                 with open(cached_path, 'wb') as fo:
@@ -315,12 +412,15 @@ class PlaywrightDownloader(BrowserDownloader):
         browser_channel = request.meta.get('browser_channel', 'chromium')  # default to headless
         if browser_channel not in ('chromium', 'chrome', 'msedge', 'chrome-beta', 'msedge-beta', 'msedge-dev'):
             raise ImproperlyConfigured("Unsupported browser channel: %s" % browser_channel)
+
+        keep_alive = request.meta.get('browser_keep_alive', False)
         screenshot_path = request.meta.get('browser_screenshot_path')
         init_script = request.meta.get('browser_init_script')
         init_script_path = request.meta.get('browser_init_script_path')
         device = request.meta.get('browser_device')
         scroll_to_bottom = request.meta.get('browser_scroll_to_bottom', False)
         scroll_timeout = request.meta.get('browser_scroll_timeout', request.timeout)
+        banned_routes = request.meta.get('browser_banned_routes', ['media'])
 
         playwright_context = browser = page = None
         hooked = defaultdict(list)
@@ -337,6 +437,7 @@ class PlaywrightDownloader(BrowserDownloader):
                 # devtools=True,
                 args=['--no-sandbox', '--single-process'],
             )
+            # clear caches manually if needed when something is always on load state.
             context = browser.new_context(**context_config, bypass_csp=True)
 
             page = context.background_pages[0] if context.background_pages else context.new_page()
@@ -346,9 +447,6 @@ class PlaywrightDownloader(BrowserDownloader):
                 page.add_init_script(script=init_script, path=init_script_path)
             page.set_extra_http_headers(dict(request.headers))
 
-            banned_routes = ['media', 'other', 'websocket']
-            if not screenshot_path:
-                banned_routes.append('image')
             page.on('response', self.on_response)
             page.route("**/*", functools.partial(self.handle_route, hooked=hooked, banned_routes=banned_routes))
 
@@ -381,6 +479,8 @@ class PlaywrightDownloader(BrowserDownloader):
                     if scroll_elapsed > scroll_timeout or len(history_heights) == 5 and len(set(history_heights)) == 1:
                         break
             page.wait_for_load_state('networkidle')
+            for span in page.evaluate('getSpansWithClick()'):
+                page.locator(span).click()
             self.wait_for_hooked_frames(hooked, timeout=request.timeout * 1000)
 
             html = page.content()
@@ -398,6 +498,9 @@ class PlaywrightDownloader(BrowserDownloader):
             context_cookies = context.cookies()
             cookies = {cookie['name']: cookie['value'] for cookie in context_cookies}
             resp = BrowserResponse(html, headers=response_headers, status_code=status_code, cookies=cookies, reason=reason)
+            if keep_alive:
+                resp.page = page
+                resp.browser = browser
             response = Response.from_origin_resp(resp=resp, request=request)
             response.elapsed = elapsed
             return response
@@ -411,9 +514,11 @@ class PlaywrightDownloader(BrowserDownloader):
                 response.fail(error=e)
             return response
         finally:
+            hooked.clear()
+            if keep_alive:
+                return
             if page is not None:
                 page.unroute_all(behavior='ignoreErrors')
-            hooked.clear()
             browser and browser.close()
             playwright_context and playwright_context.__exit__()
 
