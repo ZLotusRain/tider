@@ -269,9 +269,9 @@ class LinkExtractor:
             return False
         if self.deny_res and _matches(link["url"], self.deny_res):
             return False
-        if self.allow_titles and not _matches(link["title"], self.allow_titles):
+        if self.allow_titles and not _matches(" ".join((link["title"], link['text'])), self.allow_titles):
             return False
-        if self.deny_titles and _matches(link["title"], self.deny_titles):
+        if self.deny_titles and _matches(" ".join((link["title"], link['text'])), self.deny_titles):
             return False
         parsed_url = urlparse(link["url"])
         if self.allow_domains and not url_is_from_any_domain(parsed_url, self.allow_domains):
@@ -336,7 +336,7 @@ class LinkExtractor:
             alt = el.attrib.get("alt") or ""
             ext = self.ext_extractor.extract(title) or self.ext_extractor.extract(url, source_type='url')
             links.append(Link(url=url, title=str(title).strip(), text=text, alt=alt, ext=ext,  nofollow=rel_has_nofollow(el.get("rel"))))
-        return self._deduplicate_if_needed(links)
+        return links
 
     def extract_links(self, response):
         all_links = []
