@@ -315,7 +315,7 @@ class LinkExtractor:
                 continue  # skipping bogus links
             else:
                 url = self.on_extract(attr_val)
-                if url is None or 'javascript:void(0)' in url:
+                if url is None or 'javascript:void(0)' in url or 'javascript:void(0)' in url:
                     continue
             try:
                 response_encoding = response_encoding or 'utf-8'
