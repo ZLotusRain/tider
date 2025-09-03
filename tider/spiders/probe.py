@@ -63,9 +63,6 @@ class Rule:
             return
         links = self.link_extractor.extract_links(response)
         self.process_links(links)
-        if self.found and self.stop_on_found:
-            yield from self.maybe_on_stop(response.cb_kwargs['probe_meta'])
-            return
         for link in links:
             if not self.link_allowed(link, response):
                 continue
@@ -243,6 +240,12 @@ class ProbeSpider(Spider):
             url = response.url.replace('https', 'http')
             yield response.retry(url=url, meta={'depth': 0})
             return
+        soup = response.soup('lxml')
+        if soup.find('meta', attrs={'http-equiv': 'refresh'}):
+            url = soup.find('meta', attrs={'http-equiv': 'refresh'}).get('content', '').split('url=')[-1]
+            if url and url not in response.url:
+                yield response.retry(url=response.urljoin(url), meta={'depth': 0})
+                return
         if not self.response_allowed(response):
             for rule in link_rules:
                 if link:
@@ -280,7 +283,10 @@ class ProbeSpider(Spider):
         seen = probe_meta['seen']
         with seen:
             for rule in rules:
-                links = probe_rules[rule].get_links(response)
+                links = list(probe_rules[rule].get_links(response))  # add to processing.
+                if probe_rules[rule].found and probe_rules[rule].stop_on_found:
+                    yield from probe_rules[rule].maybe_on_stop(response.cb_kwargs['probe_meta'])
+                    continue
                 for new_link in links:
                     if new_link in seen or new_link['url'] in start_urls or new_link['url'].strip('/') in start_urls:
                         yield from probe_rules[rule].on_processed(new_link, meta=probe_meta)
