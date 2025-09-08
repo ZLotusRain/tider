@@ -126,13 +126,15 @@ def get_longest_common_sub_string(str1: str, str2: str) -> str:
 
 class Article:
 
-    __slots__ = ('content', 'title', 'author', 'publish_date', )
+    __slots__ = ('content', 'title', 'source', 'author', 'publish_date', )
 
-    _AVAILABLE_KEYS = ('content', 'title', 'author', 'publish_date', )
+    _AVAILABLE_KEYS = ('content', 'title', 'source', 'author', 'publish_date', )
 
-    def __init__(self, content: str = "", title: str = "", publish_date: str = "", author: str = ""):
+    def __init__(self, content: str = "", title: str = "", source: str = "",
+                 publish_date: str = "", author: str = ""):
         self.content = content
         self.title = title
+        self.source = source
         self.publish_date = publish_date
         self.author = author
 
