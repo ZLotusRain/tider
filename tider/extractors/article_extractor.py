@@ -198,11 +198,13 @@ class ArticleExtractor:
 
     PARAGRAPH_LENGTH_THRESHOLD = 3
 
-    def __init__(self, allow_ignored=False, ignored_paragraphs=None, paragraph_min_length=None, on_extract=None):
+    def __init__(self, allow_ignored=False, ignored_paragraphs=None, paragraph_min_length=None,
+                 title=None, on_extract=None):
         self._tag_regexes = {
             'positives': r'|'.join(POSITIVE_KEYWORDS),
             'negatives': r'|'.join(NEGATIVE_KEYWORDS),
         }
+        self._title = title  # provided title.
         self.on_extract = on_extract
         self.ext_extractor = FileExtExtractor(guess=False)
         self.ignored_paragraphs = set()
@@ -210,6 +212,34 @@ class ArticleExtractor:
             ignored_paragraphs = ignored_paragraphs or []
             self.ignored_paragraphs = set(ignored_paragraphs) | set(IGNORED_PARAGRAPHS)
         self.paragraph_min_length = paragraph_min_length or self.PARAGRAPH_LENGTH_THRESHOLD
+
+    @staticmethod
+    def _format_title(title):
+        punc_table = {
+            '，': ',',
+            '。': '.',
+            '！': '!',
+            '？': '?',
+            '：': ':',
+            '；': ';',
+            '“': '"',
+            '”': '"',
+            '‘': "'",
+            '’': "'",
+            '（': '(',
+            '）': ')',
+            '【': '[',
+            '】': ']',
+            '《': '<',
+            '》': '>',
+            '、': ',',
+            '—': '-',
+            '…': '...',
+        }
+        title = title.strip().lower()
+        for cn, en in punc_table.items():
+            title = title.replace(cn, en)
+        return title
 
     @staticmethod
     def _get_text(tag: Tag):
