@@ -246,7 +246,7 @@ class ArticleExtractor:
             '—': '-',
             '…': '...',
         }
-        title = title.strip().lower()
+        title = title.replace('\n', '').strip().lower()
         for cn, en in punc_table.items():
             title = title.replace(cn, en)
         return title
@@ -308,7 +308,7 @@ class ArticleExtractor:
         while (
             node.parent
             and node.parent.name != 'body'
-            and len([c for c in node.parent.children if isinstance(c, Tag)]) == 1
+            and len([c for c in node.parent.children if isinstance(c, Tag) and c.name != 'br']) == 1
         ):
             node = node.parent
         return node
