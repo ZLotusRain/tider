@@ -441,10 +441,16 @@ class ArticleExtractor:
         title = title if len(title) > 4 else ''
 
         if not title:
-            node = self._find_only_child_parent(content_node.parent) if content_node.parent else content_node
+            source = node = self._find_only_child_parent(content_node.parent) if content_node.parent else content_node
             if not node.find_all(lambda x: x.name in ('h1', 'h2', 'h3')):
                 node = node.parent or node
-            title_tags = node.find_all('h2') or node.find_all('h3') or node.find_all('h1')
+            title_tags = []
+            for child in node.children:
+                if not isinstance(child, Tag):
+                    continue
+                if child == source:
+                    break
+                title_tags.extend(child.find_all('h2') or child.find_all('h3') or child.find_all('h1'))
             if title_tags:
                 contents = [each.get_text().strip() for each in title_tags[-1].contents if self._get_text(each)]
                 if contents and len(contents[0]) > 4:
