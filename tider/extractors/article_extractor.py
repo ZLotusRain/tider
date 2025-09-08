@@ -2,6 +2,7 @@ import re
 import json
 from datetime import datetime
 from bs4 import Tag
+from copy import deepcopy
 
 from tider.utils.url import parse_url_host
 from tider.extractors.link_extractor import FileExtExtractor
@@ -153,9 +154,16 @@ class Article:
 
 
 class Candidate:
-    def __init__(self, node):
+
+    __slots__ = ('node', '_path', 'score', 'source', 'source_parent')
+
+    def __init__(self, node: Tag, score=0):
         self.node = node
+
         self._path = None
+        self.score = score
+        self.source = deepcopy(node)
+        self.source_parent = deepcopy(node.parent) if node.parent else None
 
     @property
     def path(self):
@@ -173,11 +181,14 @@ class Candidate:
             self._path = tuple(reverse_path)
         return self._path
 
+    def get_text(self, separator: str = "", strip: bool = False,):
+        return self.node.get_text(separator=separator, strip=strip)
+
     def __hash__(self):
-        return hash(self.path)
+        return hash(self.node)
 
     def __eq__(self, other):
-        return self.path == other.path
+        return self.node == other.node
 
     def __getattr__(self, name):
         return getattr(self.node, name)
