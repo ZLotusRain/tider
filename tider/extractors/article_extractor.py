@@ -253,7 +253,7 @@ class ArticleExtractor:
 
     def _clean_root(self, root: Tag) -> Tag:
         invalid_nodes = []
-        for each in root.find_all():
+        for each in root.find_all(recursive=True):
             if each.name in ("script", "style"):
                 invalid_nodes.append(each)
             elif each.name == 'a':
@@ -262,6 +262,10 @@ class ArticleExtractor:
             elif each.name == 'div' and not each.find_all(recursive=False) and not each.get_text().strip():
                 invalid_nodes.append(each)
             elif self._get_text(each) in self.ignored_paragraphs:
+                invalid_nodes.append(each)
+            elif not self._get_text(each) and each.name in TAGS_CAN_BE_REMOVE_IF_EMPTY and not [c for c in each.children]:
+                invalid_nodes.append(each)
+            elif each.name == 'b' and not self._get_text(each):
                 invalid_nodes.append(each)
             elif each.name in ('h2', 'h3', 'h4'):
                 for small in each.find_all('small'):
@@ -289,22 +293,14 @@ class ArticleExtractor:
                 child.extract()
         return node
 
-    def _find_only_child_parent(self, node: Tag):
-        invalid_name = ()
-        if node.name not in ('style', 'script'):
-            invalid_name += ('style', 'script')
+    @staticmethod
+    def _find_only_child_parent(node: Tag):
         while (
             node.parent
             and node.parent.name != 'body'
-            and len([each for each in self._clean_node(node.parent).children
-                    if isinstance(each, Tag) and each.name not in invalid_name]) == 1
+            and len([c for c in node.parent.children if isinstance(c, Tag)]) == 1
         ):
-            if node.parent is None or node.parent.name == 'body':
-                break
             node = node.parent
-            invalid_name = ()
-            if node.name not in ('style', 'script'):
-                invalid_name += ('style', 'script')
         return node
 
     def _get_link_density(self, tag):
