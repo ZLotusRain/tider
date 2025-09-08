@@ -157,15 +157,26 @@ class Article:
 
 class Candidate:
 
-    __slots__ = ('node', '_path', 'score', 'source', 'source_parent')
+    __slots__ = ('node', '_path', 'score', 'source')
 
     def __init__(self, node: Tag, score=0):
         self.node = node
 
         self._path = None
         self.score = score
-        self.source = deepcopy(node)
-        self.source_parent = deepcopy(node.parent) if node.parent else None
+        self.source = None
+
+    def finalize_source(self, node=None):
+        if self.source:
+            return
+        node = node or self.node
+        source = self.source = deepcopy(node)
+        for _ in range(2):
+            node = node.parent
+            if not node:
+                break
+            source.parent = deepcopy(node)
+            source = source.parent
 
     @property
     def path(self):
@@ -183,7 +194,7 @@ class Candidate:
             self._path = tuple(reverse_path)
         return self._path
 
-    def get_text(self, separator: str = "", strip: bool = False,):
+    def get_text(self, separator: str = "", strip: bool = False, ):
         return self.node.get_text(separator=separator, strip=strip)
 
     def __hash__(self):
@@ -191,9 +202,6 @@ class Candidate:
 
     def __eq__(self, other):
         return self.node == other.node
-
-    def __getattr__(self, name):
-        return getattr(self.node, name)
 
 
 class ArticleExtractor:
