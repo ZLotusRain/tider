@@ -484,21 +484,29 @@ class ArticleExtractor:
             if len(pubdate) > 20:
                 pubdate = ""
 
+        first_taken = False
+        tmp_date = ""
         text = content_node.get_text().strip()
         paragraphs = [p for p in text.split('\n') if len(p) <= 20]
-        if not pubdate:
-            for p in paragraphs:
-                for pattern in DATETIME_PATTERNS:
-                    result = re.findall(r"(?:发布日期：|发布时间：|印发日期：)\s*" + pattern, p)
-                    if result:
-                        pubdate = result[0]
-                        break
-                    result = re.findall(pattern, p)
-                    if len(result) == 1 and len(result[0]) == len(p.strip()):
-                        pubdate = result[0]
-                        break
-                if pubdate:
+        for p in paragraphs:
+            for pattern in DATETIME_PATTERNS:
+                result = re.findall(r"(?:发布日期：|发布时间：|印发日期：)\s*" + pattern, p)
+                if result:
+                    tmp_date = result[0]
+                    first_taken = True
                     break
+                result = re.findall(pattern, p)
+                if len(result) == 1 and len(result[0]) == len(p.strip()):
+                    tmp_date = result[0]
+                    if p == paragraphs[-1]:
+                        first_taken = True
+                    break
+            if tmp_date:
+                break
+        if tmp_date and first_taken:
+            pubdate = tmp_date
+        else:
+            pubdate = pubdate or tmp_date
         if not pubdate:
             for pattern in DATETIME_PATTERNS:
                 result = re.findall(pattern, text)
