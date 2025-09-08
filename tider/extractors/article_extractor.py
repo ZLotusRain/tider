@@ -4,7 +4,7 @@ from datetime import datetime
 from bs4 import Tag
 
 from tider.utils.url import parse_url_host
-from tider.extractors.file_extractor import FileExtExtractor
+from tider.extractors.link_extractor import FileExtExtractor
 
 __all__ = ('ArticleExtractor', )
 
