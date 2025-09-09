@@ -395,7 +395,7 @@ class ArticleExtractor:
                 score += self._get_punctuations_score(inner_text)
 
             parent_node = elem.parent
-            if not parent_node or parent_node.name:
+            if not parent_node or parent_node.name == 'body':
                 key = Candidate(elem, score=score)
                 if key not in candidates:
                     candidates.append(key)
@@ -460,21 +460,23 @@ class ArticleExtractor:
 
         if not title:
             source = node = self._find_only_child_parent(content_node.parent) if content_node.parent else content_node
-            if not node.find_all(lambda x: x.name in ('h1', 'h2', 'h3')):
-                node = node.parent or node
-            title_tags = []
-            for child in node.children:
-                if not isinstance(child, Tag):
-                    continue
-                if child == source:
-                    break
-                title_tags.extend(child.find_all('h2') or child.find_all('h3') or child.find_all('h1'))
+            title_tags = node.find_all(lambda x: x.name in ('h1', 'h2', 'h3'))
+            if not title_tags or len(title_tags) == 1 and str(node).index(str(title_tags[0])) > len(str(node)) * 0.65:
+                title_tags = []
+                node = node.parent
+                children = node.children if node else []
+                for child in children:
+                    if not isinstance(child, Tag):
+                        continue
+                    if child == source:
+                        break
+                    title_tags.extend(child.find_all('h2') or child.find_all('h3') or child.find_all('h1'))
             if title_tags:
                 contents = [each.get_text().strip() for each in title_tags[-1].contents if self._get_text(each)]
                 if contents and len(contents[0]) > 4:
                     title = contents[0]
 
-        if not title and page_title:
+        if page_title and page_title != title and page_title in self._format_title(content_node.get_text())[:50]:
             tmp = re.split(r'[-_|]', page_title)
             if tmp and len(tmp[0]) >= 4:
                 title = tmp[0]
