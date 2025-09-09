@@ -332,9 +332,9 @@ class ArticleExtractor:
             multiplier -= 1
         return (multiplier - 1) * 25
 
-    def gen_candidate(self, elem):
-        score = self._tag_weight(elem)
+    def gen_candidate_score(self, elem):
         name = elem.name.lower()
+        score = self._tag_weight(elem)
         if name == 'ucapcontent':
             score += 10
         if name == "div":
@@ -345,23 +345,25 @@ class ArticleExtractor:
             score -= 3
         elif name == "th":
             score -= 5
-        return {'score': score, 'elem': elem}
+        return score
 
     def _get_candidates(self, body, response):
-        candidates = {}
+        candidates = []
         invalid_elems = []
-        for elem in body.find_all(lambda x: x.name in ('p', 'b', 'td', 'span', 'iframe', 'img', 'div')):
-            skip_elem = False
-            temp = elem.parent
-            while temp:
-                # td tag may include the whole content.
-                if temp.name in ('p', 'b', 'span'):
-                    skip_elem = True
-                    break
-                temp = temp.parent
-            if skip_elem:
-                continue
 
+        def _filter(t):
+            flag = False
+            if t.name in ('p', 'b', 'td', 'span', 'iframe', 'img', 'div'):
+                flag = True
+                tp = t.parent
+                while tp and tp.name not in ('p', 'b', 'span'):
+                    # td tag may include the whole content.
+                    tp = tp.parent
+                if tp:
+                    flag = False
+            return flag
+
+        for elem in body.find_all(name=_filter):
             score = 1
             inner_text = elem.get_text().strip()
             if elem.name == 'div':
@@ -371,9 +373,10 @@ class ArticleExtractor:
                     or any(filter(lambda x: isinstance(x, Tag) and x.name != 'br', elem.contents))
                 ):
                     continue
+                # div which only contains innerText
                 elem.name = 'p'
             if elem.name in ('p', 'span'):
-                if not elem.get_text().strip() and all([not isinstance(each, Tag) or each.name == 'br' for each in elem.contents]):
+                if not self._get_text(elem) and all([not isinstance(e, Tag) or e.name == 'br' for e in elem.contents]):
                     invalid_elems.append(elem)
                     continue
             if elem.name in ('iframe', 'img'):
@@ -392,37 +395,42 @@ class ArticleExtractor:
                 score += self._get_punctuations_score(inner_text)
 
             parent_node = elem.parent
-            if not parent_node:
-                key = Candidate(elem)
+            if not parent_node or parent_node.name:
+                key = Candidate(elem, score=score)
                 if key not in candidates:
-                    candidates[key] = {'score': score, 'elem': elem}
-                continue
+                    candidates.append(key)
+            else:
+                parent_key = Candidate(self._find_only_child_parent(parent_node))
+                try:
+                    idx = candidates.index(parent_key)
+                    parent_key = candidates[idx]
+                except ValueError:
+                    parent_key.score = self.gen_candidate_score(parent_node)  # don't score the only child parent.
+                    candidates.append(parent_key)
+                parent_key.score += score
 
-            parent_key = Candidate(self._find_only_child_parent(parent_node))
-            if parent_key not in candidates:
-                candidates[parent_key] = self.gen_candidate(parent_node)  # don't score the only child parent.
-            candidates[parent_key]['score'] += score
-
-            grandparent_node = parent_key.node.parent
-            if grandparent_node:
-                node = self._find_only_child_parent(grandparent_node)
-                if node.name == 'table' and node.parent:
-                    key = Candidate(node.parent)
-                    if key in candidates:
-                        candidates[key]['score'] += score * 0.3
-                grandparent_key = Candidate(node)
-                if grandparent_key not in candidates:
-                    candidates[grandparent_key] = self.gen_candidate(grandparent_node)
-                candidates[grandparent_key]['score'] += score * 0.6  # maybe half.
+                grandparent_node = self._find_only_child_parent(parent_key.node.parent)
+                if grandparent_node and grandparent_node != parent_key.node and grandparent_node.name:
+                    if grandparent_node.name == 'table' and grandparent_node.parent:
+                        key = Candidate(grandparent_node.parent)
+                        if key in candidates:
+                            candidates[candidates.index(key)].score += score * 0.3
+                    grandparent_key = Candidate(grandparent_node)
+                    try:
+                        idx = candidates.index(grandparent_key)
+                        grandparent_key = candidates[idx]
+                    except ValueError:
+                        grandparent_key.score = self.gen_candidate_score(grandparent_node)
+                        candidates.append(grandparent_key)
+                    grandparent_key.score += score * 0.6  # maybe half.
 
         # Scale the final candidates score based on link density. Good content should have a
         # relatively small link density (5% or less) and be mostly unaffected by this operation.
         for elem in invalid_elems:
-            candidates.pop(Candidate(elem), None)
             elem.extract()
-        for key, candidate in candidates.items():
-            candidate['score'] *= (1 - self._get_link_density(candidate['elem']))
-        return candidates
+        for candidate in candidates:
+            candidate.score *= (1 - self._get_link_density(candidate.node))
+        return sorted(candidates, key=lambda x: x.score, reverse=True)
 
     @staticmethod
     def _get_punctuations_score(text):
@@ -568,65 +576,81 @@ class ArticleExtractor:
         if self._is_json_capable(response):
             return Article()
         root = self._clean_root(response.soup('lxml'))
-        content_node = body = root.find('body') or root
+        source = content_node = body = root.find('body') or root
         candidates = self._get_candidates(body, response)
-        sorted_candidates = sorted(candidates.values(), key=lambda x: x['score'], reverse=True)
 
         author = self._extract_author(root)
-        if len(sorted_candidates) != 0:
-            best_candidate = sorted_candidates[0]
-            content_node = self._finalize_content(candidates, best_candidate)
-        title = self._extract_title(root, content_node)
-        pubdate = self._extract_pubdate(root, content_node)
-        article = Article(content=str(content_node), title=title, publish_date=pubdate, author=author)
+        if len(candidates) != 0:
+            best_candidate = candidates[0]
+            candidate = self._finalize_content(best_candidate, candidates=candidates)
+            source = candidate.source
+            content_node = candidate.node
+        title = self._title or self._extract_title(root, source)
+        pubdate = self._extract_pubdate(root, source)
+        article = Article(content=str(content_node), title=title, source=str(source), publish_date=pubdate, author=author)
         if self.on_extract:
             self.on_extract(root=root, content_node=content_node, article=article)
         return article
 
-    def _finalize_content(self, candidates, best_candidate, recursive=True):
+    def _finalize_content(self, best_candidate, candidates, recursive=True):
         # Now that we have the top candidate, look through its siblings for content that might also be related.
         # Things like preambles, content split by ads that we removed, etc.
-        result = best_candidate['elem'].parent
-        if not result:
-            return best_candidate['elem']
+        best_candidate.finalize_source()
+        if not best_candidate.node.parent:
+            return best_candidate
+        result = Candidate(best_candidate.node.parent)
+        result.source = best_candidate.source.parent  # remain unchanged
 
-        contents = [each for each in result.contents if isinstance(each, Tag)]
-        parent = self._find_only_child_parent(result)
-        if len(contents) > 1 and all([each.name in ('h1', 'h2', 'h3') or each is best_candidate['elem'] for each in contents]):
-            return best_candidate['elem']
-        root = best_candidate['elem']
+        contents = [each for each in result.node.contents if isinstance(each, Tag)]
+        parent = self._find_only_child_parent(result.node)
+        parent_candidate = Candidate(parent)
+        parent_candidate.finalize_source()
+        if len(contents) > 1 and all([each.name in ('h1', 'h2', 'h3') or each is best_candidate.node for each in contents]):
+            return best_candidate
+
+        root = best_candidate.node
         while root.parent:
             root = root.parent
-        title = self._title_from_meta(root)
-        score = best_candidate['score']
+        title = self._format_title(self._title or self._title_from_meta(root))
+        score = best_candidate.score
         sibling_score_threshold = max([10, score * 0.2])
 
+        positioned = False
         continuous_text = False
         invalid_siblings = []
         for sibling in contents:
-            if sibling is best_candidate['elem']:
+            if sibling is best_candidate.node:
+                positioned = True  # don't mark tags as invalid between positioned and next valid.
                 continue
             if sibling.name not in ("b", "p", "span", "h1", "h2", "h3"):
                 continuous_text = False
             sibling_key = Candidate(sibling)
-            if sibling_key in candidates and candidates[sibling_key]['score'] >= sibling_score_threshold:
-                score += candidates[sibling_key]['score']
+            if sibling_key in candidates and candidates[candidates.index(sibling_key)].score >= sibling_score_threshold:
+                score += candidates[candidates.index(sibling_key)].score
+                if positioned:
+                    invalid_siblings.clear()
                 continue
             elif sibling.name in ("b", "p", "span", "h1", "h2", "h3"):
                 if continuous_text:
+                    if positioned:
+                        invalid_siblings.clear()
                     continue
                 link_density = self._get_link_density(sibling)
                 node_content = sibling.get_text().strip()
                 node_length = len(node_content)
                 if node_length > 80 and link_density < 0.25:
                     continuous_text = True
+                    if positioned:
+                        invalid_siblings.clear()
                     continue
                 elif node_length < 80 and link_density == 0 and re.search(r'[.。]( |$)', node_content):
                     continuous_text = True
+                    if positioned:
+                        invalid_siblings.clear()
                     continue
                 continuous_text = False
-            elif title and title in sibling.get_text().strip():
-                if title == sibling.get_text().strip():
+            elif title and title in self._format_title(sibling.get_text()):
+                if title == self._format_title(sibling.get_text()):
                     # won't affect extract title.
                     invalid_siblings.append(sibling)
                     continue
@@ -645,12 +669,12 @@ class ArticleExtractor:
                     text = each.get('title') or each.get('popover') or each.get_text().strip()
                     ext = self.ext_extractor.extract(href, source_type='url') or self.ext_extractor.extract(text)
                     attrs_text = "".join(each.get('class', [])) + each.get('id', '') + each.get('alt', '')
-                    if href.startswith(('javascript', 'window.')) or not ext or re.search(r'qrcode|二维码', attrs_text):
+                    if href.startswith(('javascript', 'window.')) or not ext or re.search(r'qrcode|二维码|首页', attrs_text):
                         invalid = True
                         break
                 link_density = self._get_link_density(sibling)
                 if not invalid and link_density >= 0.5:
-                    if contents.index(sibling) < contents.index(best_candidate['elem']):
+                    if contents.index(sibling) < contents.index(best_candidate.node):
                         invalid = True
                 attrs_text = "".join(sibling.get('class', [])) + sibling.get('id', '') + sibling.get('alt', '')
                 attrs_text = attrs_text.lower()
@@ -660,10 +684,10 @@ class ArticleExtractor:
 
         siblings = parent.parent.contents if parent.parent else []
         siblings = [each for each in siblings if isinstance(each, Tag) and each.get_text().strip()]
-        title_from_outside = title and title not in result.get_text() and root.find('body') and title in root.find('body').get_text()
+        title_from_outside = title and title not in self._format_title(result.get_text()) and root.find('body') and title in root.find('body').get_text()
         try_extend = (
-            (not title and parent != result)
-            or not result.find_all(lambda x: x.name in ("h2", "h3", "h4"))
+            (not title and parent != result.node)
+            or not result.node.find_all(lambda x: x.name in ("h2", "h3", "h4"))
             or title_from_outside and (not siblings or siblings[-1] is not parent)
         )
 
@@ -676,7 +700,7 @@ class ArticleExtractor:
             for non_h_tag in non_h_tags:
                 non_h_tag.extract()
             if sibling.name in ('h1', 'h2', 'h3', 'h4') or sibling.find(lambda x: x.name in ("h1", "h2")):
-                if sibling.get_text().strip() != title and contents.index(sibling) < contents.index(best_candidate['elem']):
+                if sibling.get_text().strip() != title and contents.index(sibling) < contents.index(best_candidate.node):
                     # avoid extract uncaught titles
                     continue
             sibling.extract()
@@ -689,9 +713,9 @@ class ArticleExtractor:
                 break
             depth -= 1
             node = node.parent
+        parent_candidate.score = score
         if try_extend and recursive:
-            best_candidate = {'elem': parent, 'score': score}
-            return self._finalize_content(candidates, best_candidate, recursive=False)
+            return self._finalize_content(parent_candidate, candidates, recursive=False)
         elif siblings:
             reserved_nodes = []
             for sibling in siblings[siblings.index(parent) + 1:]:
@@ -700,6 +724,5 @@ class ArticleExtractor:
                 if all([a.get('href', '').endswith(('.pdf', '.doc', '.docx', '.xlsx', '.xls', '.jpg', '.png')) for a in sibling.find_all('a')]):
                     reserved_nodes.append(sibling)
             if reserved_nodes:
-                best_candidate = {'elem': parent, 'score': score}
-                return self._finalize_content(candidates, best_candidate, recursive=False)
+                return self._finalize_content(parent_candidate, candidates, recursive=False)
         return result
