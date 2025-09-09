@@ -476,7 +476,7 @@ class ArticleExtractor:
                 if contents and len(contents[0]) > 4:
                     title = contents[0]
 
-        if page_title and page_title != title and page_title in self._format_title(content_node.get_text())[:50]:
+        if page_title and not title or page_title != title and page_title in self._format_title(content_node.get_text())[:50]:
             tmp = re.split(r'[-_|]', page_title)
             if tmp and len(tmp[0]) >= 4:
                 title = tmp[0]
