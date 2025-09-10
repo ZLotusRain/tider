@@ -99,7 +99,7 @@ IGNORED_PARAGRAPHS = (
     '【打印本页】', '【关闭窗口】', '【打印页面】', '【关闭页面】', '【TOP】',
     '上一篇：', '下一篇：', '字体：【大中小】', '字体大小：[大中小]', '字号：大中小',
     '【字体：大中小】', '【字体：小中大】', '【字体：大中小】打印', '【字体：大中小】打印分享：',
-    '【字体:  大  中  小】', '扫一扫在手机打开当前页', '扫码查看手机版', '是否打开信息无障碍浏览',
+    '【字体:  大  中  小】', '字号:〖大 中 小〗', '扫一扫在手机打开当前页', '扫码查看手机版', '是否打开信息无障碍浏览',
 )
 
 # if one tag in the follow list does not contain any child node nor content, it could be removed
@@ -194,7 +194,7 @@ class Candidate:
             self._path = tuple(reverse_path)
         return self._path
 
-    def get_text(self, separator: str = "", strip: bool = False, ):
+    def get_text(self, separator: str = "", strip: bool = False):
         return self.node.get_text(separator=separator, strip=strip)
 
     def __hash__(self):
@@ -304,10 +304,11 @@ class ArticleExtractor:
         return node
 
     @staticmethod
-    def _find_only_child_parent(node: Tag):
+    def _find_only_child_parent(node: Tag, stop_util=('body', )):
+        stop_util = set(stop_util) | {'body', } if stop_util else {'body', }
         while (
             node.parent
-            and node.parent.name != 'body'
+            and node.parent.name not in stop_util
             and len([c for c in node.parent.children if isinstance(c, Tag) and c.name != 'br']) == 1
         ):
             node = node.parent
@@ -325,7 +326,8 @@ class ArticleExtractor:
 
     def _tag_weight(self, e):
         multiplier = 1
-        hints = " ".join(e.get('class') or []) + (e.get('id') or "")
+        hints = " ".join(e.get('class') or []) + e.get('id', '')
+        hints = hints.lower()
         if re.search(self._tag_regexes['positives'], hints):
             multiplier += 1
         if re.search(self._tag_regexes['negatives'], hints):
@@ -410,19 +412,23 @@ class ArticleExtractor:
                 parent_key.score += score
 
                 grandparent_node = self._find_only_child_parent(parent_key.node.parent)
-                if grandparent_node and grandparent_node != parent_key.node and grandparent_node.name:
-                    if grandparent_node.name == 'table' and grandparent_node.parent:
-                        key = Candidate(grandparent_node.parent)
-                        if key in candidates:
-                            candidates[candidates.index(key)].score += score * 0.3
-                    grandparent_key = Candidate(grandparent_node)
-                    try:
-                        idx = candidates.index(grandparent_key)
-                        grandparent_key = candidates[idx]
-                    except ValueError:
-                        grandparent_key.score = self.gen_candidate_score(grandparent_node)
-                        candidates.append(grandparent_key)
-                    grandparent_key.score += score * 0.6  # maybe half.
+                if grandparent_node and grandparent_node != parent_key.node:
+                    if not grandparent_node.parent or grandparent_node.parent.name not in ('td', 'p', 'span'):
+                        grandparent_key = Candidate(grandparent_node)
+                        try:
+                            idx = candidates.index(grandparent_key)
+                            grandparent_key = candidates[idx]
+                        except ValueError:
+                            grandparent_key.score = self.gen_candidate_score(grandparent_node)
+                            candidates.append(grandparent_key)
+                        if grandparent_node.name == 'table':
+                            grandparent_key.score += score * 0.4
+                            if grandparent_node.parent:
+                                key = Candidate(grandparent_node.parent)
+                                if key in candidates:
+                                    candidates[candidates.index(key)].score += score * 0.3
+                        else:
+                            grandparent_key.score += score * 0.6  # maybe half.
 
         # Scale the final candidates score based on link density. Good content should have a
         # relatively small link density (5% or less) and be mostly unaffected by this operation.
