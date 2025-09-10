@@ -99,7 +99,8 @@ IGNORED_PARAGRAPHS = (
     '【打印本页】', '【关闭窗口】', '【打印页面】', '【关闭页面】', '【TOP】',
     '上一篇：', '下一篇：', '字体：【大中小】', '字体大小：[大中小]', '字号：大中小',
     '【字体：大中小】', '【字体：小中大】', '【字体：大中小】打印', '【字体：大中小】打印分享：',
-    '【字体:  大  中  小】', '字号:〖大 中 小〗', '扫一扫在手机打开当前页', '扫码查看手机版', '是否打开信息无障碍浏览',
+    '【字体:  大  中  小】', '字号:〖大 中 小〗', '字体:',
+    '扫一扫在手机打开当前页', '扫码查看手机版', '是否打开信息无障碍浏览',
 )
 
 # if one tag in the follow list does not contain any child node nor content, it could be removed
@@ -478,9 +479,14 @@ class ArticleExtractor:
                         break
                     title_tags.extend(child.find_all('h2') or child.find_all('h3') or child.find_all('h1'))
             if title_tags:
-                contents = [each.get_text().strip() for each in title_tags[-1].contents if self._get_text(each)]
-                if contents and len(contents[0]) > 4:
-                    title = contents[0]
+                node_len = len(str(node))
+                for title_tag in title_tags[::-1]:
+                    if str(node).index(str(title_tag)) > node_len * 0.7:
+                        continue
+                    contents = [each.get_text().strip() for each in title_tag.contents if self._get_text(each)]
+                    if contents and len(contents[0]) > 4:
+                        title = contents[0]
+                        break
 
         if page_title and not title or page_title != title and page_title in self._format_title(content_node.get_text())[:50]:
             tmp = re.split(r'[-_|]', page_title)
