@@ -15,6 +15,7 @@ class CurlParser(argparse.ArgumentParser):
 
 curl_parser = CurlParser()
 curl_parser.add_argument('url')
+curl_parser.add_argument('-b', dest='cookie')
 curl_parser.add_argument('-H', '--header', dest='headers', action='append')
 curl_parser.add_argument('-X', '--request', dest='method')
 curl_parser.add_argument('-d', '--data', '--data-raw', dest='data')
@@ -37,6 +38,9 @@ for argument in safe_to_ignore_arguments:
 def _parse_headers_and_cookies(parsed_args):
     headers = []
     cookies = {}
+    if parsed_args.cookie:
+        for name, morsel in SimpleCookie(parsed_args.cookie).items():
+            cookies[name] = morsel.value
     for header in parsed_args.headers or ():
         name, val = header.split(':', 1)
         name = name.strip()
