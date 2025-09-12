@@ -323,7 +323,8 @@ class ArticleExtractor:
             title = a_tag.get('title') or a_tag.get('popover') or a_tag.get_text().strip()
             if href and not (self.ext_extractor.extract(href, source_type='url') or self.ext_extractor.extract(title)):
                 link_text += a_tag.text or ""
-        return float(len(link_text)) / max(len(text), 1)
+        # text maybe in attrs.
+        return min(float(len(link_text)) / max(len(text), 1), 1)
 
     def _tag_weight(self, e):
         multiplier = 1
