@@ -92,14 +92,19 @@ DATETIME_PATTERNS = [
     r"(\d{2}[-|/|.]\d{1,2}[-|/|.]\d{1,2})",
 ]
 
-AUTHOR_PATTERN = r"(?:责编|责任编辑|作者|编辑|文|原创|撰文|来源)[：|:| |丨|/]\s*([\u4E00-\u9FA5a-zA-Z]{2,20})[^\u4E00-\u9FA5|:|：]"
+AUTHOR_PATTERN = r"(?:责编|责任编辑|作者|编辑|文|原创|撰文|来源|发布机构|发布单位)[：|:| |丨|/]\s*([\u4E00-\u9FA5a-zA-Z]{2,20})[^\u4E00-\u9FA5|:|：]"
+
+TITLE_PATTERNS = [
+    r"关于.*?通知",
+    r"关于.*?公告"
+]
 
 IGNORED_PARAGRAPHS = (
     '首页', '分享到', '分享：', '分享', '打印此页', '关闭窗口', '打印', '关闭', '保存',
     '【打印本页】', '【关闭窗口】', '【打印页面】', '【关闭页面】', '【TOP】',
     '上一篇：', '下一篇：', '字体：【大中小】', '字体大小：[大中小]', '字号：大中小',
     '【字体：大中小】', '【字体：小中大】', '【字体：大中小】打印', '【字体：大中小】打印分享：',
-    '【字体:  大  中  小】', '字号:〖大 中 小〗', '字体:',
+    '【字体:  大  中  小】', '字号:〖大 中 小〗', '字体:', '【字体：大 中 小】',
     '扫一扫在手机打开当前页', '扫码查看手机版', '是否打开信息无障碍浏览',
 )
 
@@ -459,6 +464,13 @@ class ArticleExtractor:
                     title_tag = None
         return (title_tag.get('content', '') or title_tag.get_text()).strip() if title_tag else ""
 
+    @staticmethod
+    def _match_title(title):
+        for pattern in TITLE_PATTERNS:
+            if re.findall(pattern, title):
+                return True
+        return False
+
     def _extract_title(self, root, content_node):
         title = ""
         h_tags = root.find_all(lambda x: self._get_tag_name(x) in ('h1', 'h2', 'h3', 'h4', 'h5'))
@@ -483,16 +495,31 @@ class ArticleExtractor:
                         break
                     title_tags.extend(child.find_all('h2') or child.find_all('h3') or child.find_all('h1'))
             if title_tags:
-                node_len = len(str(node))
-                for title_tag in title_tags[::-1]:
-                    if str(node).index(str(title_tag)) > node_len * 0.7:
-                        continue
-                    contents = [each.get_text().strip() for each in title_tag.contents if self._get_text(each)]
-                    if contents and len(contents[0]) > 4:
-                        title = contents[0]
-                        break
+                maybe_titles = [self._format_title(t.get_text()) for t in title_tags[:-1]]
+                if self._format_title(page_title) in maybe_titles:
+                    title = page_title
+                else:
+                    node_len = len(str(node))
+                    for title_tag in title_tags[::-1]:
+                        if str(node).index(str(title_tag)) > node_len * 0.7:
+                            continue
+                        contents = [each.get_text().strip() for each in title_tag.contents if self._get_text(each)]
+                        if contents and len(contents[0]) > 4:
+                            title = contents[0]
+                            break
+            content_text = self._format_title(content_node.get_text())
+            if page_title and title and title != page_title and self._format_title(page_title) in content_text:
+                # actual title not in h tags.
+                try:
+                    if content_text.index(self._format_title(page_title)) < content_text.index(self._format_title(title)):
+                        title = page_title
+                except ValueError:
+                    pass
+                if title != page_title:
+                    if self._match_title(page_title) and not self._match_title(title):
+                        title = page_title
 
-        if page_title and not title or page_title != title and page_title in self._format_title(content_node.get_text())[:50]:
+        if page_title and (not title or page_title != title and page_title in self._format_title(content_node.get_text())[:50]):
             tmp = re.split(r'[-_|]', page_title)
             if tmp and len(tmp[0]) >= 4:
                 title = tmp[0]
