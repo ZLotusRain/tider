@@ -253,6 +253,10 @@ class ArticleExtractor:
         return title
 
     @staticmethod
+    def _get_tag_name(tag: Tag) -> str:
+        return tag.name.lower()
+
+    @staticmethod
     def _get_text(tag: Tag):
         s = tag.get_text().replace("\xa0", "").strip()
         spaces = ["&nbsp;", "&ensp;", "&emsp;", "&thinsp;", "&zwnj;", "&zwj;", "&#x0020;", "&#x0009;",
@@ -265,20 +269,20 @@ class ArticleExtractor:
     def _clean_root(self, root: Tag) -> Tag:
         invalid_nodes = []
         for each in root.find_all(recursive=True):
-            if each.name in ("script", "style"):
+            if self._get_tag_name(each) in ("script", "style"):
                 invalid_nodes.append(each)
-            elif each.name == 'a':
+            elif self._get_tag_name(each) == 'a':
                 if not each.get('href') and not each.get('title'):
                     invalid_nodes.append(each)
-            elif each.name == 'div' and not each.find_all(recursive=False) and not each.get_text().strip():
+            elif self._get_tag_name(each) == 'div' and not each.find_all(recursive=False) and not each.get_text().strip():
                 invalid_nodes.append(each)
             elif self._get_text(each) in self.ignored_paragraphs:
                 invalid_nodes.append(each)
-            elif not self._get_text(each) and each.name in TAGS_CAN_BE_REMOVE_IF_EMPTY and not [c for c in each.children]:
+            elif not self._get_text(each) and self._get_tag_name(each) in TAGS_CAN_BE_REMOVE_IF_EMPTY and not [c for c in each.children]:
                 invalid_nodes.append(each)
-            elif each.name == 'b' and not self._get_text(each):
+            elif self._get_tag_name(each) == 'b' and not self._get_text(each):
                 invalid_nodes.append(each)
-            elif each.name in ('h2', 'h3', 'h4'):
+            elif self._get_tag_name(each) in ('h2', 'h3', 'h4'):
                 for small in each.find_all('small'):
                     invalid_nodes.append(small)
             elif 'display:none' in each.get('style', ''):
@@ -290,7 +294,7 @@ class ArticleExtractor:
             each.extract()
             contents = node.contents
             text = "".join(c.get_text().strip() for c in contents).strip()
-            if not text and node.name not in ('p', 'b', 'td', 'h1', 'h2', 'h3', 'h4' 'h5'):
+            if not text and self._get_tag_name(node) not in ('p', 'b', 'td', 'h1', 'h2', 'h3', 'h4' 'h5'):
                 # don't affect select candidates.
                 node.extract()
         return root
@@ -300,17 +304,16 @@ class ArticleExtractor:
             if not isinstance(child, Tag):
                 continue
             child = self._clean_node(child)
-            if not self._get_text(child) and child.name in TAGS_CAN_BE_REMOVE_IF_EMPTY and not [c for c in child.children]:
+            if not self._get_text(child) and self._get_tag_name(child) in TAGS_CAN_BE_REMOVE_IF_EMPTY and not [c for c in child.children]:
                 child.extract()
         return node
 
-    @staticmethod
-    def _find_only_child_parent(node: Tag, stop_util=('body', )):
+    def _find_only_child_parent(self, node: Tag, stop_util=('body', )):
         stop_util = set(stop_util) | {'body', } if stop_util else {'body', }
         while (
             node.parent
-            and node.parent.name not in stop_util
-            and len([c for c in node.parent.children if isinstance(c, Tag) and c.name != 'br']) == 1
+            and self._get_tag_name(node.parent) not in stop_util
+            and len([c for c in node.parent.children if isinstance(c, Tag) and self._get_tag_name(c) != 'br']) == 1
         ):
             node = node.parent
         return node
@@ -337,7 +340,7 @@ class ArticleExtractor:
         return (multiplier - 1) * 25
 
     def gen_candidate_score(self, elem):
-        name = elem.name.lower()
+        name = self._get_tag_name(elem)
         score = self._tag_weight(elem)
         if name == 'ucapcontent':
             score += 10
@@ -357,10 +360,10 @@ class ArticleExtractor:
 
         def _filter(t):
             flag = False
-            if t.name in ('p', 'b', 'td', 'span', 'iframe', 'img', 'div'):
+            if self._get_tag_name(t) in ('p', 'b', 'td', 'span', 'iframe', 'img', 'div'):
                 flag = True
                 tp = t.parent
-                while tp and tp.name not in ('p', 'b', 'span'):
+                while tp and self._get_tag_name(tp) not in ('p', 'b', 'span'):
                     # td tag may include the whole content.
                     tp = tp.parent
                 if tp:
@@ -370,26 +373,26 @@ class ArticleExtractor:
         for elem in body.find_all(name=_filter):
             score = 1
             inner_text = elem.get_text().strip()
-            if elem.name == 'div':
+            if self._get_tag_name(elem) == 'div':
                 if (
                     elem.get('id')
                     or not self._get_text(elem)
-                    or any(filter(lambda x: isinstance(x, Tag) and x.name != 'br', elem.contents))
+                    or any(filter(lambda x: isinstance(x, Tag) and self._get_tag_name(x) != 'br', elem.contents))
                 ):
                     continue
                 # div which only contains innerText
                 elem.name = 'p'
-            if elem.name in ('p', 'span'):
-                if not self._get_text(elem) and all([not isinstance(e, Tag) or e.name == 'br' for e in elem.contents]):
+            if self._get_tag_name(elem) in ('p', 'span'):
+                if not self._get_text(elem) and all([not isinstance(e, Tag) or self._get_tag_name(e) == 'br' for e in elem.contents]):
                     invalid_elems.append(elem)
                     continue
-            if elem.name in ('iframe', 'img'):
+            if self._get_tag_name(elem) in ('iframe', 'img'):
                 src = elem.get('src', '')
                 if (
                     not src
                     or src.startswith(('window.', 'javascript'))
                     or parse_url_host(response.urljoin(src)) != parse_url_host(response.url)
-                    or elem.name == 'img' and self._find_only_child_parent(elem).name not in ('p', 'span')
+                    or self._get_tag_name(elem) == 'img' and self._get_tag_name(self._find_only_child_parent(elem)) not in ('p', 'span')
                 ):
                     continue
                 score += 8
@@ -399,7 +402,7 @@ class ArticleExtractor:
                 score += self._get_punctuations_score(inner_text)
 
             parent_node = elem.parent
-            if not parent_node or parent_node.name == 'body':
+            if not parent_node or self._get_tag_name(parent_node) == 'body':
                 key = Candidate(elem, score=score)
                 if key not in candidates:
                     candidates.append(key)
@@ -415,7 +418,7 @@ class ArticleExtractor:
 
                 grandparent_node = self._find_only_child_parent(parent_key.node.parent)
                 if grandparent_node and grandparent_node != parent_key.node:
-                    if not grandparent_node.parent or grandparent_node.parent.name not in ('td', 'p', 'span'):
+                    if not grandparent_node.parent or self._get_tag_name(grandparent_node.parent) not in ('td', 'p', 'span'):
                         grandparent_key = Candidate(grandparent_node)
                         try:
                             idx = candidates.index(grandparent_key)
@@ -423,7 +426,7 @@ class ArticleExtractor:
                         except ValueError:
                             grandparent_key.score = self.gen_candidate_score(grandparent_node)
                             candidates.append(grandparent_key)
-                        if grandparent_node.name == 'table':
+                        if self._get_tag_name(grandparent_node) == 'table':
                             grandparent_key.score += score * 0.4
                             if grandparent_node.parent:
                                 key = Candidate(grandparent_node.parent)
@@ -448,7 +451,7 @@ class ArticleExtractor:
     def _title_from_meta(root):
         title_tag = root.find('meta', attrs={'name': 'ArticleTitle'})
         if not title_tag:
-            site_meta = root.find(lambda x: x.name == 'meta' and x.get('name', '').lower() == 'sitename')
+            site_meta = root.find(lambda x: x.name.lower() == 'meta' and x.get('name', '').lower() == 'sitename')
             sitename = site_meta.get('content') or '' if site_meta else ''
             title_tag = root.find('title')
             if title_tag and sitename:
@@ -458,7 +461,7 @@ class ArticleExtractor:
 
     def _extract_title(self, root, content_node):
         title = ""
-        h_tags = root.find_all(lambda x: x.name in ('h1', 'h2', 'h3', 'h4', 'h5'))
+        h_tags = root.find_all(lambda x: self._get_tag_name(x) in ('h1', 'h2', 'h3', 'h4', 'h5'))
         page_title = self._title_from_meta(root)
         for h_tag in h_tags:
             lcs = get_longest_common_sub_string(page_title, h_tag.get_text().strip())
@@ -468,7 +471,7 @@ class ArticleExtractor:
 
         if not title:
             source = node = self._find_only_child_parent(content_node.parent) if content_node.parent else content_node
-            title_tags = node.find_all(lambda x: x.name in ('h1', 'h2', 'h3'))
+            title_tags = node.find_all(lambda x: self._get_tag_name(x) in ('h1', 'h2', 'h3'))
             if not title_tags or len(title_tags) == 1 and str(node).index(str(title_tags[0])) > len(str(node)) * 0.65:
                 title_tags = []
                 node = node.parent
@@ -505,7 +508,7 @@ class ArticleExtractor:
     def _extract_pubdate(root, content_node):
         pubdate = ""
         meta_tag = root.find_all(
-            lambda x: x.name == 'meta'
+            lambda x: x.name.lower() == 'meta'
             and (
                 x.get('name', '').startswith(
                     ('OriginalPublicationDate', 'article_date_original', 'og:time', 'apub:time',
@@ -620,7 +623,7 @@ class ArticleExtractor:
         parent = self._find_only_child_parent(result.node)
         parent_candidate = Candidate(parent)
         parent_candidate.finalize_source()
-        if len(contents) > 1 and all([each.name in ('h1', 'h2', 'h3') or each is best_candidate.node for each in contents]):
+        if len(contents) > 1 and all([self._get_tag_name(each) in ('h1', 'h2', 'h3') or each is best_candidate.node for each in contents]):
             return best_candidate
 
         root = best_candidate.node
@@ -637,15 +640,19 @@ class ArticleExtractor:
             if sibling is best_candidate.node:
                 positioned = True  # don't mark tags as invalid between positioned and next valid.
                 continue
-            if sibling.name not in ("b", "p", "span", "h1", "h2", "h3"):
+            if self._get_tag_name(sibling) not in ("b", "p", "span", "h1", "h2", "h3"):
                 continuous_text = False
             sibling_key = Candidate(sibling)
             if sibling_key in candidates and candidates[candidates.index(sibling_key)].score >= sibling_score_threshold:
                 score += candidates[candidates.index(sibling_key)].score
                 if positioned:
                     invalid_siblings.clear()
+                if self._get_tag_name(sibling) in ("b", "p", "span", "h1", "h2", "h3"):
+                    continuous_text = True
+                if all([self._get_tag_name(c) in ("b", "p", "span", "h1", "h2", "h3", "br") for c in sibling.contents if isinstance(c, Tag)]):
+                    continuous_text = True
                 continue
-            elif sibling.name in ("b", "p", "span", "h1", "h2", "h3"):
+            elif self._get_tag_name(sibling) in ("b", "p", "span", "h1", "h2", "h3"):
                 if continuous_text:
                     if positioned:
                         invalid_siblings.clear()
@@ -672,14 +679,14 @@ class ArticleExtractor:
                 for node in sibling.contents:
                     if not isinstance(node, Tag):
                         continue
-                    for each in node.find_all(lambda x: x.name in ("img", "iframe", "a")):
+                    for each in node.find_all(lambda x: self._get_tag_name(x) in ("img", "iframe", "a")):
                         href = each.get('href') or each.get('src') or ""
                         if not href.startswith(('/', './', '../', 'http')) or href.endswith(('.html', '.htm', '.shtml', '.jsp')):
                             invalid_siblings.append(self._find_only_child_parent(each))
                 continue
-            elif sibling.find(lambda x: x.name in ("img", "iframe", "a")):
+            elif sibling.find(lambda x: self._get_tag_name(x) in ("img", "iframe", "a")):
                 invalid = False
-                for each in sibling.find_all(lambda x: x.name in ("img", "iframe", "a")):
+                for each in sibling.find_all(lambda x: self._get_tag_name(x) in ("img", "iframe", "a")):
                     href = each.get('href') or each.get('src') or ""
                     text = each.get('title') or each.get('popover') or each.get_text().strip()
                     ext = self.ext_extractor.extract(href, source_type='url') or self.ext_extractor.extract(text)
@@ -702,7 +709,7 @@ class ArticleExtractor:
         title_from_outside = title and title not in self._format_title(result.get_text()) and root.find('body') and title in root.find('body').get_text()
         try_extend = (
             (not title and parent != result.node)
-            or not result.node.find_all(lambda x: x.name in ("h2", "h3", "h4"))
+            or not result.node.find_all(lambda x: self._get_tag_name(x) in ("h2", "h3", "h4"))
             or title_from_outside and (not siblings or siblings[-1] is not parent)
         )
 
@@ -710,11 +717,11 @@ class ArticleExtractor:
         for sibling in invalid_siblings:
             non_h_tags = []
             for each in sibling.contents:
-                if not isinstance(each, Tag) or each.name not in ('h1', 'h2', 'h3', 'h4'):
+                if not isinstance(each, Tag) or self._get_tag_name(each) not in ('h1', 'h2', 'h3', 'h4'):
                     non_h_tags.append(each)
             for non_h_tag in non_h_tags:
                 non_h_tag.extract()
-            if sibling.name in ('h1', 'h2', 'h3', 'h4') or sibling.find(lambda x: x.name in ("h1", "h2")):
+            if self._get_tag_name(sibling) in ('h1', 'h2', 'h3', 'h4') or sibling.find(lambda x: self._get_tag_name(x) in ("h1", "h2")):
                 if sibling.get_text().strip() != title and contents.index(sibling) < contents.index(best_candidate.node):
                     # avoid extract uncaught titles
                     continue
@@ -723,7 +730,7 @@ class ArticleExtractor:
         depth = 2
         node = parent
         while depth >= 0 and try_extend:
-            if node and node.name == 'body':
+            if node and self._get_tag_name(node) == 'body':
                 try_extend = False
                 break
             depth -= 1
