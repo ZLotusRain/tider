@@ -27,7 +27,7 @@ from tider import signals
 from tider.brokers import Broker
 from tider.utils.log import get_logger
 from tider.utils.crypto import set_md5
-from tider.utils.time import humanize_seconds
+from tider.utils.time import humanize_seconds, preferred_clock
 from tider.utils.text import truncate, indent as textindent
 
 __all__ = ('AMQPBroker', )
@@ -690,11 +690,17 @@ class AMQPBroker(Broker):
         self._restore_messages(consumer)
 
         logged = False
+        if getattr(connection.transport, 'driver_type', None):
+            should_rebalance = connection.transport.driver_type in ('kafka', 'confluentkafka')
+        else:
+            should_rebalance = self.crawler.broker_transport in ('kafka', 'confluentkafka')
+        elapsed = 0
         try:
             while not self._stopped.is_set():
                 try:
                     connection.drain_events(timeout=2.0)
                     logged = False
+                    elapsed = 0
                 except socket.timeout:
                     on_message_consumed and on_message_consumed()
                     if not logged:
@@ -703,6 +709,21 @@ class AMQPBroker(Broker):
                                     f"queues: {','.join([queue.name for queue in consumer.queues])}")
                     logged = True
                     consumer.channel.qos._flush()  # clear dirty.
+                    if should_rebalance:
+                        if not elapsed:
+                            elapsed = preferred_clock()
+                        elif preferred_clock() - elapsed > 60 * 5:
+                            elapsed = 0
+                            logger.info('No messages fetched, try rebalancing...')
+                            ignore_errors(connection, consumer.close)
+                            connection.release()
+
+                            connection = self.connect(transport_options=transport_options)
+                            consumer = self.MessageConsumer(channel=connection, queues=queues,
+                                                            accept=None, on_decode_error=on_decode_error)
+                            consumer.on_message = on_message
+                            consumer.consume()
+                            self._restore_messages(consumer)
                 except connection.connection_errors:
                     logger.warning('Broker connection has broken, try reconnecting...')
                     ignore_errors(connection, consumer.close)
