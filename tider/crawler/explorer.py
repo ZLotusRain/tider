@@ -14,6 +14,7 @@ from tider.exceptions import (
     HTTPError,
     ProxyError,
     InvalidProxy,
+    InvalidSelectedProxy,
     ExclusiveProxy,
     Timeout,
     SpiderShutdown,
@@ -100,7 +101,7 @@ class ConcurrencyLimits:
 
 class Explorer:
 
-    def __init__(self, crawler, concurrency=4, concurrency_limits=None, priority_adjust=0):
+    def __init__(self, crawler, concurrency=4, concurrency_limits=None, priority_adjust=0, retry_until_valid_proxy=True):
         self._crawler = crawler
         self.concurrency = concurrency
         self.pool = crawler.create_pool(limit=concurrency, thread_name_prefix="ExplorerWorker")
@@ -109,6 +110,7 @@ class Explorer:
         self.session: Optional[Session] = build_from_crawler(Session, crawler)
         self.proxypool = build_from_crawler(ProxyPoolManager, crawler)
         self.priority_adjust = priority_adjust  # adjust priority when retrying.
+        self.retry_until_valid_proxy = retry_until_valid_proxy
 
         self.loop = crawler.settings.getbool('EXPLORER_USE_LOOP', False)
         self.queue = deque()
@@ -123,7 +125,8 @@ class Explorer:
             crawler=crawler,
             concurrency=crawler.concurrency,
             concurrency_limits=crawler.settings.getdict('EXPLORER_CONCURRENCY_LIMITS'),
-            priority_adjust=crawler.settings.getint('EXPLORER_RETRY_PRIORITY_ADJUST')
+            priority_adjust=crawler.settings.getint('EXPLORER_RETRY_PRIORITY_ADJUST'),
+            retry_until_valid_proxy=crawler.settings.getint('EXPLORER_RETRY_UNTIL_VALID_PROXY')
         )
 
     def active(self):
@@ -352,9 +355,10 @@ class Explorer:
             if request.delay or (status_code and str(status_code).startswith("5")):
                 # update explore_after
                 request.meta['explore_after'] = time.monotonic() + (request.delay or 2)
-            request.meta['retry_times'] = retry_times
             request.dup_check = False
-            request.priority += self.priority_adjust
+            if not isinstance(exc, InvalidSelectedProxy) and self.retry_until_valid_proxy:
+                request.meta['retry_times'] = retry_times
+                request.priority += self.priority_adjust
             if response is not None:
                 response.close()
             self._crawler.stats.inc_value("request/count/retry")
