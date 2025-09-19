@@ -14,7 +14,7 @@ from tider.utils.misc import symbol_by_name, build_from_crawler
 from tider.utils.collections import DummyLock
 from tider.utils.time import preferred_clock
 from tider.utils.url import prepend_scheme_if_needed
-from tider.exceptions import InvalidProxy, ExclusiveProxy
+from tider.exceptions import InvalidProxy, InvalidSelectedProxy, ExclusiveProxy
 
 
 class _ProxyPoolMeta(type):
@@ -181,7 +181,7 @@ class Proxy:
         :param url: The url being for the request
         """
         if not self.valid:
-            raise InvalidProxy("Can't select from a discarded proxy.")
+            raise InvalidSelectedProxy("Can't select from a discarded proxy.")
         urlparts = urlparse(url)
         if urlparts.hostname is None:
             return self.proxies.get(urlparts.scheme, self.proxies.get("all"))
