@@ -108,6 +108,10 @@ class InvalidProxy(ProxyError):
     """Try to connect to an invalid proxy."""
 
 
+class InvalidSelectedProxy(InvalidProxy):
+    """Try to select to an invalid proxy."""
+
+
 class ExclusiveProxy(ProxyError):
     """Try to connect to a exclusive proxy."""
 
