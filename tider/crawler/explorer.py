@@ -356,7 +356,7 @@ class Explorer:
                 # update explore_after
                 request.meta['explore_after'] = time.monotonic() + (request.delay or 2)
             request.dup_check = False
-            if not isinstance(exc, InvalidSelectedProxy) and self.retry_until_valid_proxy:
+            if not isinstance(exc, InvalidSelectedProxy) or not self.retry_until_valid_proxy:
                 request.meta['retry_times'] = retry_times
                 request.priority += self.priority_adjust
             if response is not None:
