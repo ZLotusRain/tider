@@ -516,8 +516,8 @@ class Response:
         parse_times = meta.get('parse_times', 0) + 1
         meta.update(retry_times=0, parse_times=parse_times)
 
-        headers = kwargs.pop('headers', None) or self.request.headers
-        headers = dict(headers or {})
+        headers = dict(self.request.headers or {})
+        headers.update(kwargs.pop('headers', {}))
         if not keep_cookies:
             headers.pop('Cookie', None)
             meta['merge_cookies'] = False
