@@ -645,15 +645,18 @@ class AMQPBroker(Broker):
                     continue
                 M, EX, RK = loads(bytes_to_str(P))  # json is unicode
                 if RK:
-                    count += 1
-                    # delete after successfully restore.
-                    # lpush if leftmost else rpush.
-                    chan._do_restore_message(M, EX, RK, pipe, leftmost=False)
-                    if not use_client:
-                        pipe.zrem(chan.unacked_index_key, tag).hdel(chan.unacked_key, tag)
-                    else:
-                        pipe.zrem(chan.unacked_index_key, tag)
-                        pipe.hdel(chan.unacked_key, tag)
+                    try:
+                        # delete before successfully restore.
+                        if not use_client:
+                            pipe.zrem(chan.unacked_index_key, tag).hdel(chan.unacked_key, tag)
+                        else:
+                            pipe.zrem(chan.unacked_index_key, tag)
+                            pipe.hdel(chan.unacked_key, tag)
+                        # lpush if leftmost else rpush.
+                        chan._do_restore_message(M, EX, RK, pipe, leftmost=False)
+                        count += 1
+                    except redis.exceptions.ResponseError:
+                        logger.critical('Could not restore message: %r', M, exc_info=True)
             logger.info(f'Restored {count}/{len(data)} message(s) from {chan.unacked_key}')
 
         # restore at start.
