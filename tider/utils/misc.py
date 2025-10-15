@@ -5,8 +5,6 @@ import importlib
 from typing import Iterable
 from pkgutil import iter_modules
 
-from sympy.abc import lamda
-
 from tider.item import Item
 from tider.utils.log import get_logger
 
