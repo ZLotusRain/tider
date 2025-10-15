@@ -87,7 +87,7 @@ class FilesBroker(Broker):
         fp.close()
 
     def _consume_xls(self, file, on_message=None, on_message_consumed=None):
-        wb = xlrd.open_workbook(file_contents=file, on_demand=True)
+        wb = xlrd.open_workbook(file_contents=file.read(), on_demand=True)
         for sheet in wb.sheets():
             invalid_count = 0
             titles = None
