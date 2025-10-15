@@ -63,6 +63,7 @@ class Rule:
             return
         links = self.link_extractor.extract_links(response)
         self.process_links(links)
+        # add all to processing instead of trying stop.
         for link in links:
             if not self.link_allowed(link, response):
                 continue
@@ -120,9 +121,13 @@ class Rule:
 
     def on_processed(self, link, meta):
         try:
-            self._processing.remove(link)
+            if link is not None:
+                # avoid compare non-link object.
+                self._processing.remove(link)
         except ValueError:
             pass
+        if self.found and self.stop_on_found:
+            self._processing.clear()
         yield from self.maybe_on_stop(meta)
 
     def process_result(self, meta):
@@ -248,10 +253,8 @@ class ProbeSpider(Spider):
                 return
         if not self.response_allowed(response):
             for rule in link_rules:
-                if link:
-                    yield from probe_rules[rule].on_processed(link=link, meta=probe_meta)
-                elif start:
-                    yield from probe_rules[rule].maybe_on_stop(meta=probe_meta)
+                # link may be None if parsing start.
+                yield from probe_rules[rule].on_processed(link=link, meta=probe_meta)
             return
         if not response.ok:
             retry = False
@@ -263,10 +266,8 @@ class ProbeSpider(Spider):
                 retry = True
             if not retry:
                 for rule in link_rules:
-                    if link:
-                        yield from probe_rules[rule].on_processed(link=link, meta=probe_meta)
-                    elif start:
-                        yield from probe_rules[rule].maybe_on_stop(meta=probe_meta)
+                    # link may be None if parsing start.
+                    yield from probe_rules[rule].on_processed(link=link, meta=probe_meta)
             return
 
         rules = link_rules.copy()
@@ -283,10 +284,7 @@ class ProbeSpider(Spider):
         seen = probe_meta['seen']
         with seen:
             for rule in rules:
-                links = list(probe_rules[rule].get_links(response))  # add to processing.
-                if probe_rules[rule].found and probe_rules[rule].stop_on_found:
-                    yield from probe_rules[rule].maybe_on_stop(response.cb_kwargs['probe_meta'])
-                    continue
+                links = probe_rules[rule].get_links(response)
                 for new_link in links:
                     if new_link in seen or new_link['url'] in start_urls or new_link['url'].strip('/') in start_urls:
                         yield from probe_rules[rule].on_processed(new_link, meta=probe_meta)
@@ -298,10 +296,7 @@ class ProbeSpider(Spider):
                 seen.add(new_link)
 
         for rule in rules:
-            if link:
-                yield from probe_rules[rule].on_processed(link=link, meta=probe_meta)
-            elif start:
-                yield from probe_rules[rule].maybe_on_stop(meta=probe_meta)
+            yield from probe_rules[rule].on_processed(link=link, meta=probe_meta)  # link may be None if parsing start.
 
         for new_link in links_d:
             # extracted links
