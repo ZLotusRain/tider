@@ -235,14 +235,15 @@ class ProbeSpider(Spider):
         start = response.cb_kwargs.get('start', False)
         probe_meta = response.cb_kwargs['probe_meta']
         probe_rules = probe_meta['rules']
-        http_errors = (
-            response.request.url.startswith('http://') and
+        https_errors = (
+            response.request.url.startswith('https://') and
             ('WRONG_VERSION_NUMBER' in str(response._error) or
              'EOF occurred in violation of protocol' in str(response._error) or
+             '631 Internal Server Error' in str(response._error) or
              not response.status_code)
         )
-        if start and http_errors and self.retry_on_https_errors:
-            url = response.url.replace('https', 'http')
+        if start and https_errors and self.retry_on_https_errors:
+            url = response.request.url.replace('https', 'http')
             yield response.retry(url=url, meta={'depth': 0})
             return
         soup = response.soup('lxml')
