@@ -255,7 +255,7 @@ class LifoMemoryQueue(queue.LifoQueue):
 
     @classmethod
     def from_crawler(cls, crawler):
-        return cls(maxsize=crawler.settings.get('SCHEDULER_DOWNSTREAM_QUEUE_MAXSIZE') or 0)
+        return cls(maxsize=crawler.settings.get('SCHEDULER_DOWNSTREAM_QUEUE_MAXSIZE') or -1)
 
     def push(self, request):
         self.put(request)
@@ -276,7 +276,7 @@ class LifoMemoryQueue(queue.LifoQueue):
 class FifoMemoryQueue(queue.Queue):
     @classmethod
     def from_crawler(cls, crawler):
-        return cls(maxsize=crawler.settings.get('SCHEDULER_DOWNSTREAM_QUEUE_MAXSIZE') or 0)
+        return cls(maxsize=crawler.settings.get('SCHEDULER_DOWNSTREAM_QUEUE_MAXSIZE') or -1)
 
     def push(self, request):
         self.put(request)

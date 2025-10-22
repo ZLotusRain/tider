@@ -115,7 +115,7 @@ SCHEDULER = "tider.crawler.scheduler.Scheduler"
 SCHEDULER_MEMORY_QUEUE = "tider.pqueues.FifoMemoryQueue"
 SCHEDULER_PRIORITY_QUEUE = "tider.pqueues:ExplorerAwarePriorityQueue"
 SCHEDULER_BODY_PRIORITY_ADJUST = 0
-SCHEDULER_DOWNSTREAM_QUEUE_MAXSIZE = 0
+SCHEDULER_DOWNSTREAM_QUEUE_MAXSIZE = -1
 
 SPIDER_LOADER_CLASS = "tider.spiderloader.SpiderLoader"
 SPIDER_LOADER_WARN_ONLY = False
