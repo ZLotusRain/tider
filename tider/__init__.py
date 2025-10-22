@@ -77,11 +77,12 @@ def _patch_gevent():
 
     gevent.monkey.patch_all()
 
-    from gevent.queue import LifoQueue
-    from urllib3.connectionpool import ConnectionPool
-    # https://github.com/gevent/gevent/issues/1957
-    # https://github.com/urllib3/urllib3/issues/3289
-    ConnectionPool.QueueCls = LifoQueue
+    if int(gevent.__version__.split('.')[0]) < 25:
+        from gevent.queue import LifoQueue
+        from urllib3.connectionpool import ConnectionPool
+        # https://github.com/gevent/gevent/issues/1957
+        # https://github.com/urllib3/urllib3/issues/3289
+        ConnectionPool.QueueCls = LifoQueue
 
 
 def maybe_patch_concurrency(argv=None, short_opts=None,
