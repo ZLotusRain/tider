@@ -126,7 +126,7 @@ class Explorer:
             concurrency=crawler.concurrency,
             concurrency_limits=crawler.settings.getdict('EXPLORER_CONCURRENCY_LIMITS'),
             priority_adjust=crawler.settings.getint('EXPLORER_RETRY_PRIORITY_ADJUST'),
-            retry_until_valid_proxy=crawler.settings.getint('EXPLORER_RETRY_UNTIL_VALID_PROXY')
+            retry_until_valid_proxy=crawler.settings.getint('EXPLORER_RETRY_UNTIL_VALID_PROXY', True)
         )
 
     def active(self):
@@ -343,9 +343,11 @@ class Explorer:
 
     def get_retry_request(self, request, response, status_code=None, exc=None):
         retry_times = request.meta.get('retry_times', 0)
-        if not isinstance(exc, ExclusiveProxy):
+        priority = request.priority
+        if not isinstance(exc, ExclusiveProxy) and not (self.retry_until_valid_proxy and isinstance(exc, InvalidSelectedProxy)):
             # re-select proxy.
             retry_times += 1
+            priority += self.priority_adjust
         max_retries = request.max_retries
         if max_retries == -1 or retry_times <= max_retries:
             logger.debug(
@@ -356,9 +358,8 @@ class Explorer:
                 # update explore_after
                 request.meta['explore_after'] = time.monotonic() + (request.delay or 2)
             request.dup_check = False
-            if not isinstance(exc, InvalidSelectedProxy) or not self.retry_until_valid_proxy:
-                request.meta['retry_times'] = retry_times
-                request.priority += self.priority_adjust
+            request.meta['retry_times'] = retry_times
+            request.priority += self.priority_adjust
             if response is not None:
                 response.close()
             self._crawler.stats.inc_value("request/count/retry")
