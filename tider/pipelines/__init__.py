@@ -76,7 +76,7 @@ class ItemPipelineManager:
                     self.process_items(self.processing)
                     self.processing[:] = []
             finally:
-                self.crawler.maybe_sleep(0.01)
+                self.crawler.sleep(0.001)
         if self.processing:
             self.process_items(self.processing)
 

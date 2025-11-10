@@ -227,7 +227,7 @@ class Explorer:
                 # switch greenlet if using gevent
                 # when the active one can't get the next request
                 # to avoid keeping loop.
-                time.sleep(0.01)
+                self._crawler.sleep(0.001)
 
         del download_func, output_handler
         FREE_SLOTS.append(None)
@@ -285,7 +285,7 @@ class Explorer:
             retry_times = request.meta.get('retry_times', 0) + 1
             request.meta['retry_times'] = retry_times
             if delay > 0:
-                time.sleep(delay)
+                self._crawler.sleep(delay)
             response = self._explore(request)
         try:
             response.check_error()

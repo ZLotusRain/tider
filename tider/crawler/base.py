@@ -310,9 +310,13 @@ class Crawler:
             thread_local=thread_local, extend_timeout=extend_timeout
         )
 
-    def maybe_sleep(self, seconds):
-        import gevent
-        getattr(self.Pool, 'is_green', False) and gevent.sleep(seconds)
+    def sleep(self, seconds):
+        if getattr(self.Pool, 'is_green', False):
+            import gevent
+            gevent.sleep(seconds)
+        else:
+            # avoid stuck in some cases.
+            time.sleep(seconds)
 
     def send_task(self, task_id=None, task_type='message', args=None, kwargs=None, queue=None,
                   transport=None, **options):

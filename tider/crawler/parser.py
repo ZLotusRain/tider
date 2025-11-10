@@ -142,7 +142,7 @@ class Parser:
 
             order = 0
             # sleep to switch thread
-            for output in iter_generator(spider_outputs, sleep=self.crawler.maybe_sleep):
+            for output in iter_generator(spider_outputs, sleep=self.crawler.sleep):
                 # maybe iter spider outputs directly.
                 state.maybe_shutdown()
                 if self._spider_output_filter(output, response):
@@ -167,7 +167,7 @@ class Parser:
         if node:
             node.state = NodeState.EXECUTED if _success else NodeState.REJECTED
             try:
-                for output in iter_generator(node.then(), sleep=self.crawler.maybe_sleep):
+                for output in iter_generator(node.then(), sleep=self.crawler.sleep):
                     # maybe iter node.then() directly.
                     state.maybe_shutdown()
                     self._process_spider_output(output, request)

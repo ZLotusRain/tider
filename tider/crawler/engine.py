@@ -52,7 +52,10 @@ class HeartEngine:
         self.running = False
         self.paused = False
         self.polling = False
-        self.connection = MockConnection() if getattr(self.crawler.Pool, 'is_green', False) else self.crawler.connection
+        if getattr(self.crawler.Pool, 'is_green', False):
+            self.connection = MockConnection(sleep=self.crawler.sleep)
+        else:
+            self.connection = self.crawler.connection
 
         self._spider_closed = Event()
         self._is_shutdown = Event()
@@ -106,7 +109,7 @@ class HeartEngine:
                     break
 
                 if self.paused:
-                    time.sleep(1)
+                    self.crawler.sleep(1)
                     continue
 
                 # no need to double-check to make sure terminate immediately
@@ -129,9 +132,12 @@ class HeartEngine:
                             start_requests.close()
                         logger.error('Error while obtaining start requests', exc_info=True)
                     else:
-                        request and self.schedule_request(request)
+                        if request:
+                            if isinstance(request, Request):
+                                request.meta.setdefault("is_start_request", True)
+                            self.schedule_request(request)
                 # maybe switch greenlet
-                self.crawler.maybe_sleep(0.01)
+                self.crawler.sleep(0.01)
 
         return on_message_received
 
@@ -148,12 +154,12 @@ class HeartEngine:
                 scheduled += 1
                 # don't judge spider_closed event because the spider_closed
                 # event will be set after start_requests iterated in dummy broker.
-                time.sleep(0.01)
+                self.crawler.sleep(0.001)
             self.polling = False
             if not loop:
                 break
             # maybe switch greenlet
-            time.sleep(0.01)  # avoid stuck in threads.
+            self.crawler.sleep(0.001)  # avoid stuck in threads.
 
     @inthread(name='Poller')
     def _poll(self):
@@ -166,10 +172,10 @@ class HeartEngine:
             ):
                 # don't judge spider_closed event because the spider_closed
                 # event will be set after start_requests iterated in dummy broker.
-                time.sleep(0.01)
+                self.crawler.sleep(0.001)
             self.polling = False
             # maybe switch greenlet
-            time.sleep(0.01)
+            self.crawler.sleep(0.001)
 
     def _next_request_from_scheduler(self):
         request = self.scheduler.next_request()
@@ -191,9 +197,9 @@ class HeartEngine:
             if flag:
                 break
             # consider some message queues like redis
-            time.sleep(0.15)
+            self.crawler.sleep(0.15)
         return flag
-    
+
     def maybe_wakeup(self):
         self.explorer.maybe_wakeup()
 
@@ -264,7 +270,7 @@ class HeartEngine:
                 raise TypeError(f"Incorrect type: expected Request, Response or Failure, "
                                 f"got {type(result)}: {result!r}")
             while overload():
-                time.sleep(0.01)
+                self.crawler.sleep(0.01)
             if isinstance(result, Request):
                 # if processed in explorer,
                 # the frame may be stuck for limited queue size.
