@@ -1,4 +1,3 @@
-import time
 import threading
 from gevent import spawn_raw
 from redis.lock import Lock
@@ -42,7 +41,7 @@ class WatchDogLock(Lock):
     def _watch(self):
         while not self._stop_extending:
             self.extend(additional_time=self.timeout, replace_ttl=False)
-            time.sleep(self.timeout // 3)
+            self.crawler.sleep(self.timeout // 3)
 
     def _start_watch_dog(self):
         if getattr(self.crawler.Pool, 'is_green', False):
