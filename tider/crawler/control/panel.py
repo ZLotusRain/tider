@@ -130,8 +130,7 @@ def slots(state):
     return {slot: len(pqueues[slot]) for slot in pqueues}
 
 
-@inspect_command(default_timeout=3.0)
-def engine(state, **kwargs):
+def _get_engine_info(state):
     result = {
         'time()-crawler.engine.start_time': time.time() - state.crawler.engine.start_time,
         'crawler.engine.active()': state.crawler.engine.active(),
@@ -144,31 +143,25 @@ def engine(state, **kwargs):
         'len(crawler.engine.explorer.transferring)': len(state.crawler.engine.explorer.transferring),
         'len(crawler.engine.parser.parsing)': len(state.crawler.engine.parser.parsing),
     }
+    if state.crawler.engine.explorer.session._downloaders.get('default'):
+        proxy_manager = state.crawler.engine.explorer.session._downloaders["default"].proxy_manager
+        result.update({'len(crawler.engine.explorer.session._downloaders["default"].proxy_manager)': len(proxy_manager)})
     return result
+
+
+@inspect_command(default_timeout=3.0)
+def engine(state, **kwargs):
+    return _get_engine_info(state)
 
 
 @inspect_command(default_timeout=3.0)
 def sse(state, **kwargs):
     s1 = state.crawler.settings.table(with_defaults=True, censored=True)
     s2 = state.crawler.dump_stats()
-    e = {
-        'time()-crawler.engine.start_time': time.time() - state.crawler.engine.start_time,
-        'crawler.engine._overload()': state.crawler.engine._overload(),
-        'crawler.engine._spider_closed.is_set()': state.crawler.engine._spider_closed.is_set(),
-        'crawler.engine.explorer.needs_backout()': state.crawler.engine.explorer.needs_backout(),
-        'len(state.crawler.engine.scheduler)': len(state.crawler.engine.scheduler),
-        'len(crawler.engine.explorer.queue)': len(state.crawler.engine.explorer.queue),
-        'len(crawler.engine.parser.queue)': len(state.crawler.engine.parser.queue),
-        'len(crawler.engine.explorer.transferring)': len(state.crawler.engine.explorer.transferring),
-        'len(crawler.engine.parser.parsing)': len(state.crawler.engine.parser.parsing),
-    }
-    if state.crawler.engine.explorer.session._downloaders.get('default'):
-        proxy_manager = state.crawler.engine.explorer.session._downloaders["default"].proxy_manager
-        e.update({'len(crawler.engine.explorer.session._downloaders["default"].proxy_manager)': len(proxy_manager)})
     return {
         'settings': s1,
         'stats': s2,
-        'engine': e
+        'engine': _get_engine_info(state)
     }
 
 
