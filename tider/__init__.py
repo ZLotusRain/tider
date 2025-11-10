@@ -20,8 +20,8 @@ version_info = tuple(int(v) if v.isdigit() else v for v in __version__.split('.'
 
 
 # Check minimum required Python version
-if sys.version_info < (3, 7):
-    print(f"Tider {__version__} requires Python 3.7+")
+if sys.version_info < (3, 8):
+    print(f"Tider {__version__} requires Python 3.8 or higher")
     sys.exit(1)
 
 # https://github.com/gevent/gevent/issues/1909
