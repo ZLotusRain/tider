@@ -22,14 +22,19 @@ from tider.utils.misc import try_import
 from tider.utils.nodenames import nodesplit
 from tider.exceptions import reraise, SecurityError
 
-
 resource = try_import("resource")
 pwd = try_import('pwd')
 grp = try_import('grp')
 mputil = try_import('multiprocessing.util')
 
-PIDFILE_FLAGS = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-PIDFILE_MODE = ((os.R_OK | os.W_OK) << 6) | ((os.R_OK) << 3) | (os.R_OK)
+__all__ = (
+    'EX_OK', 'EX_FAILURE', 'EX_UNAVAILABLE', 'EX_USAGE', 'SYSTEM',
+    'IS_macOS', 'IS_WINDOWS', 'SIGMAP', 'pyimplementation', 'LockFailed',
+    'get_fdmax', 'Pidfile', 'PidDirectory', 'create_pidlock', 'close_open_fds',
+    'DaemonContext', 'detached', 'parse_uid', 'parse_gid', 'setgroups',
+    'initgroups', 'setgid', 'setuid', 'maybe_drop_privileges', 'signals',
+    'signal_name', 'get_errno_name', 'ignore_errno', 'fd_by_path', 'isatty',
+)
 
 # exitcodes
 EX_OK = getattr(os, 'EX_OK', 0)
@@ -44,10 +49,11 @@ IS_WINDOWS = SYSTEM == 'Windows'
 
 DAEMON_WORKDIR = '/'
 
+PIDFILE_FLAGS = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+PIDFILE_MODE = ((os.R_OK | os.W_OK) << 6) | ((os.R_OK) << 3) | (os.R_OK)
 
 PIDLOCKED = """ERROR: Pidfile ({0}) already exists.
 Seems we're already running? (pid: {1})"""
-
 
 SIGNAMES = {
     sig for sig in dir(_signal)
@@ -56,9 +62,27 @@ SIGNAMES = {
 SIGMAP = {getattr(_signal, name): name for name in SIGNAMES}
 
 
-def signal_name(signum):
-    """Return name of signal from signal number."""
-    return SIGMAP[signum][3:]
+def isatty(fh):
+    """Return true if the process has a controlling terminal."""
+    try:
+        return fh.isatty()
+    except AttributeError:
+        pass
+
+
+def pyimplementation():
+    """Return string identifying the current Python implementation."""
+    if hasattr(_platform, 'python_implementation'):
+        return _platform.python_implementation()
+    elif sys.platform.startswith('java'):
+        return 'Jython ' + sys.platform
+    elif hasattr(sys, 'pypy_version_info'):
+        v = '.'.join(str(p) for p in sys.pypy_version_info[:3])
+        if sys.pypy_version_info[3:]:
+            v += '-' + ''.join(str(p) for p in sys.pypy_version_info[3:])
+        return 'PyPy ' + v
+    else:
+        return 'CPython'
 
 
 class LockFailed(Exception):
@@ -81,11 +105,12 @@ class Pidfile:
     path = None
 
     def __init__(self, path, group=None):
-        self.group = group
-        dir_path = os.path.dirname(path)
-        if dir_path and not os.path.exists(dir_path):
-            os.makedirs(dir_path)
         self.path = os.path.abspath(path)
+        self._dirname = os.path.dirname(self.path)
+        if self._dirname and not os.path.exists(self._dirname):
+            os.makedirs(self._dirname)
+
+        self.group = group
 
     def acquire(self):
         """Acquire lock."""
@@ -126,9 +151,8 @@ class Pidfile:
         """Remove the lock."""
         with ignore_errno(errno.ENOENT, errno.EACCES):
             os.unlink(self.path)
-        dirname = os.path.dirname(self.path)
-        if self.group and dirname.endswith(self.group):
-            pidd = PidDirectory(dirname)
+        if self.group and self._dirname.endswith(self.group):
+            pidd = PidDirectory(self._dirname)
             pidd.remove_if_stale()
 
     def remove_if_stale(self):
@@ -143,6 +167,10 @@ class Pidfile:
             self.remove()
             return True
         if not pid:
+            self.remove()
+            return True
+        if pid == os.getpid():
+            # this can be common in k8s pod with PID of 1 - don't kill
             self.remove()
             return True
 
@@ -335,7 +363,11 @@ class DaemonContext:
                 # We need to keep /dev/urandom from closing because
                 # shelve needs it, and Beat needs shelve to start.
                 keep = list(self.stdfds) + fd_by_path(['/dev/urandom'])
-                close_open_fds(keep)
+                try:
+                    close_open_fds(keep)
+                except OSError:
+                    # compat for gevent(>=25.4.1)
+                    pass
                 for fd in self.stdfds:
                     self.redirect_to_null(maybe_fileno(fd))
                 if self.after_forkers and mputil is not None:
@@ -645,6 +677,11 @@ get_signal = signals.signum  # compat
 install_signal_handler = signals.__setitem__  # compat
 reset_signal = signals.reset  # compat
 ignore_signal = signals.ignore  # compat
+
+
+def signal_name(signum):
+    """Return name of signal from signal number."""
+    return SIGMAP[signum][3:]
 
 
 def set_pdeathsig(name):
