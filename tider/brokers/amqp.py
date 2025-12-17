@@ -12,6 +12,7 @@ from types import MethodType
 from collections.abc import Mapping
 from weakref import WeakValueDictionary
 
+from redis.exceptions import ResponseError
 from kombu import Consumer, Exchange, Queue
 from kombu.transport.virtual.base import Message, Channel
 from kombu.connection import Connection as KombuConnection
@@ -697,6 +698,7 @@ class AMQPBroker(Broker):
             should_rebalance = connection.transport.driver_type in ('kafka', 'confluentkafka')
         else:
             should_rebalance = self.crawler.broker_transport in ('kafka', 'confluentkafka')
+        response_errors = (ResponseError, )
         elapsed = 0
         try:
             while not self._stopped.is_set():
@@ -727,7 +729,11 @@ class AMQPBroker(Broker):
                             consumer.on_message = on_message
                             consumer.consume()
                             self._restore_messages(consumer)
-                except connection.connection_errors:
+                except connection.connection_errors + response_errors as e:
+                    if isinstance(e, ResponseError):
+                        info = consumer.channel.client.info(section='replication')
+                        if info.get('role') != 'slave':
+                            raise
                     logger.warning('Broker connection has broken, try reconnecting...')
                     ignore_errors(connection, consumer.close)
                     connection.release()
