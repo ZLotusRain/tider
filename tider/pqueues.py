@@ -1,48 +1,24 @@
 import queue
 import threading
-from abc import abstractmethod
-from typing import Any, Optional, Dict, List, Iterable
+from typing import Optional, Dict, List, Iterable, Protocol, cast
 
+from tider import Request
 from tider.utils.collections import DummyLock
 from tider.utils.misc import build_from_crawler
 
 
-class _BaseQueueMeta(type):
-    """
-    Metaclass to check queue classes against the necessary interface
-    """
+class QueueProtocol(Protocol):
+    """Protocol for downstream queues of ``PriorityQueue``."""
 
-    def __instancecheck__(cls, instance):
-        return cls.__subclasscheck__(type(instance))  # pylint: disable=no-value-for-parameter
+    def push(self, request: Request) -> None: ...
 
-    def __subclasscheck__(cls, subclass):
-        return (
-            hasattr(subclass, "push")
-            and callable(subclass.push)
-            and hasattr(subclass, "pop")
-            and callable(subclass.pop)
-            and hasattr(subclass, "close")
-            and callable(subclass.close)
-            and hasattr(subclass, "__len__")
-            and callable(subclass.__len__)
-        )
+    def pop(self) -> Optional[Request]: ...
 
+    def __len__(self) -> int: ...
 
-class BaseQueue(metaclass=_BaseQueueMeta):
-    @abstractmethod
-    def push(self, obj: Any) -> None:
-        raise NotImplementedError()
+    def empty(self) -> bool: ...
 
-    @abstractmethod
-    def pop(self) -> Optional[Any]:
-        raise NotImplementedError()
-
-    @abstractmethod
-    def __len__(self):
-        raise NotImplementedError()
-
-    def close(self) -> None:
-        pass
+    def close(self) -> None: ...
 
 
 class PriorityQueue:
@@ -53,14 +29,20 @@ class PriorityQueue:
     """
 
     @classmethod
-    def from_crawler(cls, crawler, downstream_queue_cls, startprios=()):
-        return cls(crawler, downstream_queue_cls, startprios)
+    def from_crawler(cls, crawler, downstream_queue_cls: QueueProtocol,
+                     startprios: Iterable[int] = (),
+                     start_queue_cls: QueueProtocol = None):
+        return cls(crawler, downstream_queue_cls, startprios,
+                   start_queue_cls=start_queue_cls)
 
-    def __init__(self, crawler, downstream_queue_cls, startprios=()):
+    def __init__(self, crawler, downstream_queue_cls: QueueProtocol,
+                 startprios: Iterable[int] = (),
+                 start_queue_cls: QueueProtocol = None):
         self.crawler = crawler
         self.downstream_queue_cls = downstream_queue_cls
-        self.queues = {}
-
+        self._start_queue_cls = start_queue_cls
+        self.queues: dict[int, QueueProtocol] = {}
+        self._start_queues: dict[int, QueueProtocol] = {}
         self._mutex = threading.Lock()
         self.priority_change = threading.Condition(self._mutex)
         self.curprio = None
@@ -71,44 +53,86 @@ class PriorityQueue:
             return
 
         for priority in startprios:
-            self.queues[priority] = self.qfactory()
+            q = self.qfactory()
+            if q:
+                self.queues[priority] = q
+            if self._start_queue_cls:
+                q = self._sqfactory()
+                if q:
+                    self._start_queues[priority] = q
 
         self.curprio = min(startprios)
 
-    def qfactory(self):
-        downstream_queue = build_from_crawler(
+    def qfactory(self) -> QueueProtocol:
+        return build_from_crawler(
             self.downstream_queue_cls,
             self.crawler,
         )
-        if not isinstance(downstream_queue, BaseQueue):
-            raise ValueError("Priority downstream queue must be the subclass of `tider.pqueues.BaseQueue`")
-        return downstream_queue
+
+    def _sqfactory(self) -> QueueProtocol:
+        assert self._start_queue_cls is not None
+        return build_from_crawler(
+            self._start_queue_cls,
+            self.crawler,
+        )
 
     def priority(self, request) -> int:
         return -request.priority
 
     def push(self, request):
         priority = self.priority(request)
+        is_start_request = request.meta.get("is_start_request", False)
         with self.priority_change:
-            if priority not in self.queues:
-                self.queues[priority] = self.qfactory()
-            q = self.queues[priority]
+            if is_start_request and self._start_queue_cls:
+                if priority not in self._start_queues:
+                    self._start_queues[priority] = self._sqfactory()
+                q = self._start_queues[priority]
+            else:
+                if priority not in self.queues:
+                    self.queues[priority] = self.qfactory()
+                q = self.queues[priority]
             q.push(request)  # this may fail (eg. serialization error)
-        if self.curprio is None or priority < self.curprio:
-            self.curprio = priority
+            if self.curprio is None or priority < self.curprio:
+                self.curprio = priority
 
     def pop(self):
         if self.curprio is None:
             return None
         with self.priority_change:
-            q = self.queues[self.curprio]
-            m = q.pop()
-            if not q:
-                del self.queues[self.curprio]
-                q.close()
-                prios = [p for p, q in self.queues.items() if q]
-                self.curprio = min(prios) if prios else None
-        return m
+            try:
+                q = self.queues[self.curprio]
+            except KeyError:
+                pass
+            else:
+                m = q.pop()
+                if q.empty():  # don't use `not q` to compatible for gevent > 24.11.1
+                    del self.queues[self.curprio]
+                    q.close()
+                    if not self._start_queues:
+                        self._update_curprio()
+                return m
+            if self._start_queues:
+                try:
+                    q = self._start_queues[self.curprio]
+                except KeyError:
+                    self._update_curprio()
+                else:
+                    m = q.pop()
+                    if q.empty():  # don't use `not q` to compatible for gevent > 24.11.1
+                        del self._start_queues[self.curprio]
+                        q.close()
+                        self._update_curprio()
+                    return m
+            else:
+                self._update_curprio()
+
+    def _update_curprio(self) -> None:
+        prios = {
+            p
+            for queues in (self.queues, self._start_queues)
+            for p, q in queues.items() if q
+        }
+        self.curprio = min(prios) if prios else None
 
     def peek(self):
         """Returns the next object to be returned by :meth:`pop`,
@@ -120,18 +144,31 @@ class PriorityQueue:
         if self.curprio is None:
             return None
         with self.priority_change:
-            curprio_queue = self.queues[self.curprio]
-            return curprio_queue.peek()
+            try:
+                curprio_queue = self._start_queues[self.curprio]
+            except KeyError:
+                curprio_queue = self.queues[self.curprio]
+            # Protocols can't declare optional members
+            return cast("Request", curprio_queue.peek())  # type: ignore[attr-defined]
 
     def close(self):
-        active = []
-        for p, q in self.queues.items():
-            active.append(p)
-            q.close()
-        return active
+        active = set()
+        for queues in (self.queues, self._start_queues):
+            for p, q in queues.items():
+                active.add(p)
+                q.close()
+        return list(active)
 
     def __len__(self):
-        return sum(len(x) for x in list(iter(self.queues.values()))) if self.queues else 0
+        return (
+            sum(
+                len(x)
+                for queues in (self.queues, self._start_queues)
+                for x in queues.values()
+            )
+            if self.queues or self._start_queues
+            else 0
+        )
 
 
 class ExplorerInterface:
@@ -164,10 +201,10 @@ class ExplorerAwarePriorityQueue:
     """
 
     @classmethod
-    def from_crawler(cls, crawler, downstream_queue_cls, startprios=None):
-        return cls(crawler, downstream_queue_cls, startprios)
+    def from_crawler(cls, crawler, downstream_queue_cls, startprios=None, start_queue_cls=None):
+        return cls(crawler, downstream_queue_cls, startprios, start_queue_cls=start_queue_cls)
 
-    def __init__(self, crawler, downstream_queue_cls, slot_startprios=None):
+    def __init__(self, crawler, downstream_queue_cls, slot_startprios=None, start_queue_cls=None):
         if slot_startprios and not isinstance(slot_startprios, dict):
             raise ValueError(
                 "ExplorerAwarePriorityQueue accepts "
@@ -181,10 +218,10 @@ class ExplorerAwarePriorityQueue:
 
         self._explorer_interface = ExplorerInterface(crawler)
         self.downstream_queue_cls = downstream_queue_cls
+        self._start_queue_cls = start_queue_cls
         self.crawler = crawler
         self._slot_mutex = threading.Lock()
         self._dummy_mutex = DummyLock()
-
         self.pqueues: Dict[str, PriorityQueue] = {}  # slot -> priority queue
         for slot, startprios in (slot_startprios or {}).items():
             self.pqueues[slot] = self.pqfactory(startprios)
@@ -197,6 +234,7 @@ class ExplorerAwarePriorityQueue:
             self.crawler,
             self.downstream_queue_cls,
             startprios,
+            start_queue_cls=self._start_queue_cls,
         )
 
     def pop(self):
