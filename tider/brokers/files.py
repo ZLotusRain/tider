@@ -22,18 +22,29 @@ rarfile = try_import('rarfile')
 
 class Message(KombuMessage):
 
-    def __init__(self, filename=None, lineno=None, tell=None, body=None, **kwargs):
-        self.filename = filename
-        self.acked = f"{filename}.acked" if filename else None  # *.tell
-        self.lineno = lineno
-        self.tell = tell
+    def __init__(self, filename=None, raw=None, source=None, lineno=None, tell=None,
+                 body=None, **kwargs):
         super().__init__(body=body, **kwargs)
+        self.filename = filename
+        self.tell = tell
+        self.lineno = lineno
+
+        self._raw = raw
+        self._source = source
+
+    @property
+    def raw(self):
+        return self._raw
 
     def ack(self, multiple=False):
-        if not self.acked:
-            return
-        with open(self.acked, 'a+', encoding='utf-8') as fw:
-            json.dump({'lineno': self.lineno, 'tell': self.tell}, fw)
+        # maybe use file to store the acked lineno and position.
+        self._state = 'ACK'
+
+    def reject(self, requeue=False):
+        self._state = 'REJECTED'
+
+    def requeue(self):
+        self._state = 'REQUEUED'
 
 
 class FilesBroker(Broker):
@@ -179,6 +190,9 @@ class FilesBroker(Broker):
                 self._consume_rar(file, on_message, on_message_consumed)
             elif ext == 'zip':
                 self._consume_zip(file, on_message, on_message_consumed)
+            else:
+                message = {"raw": file, "source": data_source}
+                on_message and on_message(message=message, payload=message, no_ack=True)
             if not self.crawler.engine._spider_closed.is_set():
                 # start_requests consumed.
                 self.crawler.engine._spider_closed.set()
