@@ -5,6 +5,7 @@ import weakref
 import inspect
 from collections import deque
 from enum import Enum
+from typing import Iterator
 
 from tider.network import Request
 from tider.utils.misc import evaluate_callable
@@ -21,7 +22,7 @@ class NodeState(Enum):
     SCHEDULED = 1
     EXECUTED = 2
     RESOLVED = 3
-    REJECTED = 4
+    REJECTED = 4  # abnormal completion state
 
 
 def is_unresolved(state: NodeState):
@@ -142,7 +143,7 @@ class PromiseNode:
             self._pending.pop()
             self.state = NodeState.SCHEDULED
         except IndexError:
-            if is_executed(self.state):
+            if is_executed(self.state) or is_rejected(self.state):
                 # maybe conflict with next_nodes() or update_state()
                 self.on_executed()
         else:
@@ -174,7 +175,7 @@ class PromiseNode:
     def update_state(self):
         for child in self.children:
             child.update_state()
-        if is_executed(self.state):
+        if is_executed(self.state) or is_rejected(self.state):
             self.on_executed()
 
     def then(self):
@@ -206,6 +207,8 @@ class PromiseNode:
         request and request.close()
 
     def clear(self):
+        if isinstance(self.source, Iterator) and hasattr(self.source, 'close'):
+            self.source.close()
         # do not clear parent and promise here if is root
         # to avoid break conn with parent promise.
         request, self.request = self.request, None
@@ -316,7 +319,7 @@ class Promise:
             # if promise has already resolved, then skip this.
             return
         self.root.update_state()  # avoid misstate
-        if is_executed(self.state) and not self.root.children:
+        if (is_executed(self.state) or is_rejected(self.state)) and not self.root.children:
             for result in iter_generator(self.on_resolved()):
                 yield result  # iter self.on_resolved() directly.
 
