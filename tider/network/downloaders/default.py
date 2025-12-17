@@ -343,7 +343,7 @@ class RedirectMixin:
                 cert=cert,
                 proxy=proxy,
             )
-            if session_cookies:
+            if session_cookies is not None:
                 extract_cookies_to_jar(session_cookies, prepared, raw)
 
             # extract redirect url, if any, for the next loop
