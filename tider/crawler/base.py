@@ -116,8 +116,13 @@ class Crawler:
         self.app = app or self.app
         self._source_hostname = hostname
         self.startup_time = datetime.now(timezone.utc)
-        self.settings = Settings(defaults=[self.app.conf.copy()])
+
+        settings = self.app.conf.copy_to_dict()
+        settings.pop('SPIDER_MODULES', None)
+        settings.pop('SPIDER_SCHEMAS', None)
+        self.settings = Settings(defaults=[settings])
         self.spidercls.update_settings(self.settings)
+
         self.data_source = data_source
         set_default_ua(self.settings.get('DEFAULT_USER_AGENT'))
 
