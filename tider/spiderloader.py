@@ -12,10 +12,9 @@ class SpiderLoader:
     in a Tider project.
     """
     def __init__(self, settings):
-        self._spider_schemas = settings.getdict('SPIDER_SCHEMAS').copy() or {'default': []}
-        if 'default' not in self._spider_schemas:
-            self._spider_schemas['default'] = []
-        self._spider_schemas['default'].append({'SPIDER_MODULES': settings.getlist('SPIDER_MODULES').copy()})
+        self._spider_schemas = {'default': []}
+        self._spider_schemas.update(**settings.getdict('SPIDER_SCHEMAS'))
+        self._spider_schemas['default'].append({'SPIDER_MODULES': list(settings.getlist('SPIDER_MODULES'))})
 
         self._schemas = defaultdict(dict)
         self.warn_only = settings.getbool('SPIDER_LOADER_WARN_ONLY')
