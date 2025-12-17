@@ -433,6 +433,7 @@ class PlaywrightDownloader(BrowserDownloader):
                 context_config.update(playwright.devices[device])
             browser_type = getattr(playwright, browser_type)
             browser = browser_type.launch(
+                executable_path=request.meta.get('browser_executable_path'),
                 channel=browser_channel, headless=True,
                 # devtools=True,
                 args=['--no-sandbox', '--single-process'],
