@@ -55,7 +55,7 @@ class Session:
         if self._clear_thread is not None:
             self._clear_thread.join()
         self.explorer.close(reason='finished')
-        self._crawler.close()
+        self._crawler.stop()
         self.app.close()
 
     def request(self, method, url, params=None, data=None, headers=None, cookies=None,
