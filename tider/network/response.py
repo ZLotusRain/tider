@@ -301,11 +301,13 @@ class Response:
         filetype = filetype[0] if filetype else ""
 
         for each in content_type.split(';'):
+            if each.lower().startswith("charset="):
+                continue
             if each == 'application/ms-download':
                 filetype = filetype or 'pdf'
             elif each == 'image/webp':
                 filetype = filetype or 'png'
-            elif each == 'application/octet-stream':
+            elif each in ('application/octet-stream', 'application/x-msdownload'):
                 continue
             else:
                 filetype = mimetypes.guess_extension(each) or filetype
