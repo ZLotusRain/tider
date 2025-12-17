@@ -114,6 +114,7 @@ PROXY_PARAMS = {}
 SCHEDULER = "tider.crawler.scheduler.Scheduler"
 SCHEDULER_MEMORY_QUEUE = "tider.pqueues.FifoMemoryQueue"
 SCHEDULER_PRIORITY_QUEUE = "tider.pqueues:ExplorerAwarePriorityQueue"
+SCHEDULER_START_QUEUE = "tider.pqueues.FifoMemoryQueue"
 SCHEDULER_BODY_PRIORITY_ADJUST = 0
 SCHEDULER_DOWNSTREAM_QUEUE_MAXSIZE = -1
 

@@ -35,14 +35,14 @@ class BaseScheduler(metaclass=BaseSchedulerMeta):
         """
         ``True`` if the scheduler has enqueued objects, ``False`` otherwise
         """
-        raise NotImplementedError()
+        raise NotImplementedError
 
     @abstractmethod
     def enqueue_request(self, request) -> bool:
         """
         Return ``True`` if the object is stored correctly, ``False`` otherwise.
         """
-        raise NotImplementedError()
+        raise NotImplementedError
 
     @abstractmethod
     def next_request(self):
@@ -50,7 +50,7 @@ class BaseScheduler(metaclass=BaseSchedulerMeta):
         Return the next object to be processed, or ``None`` to indicate that there
         are no objects to be considered ready at the moment.
         """
-        raise NotImplementedError()
+        raise NotImplementedError
 
     def close(self, reason):
         """
@@ -91,14 +91,28 @@ class Scheduler(BaseScheduler):
     def __len__(self):
         return len(self.priority_queue)
 
+    def _start_queue_cls(self):
+        cls = self.crawler.settings[f"SCHEDULER_START_QUEUE"]
+        if not cls:
+            return None
+        return symbol_by_name(cls)
+
     @cached_property
     def priority_queue(self):
         return self._pq()
 
     def _pq(self):
         """ Create a new priority queue instance, with in-memory storage """
+        assert self.crawler
+        assert self.pq_cls
+
         pqclass = symbol_by_name(self.pq_cls)
-        return pqclass(crawler=self.crawler, downstream_queue_cls=symbol_by_name(self.mq_cls))
+        return build_from_crawler(
+            pqclass,
+            self.crawler,
+            downstream_queue_cls=symbol_by_name(self.mq_cls),
+            start_queue_cls=self._start_queue_cls(),
+        )
 
     def enqueue_request(self, request):
         """
