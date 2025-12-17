@@ -273,13 +273,18 @@ class Explorer:
 
     def try_explore(self, method, url, params=None, data=None, headers=None, cookies=None,
                     files=None, auth=None, timeout=None, allow_redirects=True, proxies=None,
-                    proxy_schema=0, stream=None, verify=None, cert=None, json=None,
-                    raise_for_status=False, delay=0, max_retries=0):
+                    stream=None, verify=None, cert=None, json=None, raise_for_status=False,
+                    proxy_schema=0, proxy_params=None, delay=0, max_retries=0, meta=None,
+                    encoding=None, ignored_status_codes=(400, 412, 521), http2=False, downloader=None,
+                    impersonate=None, session_cookies=None):
         """Simple request api."""
         request = Request(url=url, method=method, params=params, data=data, json=json, headers=headers,
                           cookies=cookies, files=files, auth=auth, timeout=timeout, allow_redirects=allow_redirects,
-                          proxies=proxies, proxy_schema=proxy_schema, stream=stream, verify=verify, cert=cert,
-                          raise_for_status=raise_for_status, max_retries=max_retries, dup_check=False)
+                          proxies=proxies, proxy_schema=proxy_schema, proxy_params=proxy_params,
+                          stream=stream, verify=verify, cert=cert, raise_for_status=raise_for_status,
+                          encoding=encoding, ignored_status_codes=ignored_status_codes, meta=meta,
+                          http2=http2, downloader=downloader, impersonate=impersonate, session_cookies=session_cookies,
+                          max_retries=max_retries, dup_check=False)
         response = self._explore(request)
         while isinstance(response, Request):
             retry_times = request.meta.get('retry_times', 0) + 1
