@@ -1,16 +1,16 @@
-"""Crawler stats, errors and failures backends."""
+"""Spider backends which store stats, results, errors, and failures."""
 
 import sys
 import types
 
-from .base import BaseBackend, KeyValueStoreBackend, State, backend_serializer_registry
+from .base import Backend, KeyValueStoreBackend, State, backend_serializer_registry
 
 from tider.utils.misc import symbol_by_name
 from tider.exceptions import reraise, ImproperlyConfigured
 
 __all__ = (
     'backend_serializer_registry', 'State',
-    'BaseBackend', 'KeyValueStoreBackend', 'by_name'
+    'Backend', 'KeyValueStoreBackend', 'by_name'
 )
 
 
@@ -28,9 +28,9 @@ def by_name(backend=None):
         cls = symbol_by_name(backend, BACKEND_ALIASES)
     except ValueError as exc:
         reraise(ImproperlyConfigured, ImproperlyConfigured(
-            "Unknown result backend: {0!r}.".format(backend, exc)), sys.exc_info()[2])
+            "Unknown spider backend: {0!r}.".format(backend, exc)), sys.exc_info()[2])
     if isinstance(cls, types.ModuleType):
-        raise ImproperlyConfigured("Unknown result backend: {0!r}.".format(
+        raise ImproperlyConfigured("Unknown spider backend: {0!r}.".format(
             backend, 'is a Python module, not a backend class.'))
     return cls
 
