@@ -265,6 +265,13 @@ class BackendReadError(BackendError):
 class BackendStoreError(BackendError):
     """An issue writing to the backend."""
 
+    def __init__(self, *args, **kwargs):
+        self.state = kwargs.get('state', "")
+        self.spider_id = kwargs.get('spider_id', "")
+
+    def __repr__(self):
+        return super().__repr__() + " state:" + self.state + " spider_id:" + self.spider_id
+
 
 class CrawlerRevokedError(TiderException):
     """The crawler has been revoked."""
