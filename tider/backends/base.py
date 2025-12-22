@@ -51,7 +51,6 @@ class State(str, enum.Enum):
 class Backend:
     """Base spider backend."""
 
-    NORMAL_STATES = frozenset({State.PENDING, State.STARTED, State.RUNNING, State.SUCCESS})
     EXCEPTION_STATES = frozenset({State.FAILURE, State.REVOKED})
     READY_STATES = frozenset({State.SUCCESS, State.FAILURE, State.REVOKED})
 

@@ -4,7 +4,7 @@ from kombu.utils import cached_property
 from kombu.utils.url import urlparse, maybe_sanitize_url
 from kombu.exceptions import EncodeError
 
-from tider.backends.base import BaseBackend, State
+from tider.backends.base import Backend, State
 from tider.exceptions import ImproperlyConfigured
 
 try:
@@ -37,8 +37,8 @@ __all__ = ('MongoBackend',)
 BINARY_CODECS = frozenset(['pickle', 'msgpack'])
 
 
-class MongoBackend(BaseBackend):
-    """MongoDB stats backend.
+class MongoBackend(Backend):
+    """MongoDB spider backend.
 
     Raises:
         tider.exceptions.ImproperlyConfigured:
@@ -61,7 +61,7 @@ class MongoBackend(BaseBackend):
     replica_set = None
     read_preference = None
     database_name = 'tider'
-    crawlermeta_collection = 'tider_crawlermeta'
+    spidermeta_collection = 'tider_spidermeta'
     max_pool_size = 10
     options = None
 
@@ -69,9 +69,10 @@ class MongoBackend(BaseBackend):
 
     _connection = None
 
-    def __init__(self, crawler, **kwargs):
+    def __init__(self, crawler, serializer=None, **kwargs):
         self.options = {}
-        super().__init__(crawler, **kwargs)
+        serializer = serializer or crawler.settings.get(f'{self.config_namespace}_SERIALIZER', 'bson')
+        super().__init__(crawler, serializer=serializer, **kwargs)
 
         if not pymongo:
             raise ImproperlyConfigured(
@@ -120,8 +121,8 @@ class MongoBackend(BaseBackend):
             self.database_name = config.pop('database', self.database_name)
             self.replica_set = config.pop('replica_set', self.replica_set)
             self.read_preference = config.pop('read_preference', self.read_preference)
-            self.crawlermeta_collection = config.pop(
-                'crawlermeta_collection', self.crawlermeta_collection,
+            self.spidermeta_collection = config.pop(
+                'spidermeta_collection', self.spidermeta_collection,
             )
 
             self.options.update(config.pop('options', {}))
@@ -168,6 +169,11 @@ class MongoBackend(BaseBackend):
             if self.read_preference:
                 conf['read_preference'] = self.MODES.get(self.read_preference)
             conf['replicaSet'] = self.replica_set
+            # if self.username:
+            #     conf['username'] = self.username
+            # if self.password:
+            #     conf['password'] = self.password
+            # conf['authSource'] = self.database_name
 
             self._connection = MongoClient(**conf)
 
@@ -189,65 +195,61 @@ class MongoBackend(BaseBackend):
             return data
         return super().decode(data)
 
-    def _store_result(self, result, state, traceback=None, **kwargs):
-        """Store stats of a crawler."""
-        meta = self._gen_crawler_meta(result=self.encode(result), state=state, traceback=traceback)
+    def _store_snapshot(self, snapshot, state, traceback=None, **kwargs):
+        """Store snapshot of a spider."""
+        meta = self._gen_spider_meta(snapshot=self.encode(snapshot), state=state, traceback=traceback)
         # Add the _id for mongodb
-        meta['_id'] = self.crawler.hostname
+        meta['_id'] = self._store_id
 
         try:
-            self.collection.replace_one({'_id': self.crawler.hostname}, meta, upsert=True)
+            self.collection.replace_one({'_id': self._store_id}, meta, upsert=True)
         except InvalidDocument as exc:
             raise EncodeError(exc)
 
-    def _get_crawler_meta(self):
-        """Get crawler meta-data."""
-        obj = self.collection.find_one({'_id': self.crawler.hostname})
+    def _get_spider_meta(self):
+        """Get spider meta-data."""
+        obj = self.collection.find_one({'_id': self._store_id})
         if obj:
             return self.meta_from_decoded({
-                'hostname': obj['_id'],
+                'group': obj['group'],
                 'schema': obj['schema'],
                 'spidername': obj['spidername'],
-                'pid': obj['pid'],
                 'server': obj['server'],
-                'group': obj['group'],
                 'status': obj['status'],
-                'stats': self.decode(obj['stats']),
-                'failures': obj['failures'],
-                'errors': obj['errors'],
+                'pid': obj['pid'],
+                'meta': self.decode(obj['meta']),
+                'stats': obj['stats'],
                 'traceback': obj['traceback'],
                 'date_done': obj['date_done'],
             })
-        return {'status': State.PENDING, 'result': None}
+        return {'status': State.PENDING, 'meta': None}
 
-    def _get_group_meta(self):
+    def _get_group(self):
         """Get all the meta-datas for a group."""
         objs = self.collection.find({'_id': {"$regex": re.compile(f'{self.crawler.group}.*')}}) or []
         result = {}
         for obj in objs:
             meta = self.meta_from_decoded({
-                '_id': obj['_id'],
+                'group': obj['group'],
                 'schema': obj['schema'],
                 'spidername': obj['spidername'],
-                'pid': obj['pid'],
                 'server': obj['server'],
-                'group': obj['group'],
                 'status': obj['status'],
-                'stats': self.decode(obj['stats']),
-                'failures': obj['failures'],
-                'errors': obj['errors'],
+                'pid': obj['pid'],
+                'meta': self.decode(obj['meta']),
+                'stats': obj['stats'],
                 'traceback': obj['traceback'],
                 'date_done': obj['date_done'],
             })
-            result[meta['_id']] = meta
+            result[obj['_id']] = meta
         return result
 
     def _delete_group(self):
         """Delete a group."""
-        self.collection.delete_many({'_id': {"$regex": re.compile(f'{self.crawler.group}.*')}})
+        self.collection.delete_many({'_id': {"$regex": re.compile(f'{self.group}.*')}})
 
     def _forget(self):
-        """Remove result from MongoDB.
+        """Remove spider meta from MongoDB.
 
         Raises:
             pymongo.exceptions.OperationsError:
@@ -256,7 +258,7 @@ class MongoBackend(BaseBackend):
         # By using safe=True, this will wait until it receives a response from
         # the server.  Likewise, it will raise an OperationsError if the
         # response was unable to be completed.
-        self.collection.delete_one({'_id': self.crawler.hostname})
+        self.collection.delete_one({'_id': self._store_id})
 
     def cleanup(self):
         """Delete expired meta-data."""
@@ -289,8 +291,8 @@ class MongoBackend(BaseBackend):
 
     @cached_property
     def collection(self):
-        """Get the meta-data crawler collection."""
-        collection = self.database[self.crawlermeta_collection]
+        """Get the meta-data spider collection."""
+        collection = self.database[self.spidermeta_collection]
 
         # Ensure an index on date_done is there, if not process the index
         # in the background.  Once completed cleanup will be much faster
