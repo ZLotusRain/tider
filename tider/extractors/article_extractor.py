@@ -290,7 +290,7 @@ class ArticleExtractor:
             elif self._get_tag_name(each) in ('h2', 'h3', 'h4'):
                 for small in each.find_all('small'):
                     invalid_nodes.append(small)
-            elif 'display:none' in each.get('style', ''):
+            elif 'display:none' in each.get('style', '').replace(" ", ""):
                 invalid_nodes.append(each)
             elif each.get('aria-hidden', '').lower() == 'true':
                 invalid_nodes.append(each)
@@ -347,16 +347,14 @@ class ArticleExtractor:
     def gen_candidate_score(self, elem):
         name = self._get_tag_name(elem)
         score = self._tag_weight(elem)
-        if name == 'ucapcontent':
-            score += 10
-        if name == "div":
-            score += 5
-        elif name == "blockquote":
-            score += 3
-        elif name == "form":
-            score -= 3
-        elif name == "th":
-            score -= 5
+        score_map = {
+            "div": 5,
+            "ucapcontent": 10,
+            "blockquote": 3,
+            "form": -3,
+            "th": -5
+        }
+        score += score_map.get(name, 0)
         return score
 
     def _get_candidates(self, body, response):
