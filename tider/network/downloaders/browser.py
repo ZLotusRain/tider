@@ -47,18 +47,19 @@ HACKED_ATTACH_SHADOW = """
     };
 """
 
-
 CREATE_HOOKED_ELEMENT = """
-    window._hooked = []
+    window._hooked = [];
     createHidden = function(name) {
-        if (window._hooked.includes(name)) { return; }
-        window._hooked.push(name); 
-        let newInput = document.createElement('input');
-        newInput.type = 'hidden'
+        if (!window._hooked.includes(name)) { window._hooked.push(name); }
+        let inputId = 'foo-tider';
         if (name != "") {
-            newInput.id = `foo-tider-${name}`;
-        } else { newInput.id = 'foo-tider'; }
-        
+            inputId = `foo-tider-${name}`;
+        }
+        let inputElement = document.querySelector('input#' + inputId);
+        if (inputElement !== null && inputId !== 'foo-tider') { return; }
+        let newInput = document.createElement('input');
+        newInput.id = inputId;
+        newInput.type = 'hidden'
         newInput.value = 'DOM_LOAD_HOOK'
         let lastElement = (document?.body || document?.head || document).lastElementChild;
         lastElement.insertAdjacentElement('afterend', newInput);
@@ -82,10 +83,10 @@ INIT_SCRIPT = """
         return new Promise(resolve => setTimeout(resolve, ms));
     };
     
-    waitFiveSeconds = async function() {
-        console.log("Starting to wait for 5 seconds...");
-        await delay(5000);
-        console.log("5 seconds have passed!");
+    wait = async function(seconds) {
+        console.log(`Starting to wait for ${seconds} seconds...`);
+        await delay(seconds * 1000);
+        console.log(`${seconds} seconds have passed!`);
         return "Completed";
     };
     
@@ -198,7 +199,7 @@ STYLE_PATCH = """
 """
 
 VUE_DOM_LOAD_HOOK = """
-(this || window).waitFiveSeconds().then(result => {{
+(this || window).wait(1).then(result => {{
     console.log(result);
 }});
 
@@ -206,15 +207,15 @@ VUE_DOM_LOAD_HOOK = """
 //     let executed = false;
 //     return function() {{
 //         if (executed) {{ return;}}
-//         setTimeout(this.createHidden("{name}"), 1000);
+//         setTimeout(this.createHidden("{name}"), 10);
 //         executed = true;
 //     }};
 // }})();
 // executeOnce();
-setTimeout((this || window).createHidden("{name}"), 1000);
+setTimeout((this || window).createHidden("{name}"), 10);
 """
 
-LAST_SCRIPT = """setTimeout(this.createHidden(""), 1000);"""
+LAST_SCRIPT = """setTimeout(this.createHidden(""), 10);"""
 
 DOM_LOAD_HOOK = f"""
     const newParagraph = document.createElement('script');
@@ -333,7 +334,7 @@ class PlaywrightDownloader(BrowserDownloader):
 
             hooking = False
             if not name.endswith('.min.js') and 'element-ui' not in name and 'ajax.js' not in name:
-                if '.js' not in name and b'function' not in body:
+                if not name.split('?')[0].endswith('.js') and b'function' not in body:
                     # some scripts maybe contain dynamic json contents.
                     hooking = False
                 elif 'google' in route.request.url or 'baidu' in route.request.url:
@@ -343,7 +344,8 @@ class PlaywrightDownloader(BrowserDownloader):
                     hooking = True
                     hooked[frame].append(name)
             if hooking:
-                body += b'\n' + VUE_DOM_LOAD_HOOK.format(name=set_md5(name)).encode('utf-8')
+                body = b'try {\n' + body + b'\n} catch (e) { throw e; } finally {'
+                body += b'\n' + VUE_DOM_LOAD_HOOK.format(name=set_md5(name)).encode('utf-8') + b'}'
             # maybe replace $createElement in vue.min.js
             route.fulfill(
                 response=original_response,
@@ -388,20 +390,25 @@ class PlaywrightDownloader(BrowserDownloader):
                     fo.write(body)
 
     @staticmethod
-    def _wait_for_hook(frame, name=None, timeout=0):
+    def _wait_for_hook(frame, name=None, timeout=0, raise_for_timeout=True):
         identity = f"foo-tider-{set_md5(name)}" if name else "foo-tider"
-        frame.locator(f"#{identity}").wait_for(state='attached', timeout=timeout)  # appropriately increase
-        frame.locator(f"#{identity}").evaluate("(ele) => {if (ele) ele.remove()}")
+        try:
+            frame.locator(f"#{identity}").wait_for(state='attached', timeout=timeout)  # appropriately increase
+            frame.locator(f"#{identity}").evaluate("(ele) => {if (ele) ele.remove()}")
+        except PlaywrightTimeoutError as e:
+            if raise_for_timeout:
+                raise e
         frame.wait_for_timeout(300)
 
-    def wait_for_hooked_frames(self, hooked, timeout=0, wait_for_load=False):
+    def wait_for_hooked_frames(self, hooked, timeout=0, wait_for_load=False, raise_for_timeout=True):
         for frame in hooked:
+            hooked[frame] = list(set(hooked[frame]))  # maybe exists duplicated scripts
             hooks = hooked[frame]
             if frame.url == frame.page.url and wait_for_load:
                 hooks.append("")
             while hooks:
                 hook = hooks.pop()
-                self._wait_for_hook(frame=frame, name=hook, timeout=timeout)
+                self._wait_for_hook(frame=frame, name=hook, timeout=timeout, raise_for_timeout=raise_for_timeout)
 
     def download_request(self, request: Request, **_):
         # https://github.com/microsoft/playwright/issues/27997
@@ -413,6 +420,7 @@ class PlaywrightDownloader(BrowserDownloader):
         if browser_channel not in ('chromium', 'chrome', 'msedge', 'chrome-beta', 'msedge-beta', 'msedge-dev'):
             raise ImproperlyConfigured("Unsupported browser channel: %s" % browser_channel)
 
+        headless = request.meta.get('browser_headless', True)
         keep_alive = request.meta.get('browser_keep_alive', False)
         screenshot_path = request.meta.get('browser_screenshot_path')
         init_script = request.meta.get('browser_init_script')
@@ -428,13 +436,15 @@ class PlaywrightDownloader(BrowserDownloader):
             playwright_context = sync_playwright()
             playwright = playwright_context.start()
 
-            context_config = {'proxy': {'server': request.selected_proxy}, 'ignore_https_errors': True}
+            context_config = {'ignore_https_errors': True}
+            if request.selected_proxy:
+                context_config.update(proxy={'server': request.selected_proxy})
             if device:
                 context_config.update(playwright.devices[device])
             browser_type = getattr(playwright, browser_type)
             browser = browser_type.launch(
                 executable_path=request.meta.get('browser_executable_path'),
-                channel=browser_channel, headless=True,
+                channel=browser_channel, headless=headless,
                 # devtools=True,
                 args=['--no-sandbox', '--single-process'],
             )
@@ -455,7 +465,7 @@ class PlaywrightDownloader(BrowserDownloader):
             # automatically dismiss dialogs.
             browser_response = page.goto(request.url, wait_until='networkidle')
             page.add_script_tag(content=DOM_LOAD_HOOK)
-            self.wait_for_hooked_frames(hooked, timeout=request.timeout * 1000, wait_for_load=True)
+            self.wait_for_hooked_frames(hooked, timeout=request.timeout * 1000, wait_for_load=True, raise_for_timeout=False)
 
             # https://www.reddit.com/
             # https://www.steelwood.amsterdam/
