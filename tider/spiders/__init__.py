@@ -13,6 +13,7 @@ class Spider:
     name: Optional[str] = None
     custom_settings: Optional[dict] = None
 
+    meta = {}
     default_ua: Optional[str] = None
 
     def __init__(self, name=None, **kwargs):
