@@ -23,7 +23,7 @@ from tider.exceptions import ImproperlyConfigured, BackendStoreError
 
 E_REDIS_MISSING = """
 You need to install the redis library in order to use \
-the Redis result store backend.
+the Redis spider store backend.
 """
 
 E_REDIS_LOST = 'Connection to Redis lost: Retry (%s/%s) %s.'
@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 
 
 class RedisBackend(KeyValueStoreBackend):
-    """Redis crawler meta store like `redis://[:password]@host:port/db`."""
+    """Redis spider meta store like `redis://[:password]@host:port/db`."""
 
     #: Maximum number of connections in the pool.
     max_connections = None
@@ -77,9 +77,11 @@ class RedisBackend(KeyValueStoreBackend):
 
         config = self.get_config('REDIS_SETTINGS', {})
         self.max_connections = (
-                max_connections or self.get_config('REDIS_MAX_CONNECTIONS')
-                or config.get('max_connections', self.max_connections)
+            max_connections or self.get_config('REDIS_MAX_CONNECTIONS')
+            or config.get('max_connections', self.max_connections)
         )
+        self._ConnectionPool = connection_pool
+
         socket_timeout = self.get_config('REDIS_SOCKET_TIMEOUT') or config.get('socket_timeout')
         socket_connect_timeout = self.get_config('REDIS_SOCKET_CONNECT_TIMEOUT') or config.get('socket_connect_timeout')
         retry_on_timeout = self.get_config('REDIS_RETRY_ON_TIMEOUT') or config.get('retry_on_timeout')
@@ -146,7 +148,6 @@ class RedisBackend(KeyValueStoreBackend):
 
         self.url = url
         self._client = None
-        self._connection_pool = connection_pool
         self.connection_errors, _ = get_redis_error_classes() if get_redis_error_classes else ((), ())
 
     def _params_from_url(self, url, defaults):
@@ -219,16 +220,21 @@ class RedisBackend(KeyValueStoreBackend):
 
     @cached_property
     def _transport_options(self):
-        return self.crawler.settings.get(f'{self.config_namespace}_TRANSPORT_OPTIONS', {})
+        return self.get_config('TRANSPORT_OPTIONS', {})
 
     def _create_client(self, **params):
         return redis.StrictRedis(
             connection_pool=self._get_pool(**params),
         )
-    
-    @staticmethod
-    def _get_pool(**params):
-        return redis.ConnectionPool(**params)
+
+    def _get_pool(self, **params):
+        return self.ConnectionPool(**params)
+
+    @property
+    def ConnectionPool(self):
+        if self._ConnectionPool is None:
+            self._ConnectionPool = redis.ConnectionPool
+        return self._ConnectionPool
 
     @property
     def client(self):
@@ -237,9 +243,10 @@ class RedisBackend(KeyValueStoreBackend):
         return self._client
 
     def close(self):
-        if self._client is None:
-            return
-        self._client.close()
+        if self._client is not None:
+            self._client.close()
+        if self._ConnectionPool is not None:
+            self._ConnectionPool.disconnect()
 
     def ensure(self, fun, args, **policy):
         retry_policy = dict(self.retry_policy, **policy)
@@ -468,3 +475,8 @@ class RedisBackend(KeyValueStoreBackend):
 
     def expire(self, key, value):
         return self.ensure(self.client.expire, args=(key, value))
+
+    def __reduce__(self, args=(), kwargs=None):
+        kwargs = {} if not kwargs else kwargs
+        return super().__reduce__(
+            args, dict(kwargs, expires=self.expires, url=self.url))
