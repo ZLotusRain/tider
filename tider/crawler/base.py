@@ -8,6 +8,7 @@ import platform as _platform
 from typing import Optional, Type
 from datetime import datetime, timezone
 from functools import partial
+from billiard.einfo import ExceptionInfo
 from billiard.common import REMAP_SIGTERM
 from billiard.process import current_process
 
@@ -369,11 +370,14 @@ class Crawler:
         logger.info(f"Crawler info:\n{banner}", {'banner': banner})
 
         self.settings.freeze()
-
+        self.backend.mark_as_started()
         try:
             self.engine = self._create_engine()
             self.engine.start(self.spider, self.broker)
-        except Exception:
+        except Exception as exc:
+            type_, real_exc, tb = sys.exc_info()
+            exception_info = ExceptionInfo((type_, exc, tb))
+            self.backend.mark_as_failure(exc=exc, traceback=exception_info.traceback)
             self.crawling = False
             self.exitcode = EX_FAILURE
             if self.engine is not None:
@@ -388,6 +392,7 @@ class Crawler:
             self.engine.stop()
         if self.pidlock:
             self.pidlock.release()
+        self.backend.close()
         self.extensions.close()
         self.pidbox is not None and self.pidbox.shutdown()
         self.connection.release()

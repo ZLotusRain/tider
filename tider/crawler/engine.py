@@ -239,6 +239,7 @@ class HeartEngine:
                 return self.close_spider(spider, reason='shutdown')
             self.explorer.clear_idle_conns()
             self.maybe_wakeup()
+        self.crawler.backend.mark_as_done()
         self.close_spider(spider, reason='finished')
 
     def _overload(self):
