@@ -446,7 +446,7 @@ class PlaywrightDownloader(BrowserDownloader):
                 executable_path=request.meta.get('browser_executable_path'),
                 channel=browser_channel, headless=headless,
                 # devtools=True,
-                args=['--no-sandbox', '--single-process'],
+                args=['--disable-blink-features=AutomationControlled', '--no-sandbox', '--single-process'],
             )
             # clear caches manually if needed when something is always on load state.
             context = browser.new_context(**context_config, bypass_csp=True)
