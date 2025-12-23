@@ -6,7 +6,7 @@ from typing import List
 
 from tider.mail import MailSender
 from tider.utils.log import get_logger
-from tider.exceptions import ImproperlyConfigured, HTTPError
+from tider.exceptions import ImproperlyConfigured
 
 logger = get_logger(__name__)
 
@@ -16,18 +16,11 @@ class StatsCollector:
     def __init__(self, crawler):
         self._dump = crawler.settings.getbool('STATS_DUMP')
         self._stats = {}
-        self._failures = {}  # failed requests.
-        self._errors = {}  # parsing errors.
-        self._results = {}
 
     def get_value(self, key, default=None):
         return self._stats.get(key, default)
 
     def get_stats(self):
-        if self._failures:
-            self._stats.update(failures=self.get_failures())
-        if self._errors:
-            self._stats.update(errors=self.get_errors())
         return self._stats
 
     def set_value(self, key, value):
@@ -49,42 +42,9 @@ class StatsCollector:
     def clear_stats(self):
         self._stats.clear()
 
-    def get_failures(self):
-        return self._failures
-
-    def add_failure(self, failure):
-        try:
-            failure.check_error()
-        except Exception as e:
-            if isinstance(e, HTTPError):
-                reason = f"Bad status: {failure.status_code}"
-            else:
-                reason = str(e)
-            if reason not in self._failures:
-                self._failures[reason] = []
-            if failure.request.url not in self._failures[reason]:
-                self._failures[reason].append(failure.request.url)
-
-    def get_errors(self):
-        return self._errors
-
-    def add_error(self, reason, request_or_response):
-        if isinstance(reason, KeyError):
-            reason = f"KeyError: {reason}"
-        else:
-            reason = str(reason)
-        if reason not in self._errors:
-            self._errors[reason] = []
-        if request_or_response.url not in self._errors[reason]:
-            self._errors[reason].append(request_or_response.url)
-
     def close_spider(self, spider, reason):
         if reason != 'finished':
             self._stats.update(reason=reason)
-        if self._failures:
-            self._stats.update(failures=self.get_failures())
-        if self._errors:
-            self._stats.update(errors=self.get_errors())
         if self._dump:
             logger.info("Dumping Tider stats:\n" + pprint.pformat(self._stats),
                         extra={'spider': spider})
