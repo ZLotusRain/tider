@@ -11,17 +11,24 @@ logger = get_logger(__name__)
 
 class TitleRow:
 
-    __slots__ = ["titles"]
+    __slots__ = ("name", "titles")
 
-    def __init__(self, titles: list):
-        self.titles = titles
+    def __init__(self, name: str, titles: list):
+        self.name = name
+        self.titles = sorted(titles)
+
+    def __eq__(self, other):
+        if isinstance(other, TitleRow):
+            return self.name == other.name and len(self.titles) == len(other.titles)
+        return False
 
     def __hash__(self) -> int:
-        titles = sorted(self.titles)
         hashed = hash("")
-        for each in titles:
+        for each in self.titles:
             hashed ^= hash(each)
-        return hashed
+        result = hashed ^ hash(self.name)
+        print(result)
+        return hashed ^ hash(self.name)
 
 
 class ExcelPipeline:
@@ -36,24 +43,22 @@ class ExcelPipeline:
         return cls(output=settings["EXCEL_PIPELINE_OUTPUT"])
 
     def process_item(self, item):
-        data = item
-        if isinstance(item, Item):
-            if item.discarded:
-                return
-            data = dict(item)
-        if not isinstance(data, dict):
+        if not isinstance(item, Item):
+            item = Item(**item)
+        if item.discarded:
             return
-        titles = list(data.keys())
-        row = TitleRow(titles)
-        value_row = []
-        for each in list(data.values()):
+        name = item.__class__.__name__
+        titles = list(item.fields.keys())
+        row = TitleRow(name=name, titles=titles)
+        values = []
+        for each in list(item.values()):
             if not isinstance(each, str):
                 try:
                     each = json.dumps(each, ensure_ascii=False)
                 except json.JSONDecodeError:
-                    each = str(each)
-            value_row.append(each)
-        self.sheets[row].append(value_row)
+                    pass
+            values.append(each)
+        self.sheets[row].append(values)
         logger.info(f'Obtained item: {item.jsonify()}')
 
     def close(self):
