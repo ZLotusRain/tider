@@ -19,7 +19,7 @@ class TitleRow:
 
     def __eq__(self, other):
         if isinstance(other, TitleRow):
-            return self.name == other.name and len(self.titles) == len(other.titles)
+            return self.name == other.name and self.titles == other.titles
         return False
 
     def __hash__(self) -> int:
