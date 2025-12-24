@@ -26,8 +26,6 @@ class TitleRow:
         hashed = hash("")
         for each in self.titles:
             hashed ^= hash(each)
-        result = hashed ^ hash(self.name)
-        print(result)
         return hashed ^ hash(self.name)
 
 
