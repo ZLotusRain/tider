@@ -158,7 +158,7 @@ def tider(ctx, app, src, proj, settings, schema, spider, workdir, version):
         app = _get_default_app(src_dirname=src,
                                proj=proj,
                                custom_settings=settings)
-    ctx.obj = CLIContext(app=app, workdir=workdir, schema=schema, spider=spider)
+    ctx.obj = CLIContext(app=app, workdir=workdir, project=proj, schema=schema, spider=spider)
 
 
 tider.add_command(crawl)
