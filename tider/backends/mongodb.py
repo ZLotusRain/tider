@@ -212,6 +212,7 @@ class MongoBackend(Backend):
         if obj:
             return self.meta_from_decoded({
                 'group': obj['group'],
+                'project': obj['project'],
                 'schema': obj['schema'],
                 'spidername': obj['spidername'],
                 'server': obj['server'],
@@ -231,6 +232,7 @@ class MongoBackend(Backend):
         for obj in objs:
             meta = self.meta_from_decoded({
                 'group': obj['group'],
+                'project': obj['project'],
                 'schema': obj['schema'],
                 'spidername': obj['spidername'],
                 'server': obj['server'],

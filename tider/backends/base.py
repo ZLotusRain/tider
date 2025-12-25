@@ -111,7 +111,7 @@ class Backend:
 
     def mark_as_started(self):
         """Mark spider as started."""
-        return self.store_snapshot(State.STARTED)
+        return self.store_snapshot(State.STARTED, override=True)
 
     def mark_as_done(self, store_snapshot=True, state=State.SUCCESS):
         """Mark spider as successfully executed."""
@@ -234,7 +234,7 @@ class Backend:
 
     def prepare_value(self):
         """Prepare value for storage."""
-        return self.spider.meta
+        return self.spider.meta.copy()
 
     def prepare_expires(self, value, exp_type=None):
         if value is None:
@@ -265,6 +265,7 @@ class Backend:
             date_done = None
         meta = {
             'group': self.crawler.group,
+            'project': self.crawler.project,
             'schema': self.crawler.schema,
             'spidername': self.crawler.spidername,
             'server': self.crawler.svr,
@@ -280,13 +281,17 @@ class Backend:
     def _sleep(self, amount):
         self.crawler.sleep(amount)
 
-    def store_snapshot(self, state: State = State.RUNNING, exc=None, traceback=None, **kwargs):
+    def store_snapshot(self, state: State = State.RUNNING, exc=None, traceback=None, override=False, **kwargs):
         """Update spider states and stats.
 
         if always_retry_backend_operation is activated, in the event of a recoverable exception,
         then retry operation with an exponential backoff until a limit has been reached.
         """
-        snapshot = self.encode_snapshot(state, exc=exc)
+        if not override:
+            snapshot = self.get_spider_meta().get('meta') or {}
+            snapshot.update(self.encode_snapshot(state, exc=exc))
+        else:
+            snapshot = self.encode_snapshot(state, exc=exc)
         retries = 0
         while True:
             try:
