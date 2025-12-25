@@ -13,7 +13,6 @@ class Spider:
     name: Optional[str] = None
     custom_settings: Optional[dict] = None
 
-    meta = {}
     default_ua: Optional[str] = None
 
     def __init__(self, name=None, **kwargs):
@@ -23,10 +22,12 @@ class Spider:
             warnings.warn(f"{type(self).__name__} doesn't have a name, use class name instead.")
             self.name = self.__class__.__name__
 
+        self.meta = {"failures": [], "errors": []}  # unprocessed or uncaught
+        self.meta.update(kwargs.pop('meta', {}))
         self.__dict__.update(kwargs)
         if not hasattr(self, 'start_urls'):
             self.start_urls = []
-        self.default_ua = default_user_agent()
+        self.default_ua = self.default_ua or default_user_agent()
 
     @property
     def logger(self) -> logging.LoggerAdapter:
