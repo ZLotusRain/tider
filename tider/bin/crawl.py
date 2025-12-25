@@ -148,6 +148,7 @@ def crawl(ctx, spider, hostname=None, transport=None, pool=None, concurrency=Non
 
         crawler = app.Crawler(
             app.load(spider or ctx.obj.spider, schema=ctx.obj.schema),
+            project=ctx.obj.project,
             schema=ctx.obj.schema,
             hostname=hostname,
             concurrency=concurrency,

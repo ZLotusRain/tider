@@ -26,15 +26,16 @@ else:
 
 class CLIContext:
 
-    def __init__(self, app, schema=None, spider=None, workdir=None,
-                 no_color=False, quiet=False):
+    def __init__(self, app, project=None, schema=None, spider=None,
+                 workdir=None, no_color=False, quiet=False):
         self.app = app
+        self.schema = schema
+        self.project = project
         self.spider = spider
 
         self.no_color = no_color
         self.quiet = quiet
         self.workdir = workdir
-        self.schema = schema
 
     @cached_property
     def OK(self):

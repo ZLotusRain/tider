@@ -105,7 +105,7 @@ class Crawler:
     #: contains the exit code if a :exc:`SystemExit` event is handled.
     exitcode = None
 
-    def __init__(self, spidercls, schema='default', app=None, hostname=None, concurrency=None, pool_cls=None,
+    def __init__(self, spidercls, schema=None, app=None, project=None, hostname=None, concurrency=None, pool_cls=None,
                  scheduler_cls=None, explorer_cls=None, data_source="", broker_transport=None,
                  broker_wait_timeout=None, stats_cls=None, alarm_cls=None, backend_cls=None, debug=False,
                  loglevel=None, logfile=None, pidfile=None, purge=False, allow_duplicates=False):
@@ -113,6 +113,7 @@ class Crawler:
             raise ValueError("The spidercls argument must be a class, not an object")
         self.spidercls: Type[Spider] = spidercls
         self.schema = schema or 'default'
+        self.project = project or 'default'
 
         self.app = app or self.app
         self._source_hostname = hostname
