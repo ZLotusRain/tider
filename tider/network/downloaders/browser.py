@@ -79,6 +79,20 @@ INIT_SCRIPT = """
     //     return originElementAddEventListener.apply(this, arguments);
     // }
     
+    Object.defineProperty(Object.getPrototypeOf(navigator), 'webdriver', {
+        set: undefined,
+        enumerable: true,
+        configurable: true,
+        get: new Proxy(
+            Object.getOwnPropertyDescriptor(Object.getPrototypeOf(navigator), 'webdriver').get,
+            { apply: (target, thisArg, args) => {
+                // emulate getter call validation
+                Reflect.apply(target, thisArg, args);
+                return false;
+            }}
+        )
+    });
+    
     function delay(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
     };
@@ -168,7 +182,6 @@ INIT_SCRIPT = """
 INIT_SCRIPT = HACKED_CREATE_ELEMENT + HACKED_ATTACH_SHADOW + CREATE_HOOKED_ELEMENT + INIT_SCRIPT
 
 STYLE_PATCH = """
-    Object.defineProperties(navigator, {webdriver:{get:()=>undefined}});
     // document.body.scrollHeight = documentElement.scrollHeight = scrollingElement.scrollHeight
     () => {
         const styleSheets = document.styleSheets;
@@ -439,7 +452,10 @@ class PlaywrightDownloader(BrowserDownloader):
             context_config = {'ignore_https_errors': True}
             if request.selected_proxy:
                 context_config.update(proxy={'server': request.selected_proxy})
+            if request.headers.get('User-Agent'):
+                context_config.update(user_agent=request.headers['User-Agent'])
             if device:
+                # device is prior to the default ua.
                 context_config.update(playwright.devices[device])
             browser_type = getattr(playwright, browser_type)
             browser = browser_type.launch(
