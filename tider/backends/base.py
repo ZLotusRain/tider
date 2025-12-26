@@ -289,7 +289,20 @@ class Backend:
         """
         if not override:
             snapshot = self.get_spider_meta().get('meta') or {}
-            snapshot.update(self.encode_snapshot(state, exc=exc))
+            new = self.encode_snapshot(state, exc=exc)
+            new_errors = new.pop('errors', None)
+            if new_errors:
+                snapshot.setdefault('errors', [])
+                for new_error in new_errors:
+                    if new_error not in snapshot['errors']:
+                        snapshot['errors'].append(new_error)
+            new_failures = new.pop('failures', None)
+            if new_failures:
+                snapshot.setdefault('failures', [])
+                for new_failure in new_failures:
+                    if new_failure not in snapshot['failures']:
+                        snapshot['failures'].append(new_failure)
+            snapshot.update(new)
         else:
             snapshot = self.encode_snapshot(state, exc=exc)
         retries = 0
