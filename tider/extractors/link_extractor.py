@@ -148,15 +148,16 @@ class FileExtExtractor:
 
 
 class Link:
-    __slots__ = ["ext", "nofollow", "alt", "text", "title", "url"]
+    __slots__ = ["ext", "tag", "nofollow", "alt", "text", "title", "url"]
 
     def __init__(
-        self, url: str, title: str = "", text: str = "", alt: str = "", ext: str = "", nofollow: bool = False
+        self, url: str, tag: str, title: str = "", text: str = "", alt: str = "", ext: str = "", nofollow: bool = False
     ):
         if not isinstance(url, str):
             got = url.__class__.__name__
             raise TypeError(f"Link urls must be str objects, got {got}")
         self.url: str = url
+        self.tag: str = tag
         self.title: str = title
         self.text: str = text
         self.alt: str = alt
@@ -179,6 +180,7 @@ class Link:
             raise NotImplementedError
         return (
             self.url == other.url
+            and self.tag == other.tag
             and self.title == other.title
             and self.text == other.text
             and self.alt == other.alt
@@ -188,7 +190,7 @@ class Link:
 
     def __hash__(self) -> int:
         return (
-            hash(self.url) ^ hash(self.title) ^ hash(self.text) ^ hash(self.ext) ^ hash(self.nofollow)
+            hash(self.url) ^ hash(self.tag) ^ hash(self.title) ^ hash(self.text) ^ hash(self.ext) ^ hash(self.nofollow)
         )
 
     def __repr__(self) -> str:
@@ -217,7 +219,7 @@ class LinkExtractor:
                  tags=('a', 'area'), attrs=('href',), on_extract=None, unique=False,
                  allow_titles=(), deny_titles=(), deny_extensions=None, restrict_css=(),
                  file_only=False, ignored_file_types=('Possibly dangerous files',), guess_extension=True,
-                 include_extensions=(), file_hints=(), strip=True):
+                 include_extensions=(), file_hints=(), file_tags=('img', ), strip=True):
         self.tags, self.attrs = set(arg_to_iter(tags)), set(arg_to_iter(attrs))
         self.scan_tags = partial(operator.contains, self.tags)
         self.scan_attrs = partial(operator.contains, self.attrs)
@@ -240,6 +242,7 @@ class LinkExtractor:
 
         self.file_only = file_only
         self.file_hints = self.file_hints | set(arg_to_iter(file_hints))
+        self.file_tags = set(arg_to_iter(file_tags))
         exclude_extensions = {e.split('.', maxsplit=1)[-1] if e.startswith('.') else e for e in arg_to_iter(deny_extensions)}
         self.ext_extractor = FileExtExtractor(ignored_types=ignored_file_types, guess=guess_extension,
                                               includes=include_extensions, excludes=exclude_extensions)
@@ -283,7 +286,7 @@ class LinkExtractor:
         if self.file_only:
             if link['url'].endswith(tuple(self.ext_extractor.NETWORK_RELATED)):
                 return False
-            if link['ext'] or link['title'] in self.file_hints:
+            if link['ext'] or link['title'] in self.file_hints or link['tag'] in self.file_tags:
                 # some file links don't end with extensions.
                 return True
             return False
@@ -335,7 +338,7 @@ class LinkExtractor:
                 title = text
             alt = el.attrib.get("alt") or ""
             ext = self.ext_extractor.extract(title) or self.ext_extractor.extract(url, source_type='url')
-            links.append(Link(url=url, title=str(title).strip(), text=text, alt=alt, ext=ext,  nofollow=rel_has_nofollow(el.get("rel"))))
+            links.append(Link(url=url, tag=el.tag, title=str(title).strip(), text=text, alt=alt, ext=ext,  nofollow=rel_has_nofollow(el.get("rel"))))
         return links
 
     def extract_links(self, response):
