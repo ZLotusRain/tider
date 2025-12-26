@@ -1,4 +1,5 @@
 import time
+import traceback
 from queue import Full
 from collections import deque
 
@@ -9,7 +10,7 @@ from tider.platforms import EX_FAILURE
 from tider.utils.log import get_logger
 from tider.utils.functional import iter_generator
 from tider.utils.misc import symbol_by_name, build_from_crawler
-from tider.exceptions import SpiderShutdown, SpiderTerminate
+from tider.exceptions import DownloadError, SpiderShutdown, SpiderTerminate
 
 __all__ = ('Parser', )
 
@@ -136,6 +137,17 @@ class Parser:
             if response.failed:
                 if errback:
                     spider_outputs = errback(response)
+                else:
+                    try:
+                        response.check_error()
+                    except DownloadError as exc:
+                        failure = {
+                            "request": request.to_dict(spider=self.crawler.spider),
+                            "type": exc.__class__.__name__,
+                            "reason": str(exc),
+                            "time": int(time.time() * 1000)
+                        }
+                        self.crawler.spider.meta['failures'].append(failure)
                 self.crawler.stats.inc_value("request/count/failed")
             else:
                 spider_outputs = callback(response)
@@ -159,6 +171,13 @@ class Parser:
             raise
         except Exception as e:
             logger.exception(f"Parser bug processing {request}")
+            error = {
+                "request": request.to_dict(spider=self.crawler.spider),
+                "time": int(time.time() * 1000),
+                "type": e.__class__.__name__,
+                "traceback": traceback.format_exc()
+            }
+            self.crawler.spider.meta['errors'].append(error)
             self.crawler.stats.inc_value(f"parser/{e.__class__.__name__}/count")
         finally:
             del callback, errback
@@ -194,6 +213,12 @@ class Parser:
                     "Ignoring link (depth > %(maxdepth)d): %(requrl)s ",
                     {'maxdepth': self.max_depth, 'requrl': request.url},
                 )
+                failure = {
+                    "request": request.to_dict(spider=self.crawler.spider),
+                    "reason": "Exceeded max depth",
+                    "time": int(time.time() * 1000)
+                }
+                self.crawler.spider.meta['failures'].append(failure)
                 return False
 
             if 'parse_times' not in request.meta:
@@ -205,7 +230,14 @@ class Parser:
                     "Ignoring link (parse_times > %(max_parse_times)d): %(requrl)s ",
                     {'max_parse_times': self.max_depth, 'requrl': request.url},
                 )
+                failure = {
+                    "request": request.to_dict(spider=self.crawler.spider),
+                    "reason": "Exceeded max parse times",
+                    "time": int(time.time() * 1000)
+                }
+                self.crawler.spider.meta['failures'].append(failure)
                 return False
+
         return True
 
     def _process_spider_output(self, output, request):
