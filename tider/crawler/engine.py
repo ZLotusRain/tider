@@ -154,12 +154,12 @@ class HeartEngine:
                 scheduled += 1
                 # don't judge spider_closed event because the spider_closed
                 # event will be set after start_requests iterated in dummy broker.
-                self.crawler.sleep(0.001)
+                self.crawler.sleep(5e-3)
             self.polling = False
             if not loop:
                 break
             # maybe switch greenlet
-            self.crawler.sleep(0.001)  # avoid stuck in threads.
+            self.crawler.sleep(0.01)  # avoid stuck in threads.
 
     @inthread(name='Poller')
     def _poll(self):
@@ -227,20 +227,40 @@ class HeartEngine:
                             queues=self.settings.getlist('BROKER_QUEUES'),
                             on_message=on_message, on_message_consumed=on_message_consumed)
 
+        last_error_time = last_failure_time = None
         while self.active():
             try:
                 state.maybe_shutdown()
                 # maybe stuck here when using threads
                 # and gevent monkey patch at the same time
-                self.connection.drain_events(timeout=2.0)
+                self.connection.drain_events(timeout=0.5)  # keep CPU active.
             except socket.timeout:
                 pass
             except (SpiderShutdown, SpiderTerminate):  # control shutdown
                 return self.close_spider(spider, reason='shutdown')
-            self.explorer.clear_idle_conns()
             self.maybe_wakeup()
+            last_error_time, last_failure_time = self._flush_errors_and_failures(last_error_time, last_failure_time)
+            self.explorer.clear_idle_conns()
         self.crawler.backend.mark_as_done()
         self.close_spider(spider, reason='finished')
+
+    def _flush_errors_and_failures(self, last_error_time=None, last_failure_time=None):
+        meta = self.crawler.spider.meta
+        store_snapshot = False
+        if meta.get('errors') or meta.get('failures'):
+            if meta['errors'] and last_error_time != meta['errors'][-1]['time']:
+                store_snapshot = True
+                last_error_time = meta['errors'][-1]['time']
+            if meta['failures'] and last_failure_time != meta['failures'][-1]['time']:
+                store_snapshot = True
+                last_failure_time = meta['failures'][-1]['time']
+        if store_snapshot:
+            self.crawler.backend.store_snapshot()
+        if 'errors' in meta:
+            del meta['errors'][:-10]  # atomic operation and thread safe
+        if 'failures' in meta:
+            del meta['failures'][:-10]
+        return last_error_time, last_failure_time
 
     def _overload(self):
         limit = self.crawler.concurrency * 3
