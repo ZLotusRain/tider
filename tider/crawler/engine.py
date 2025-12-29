@@ -241,8 +241,8 @@ class HeartEngine:
             self.maybe_wakeup()
             last_error_time, last_failure_time = self._flush_errors_and_failures(last_error_time, last_failure_time)
             self.explorer.clear_idle_conns()
-        self.crawler.backend.mark_as_done()
         self.close_spider(spider, reason='finished')
+        self.crawler.backend.mark_as_done()
 
     def _flush_errors_and_failures(self, last_error_time=None, last_failure_time=None):
         meta = self.crawler.spider.meta
