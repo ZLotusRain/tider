@@ -738,7 +738,7 @@ class AMQPBroker(Broker):
                     ignore_errors(connection, consumer.close)
                     connection.release()
 
-                    connection = self.connect(transport_options=transport_options)
+                    connection = self.connect(transport_options=transport_options)  # change settings if needed.
                     consumer = self.MessageConsumer(channel=connection, queues=queues,
                                                     accept=None, on_decode_error=on_decode_error)
                     consumer.on_message = on_message
