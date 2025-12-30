@@ -289,38 +289,23 @@ class Backend:
         """
         if not override:
             snapshot = self.get_spider_meta().get('meta') or {}
-            snapshot.setdefault('errors', [])
-            snapshot_errors = []
-            for error in snapshot.get('errors', []):
-                error = error.copy()
-                error.pop('meta', None)
-                error.pop('cb_kwargs', None)
-                snapshot_errors.append(error)
-            snapshot.setdefault('failures', [])
-            snapshot_failures = []
-            for failure in snapshot.get('failures', []):
-                failure = failure.copy()
-                failure.pop('meta', None)
-                failure.pop('cb_kwargs', None)
-                snapshot_failures.append(failure)
-
             new = self.encode_snapshot(state, exc=exc)
-            new_errors = new.pop('errors', None)
-            if new_errors:
-                for new_error in new_errors:
-                    tmp = new_error.copy()
-                    tmp.pop('meta', None)
-                    tmp.pop('cb_kwargs', None)
-                    if tmp not in snapshot_errors:
-                        snapshot['errors'].append(new_error)
-            new_failures = new.pop('failures', None)
-            if new_failures:
-                for new_failure in new_failures:
-                    tmp = new_failure.copy()
-                    tmp.pop('meta', None)
-                    tmp.pop('cb_kwargs', None)
-                    if tmp not in snapshot_failures:
-                        snapshot['failures'].append(new_failure)
+            for field in ('errors', 'failures'):
+                existing_items = snapshot.setdefault(field, [])
+                existing_fps = set()
+                for item in existing_items:
+                    fp = item.copy()
+                    fp.pop('meta', None)
+                    fp.pop('cb_kwargs', None)
+                    existing_fps.add(fp)
+                new_items = new.pop(field, None)
+                if new_items:
+                    for new_item in new_items:
+                        fp = new_item.copy()
+                        fp.pop('meta', None)
+                        fp.pop('cb_kwargs', None)
+                        if fp not in existing_fps:
+                            existing_items.append(new_item)
             snapshot.update(new)
         else:
             snapshot = self.encode_snapshot(state, exc=exc)
