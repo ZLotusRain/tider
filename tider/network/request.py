@@ -1,3 +1,4 @@
+import base64
 import time
 import hashlib
 import inspect
@@ -389,7 +390,7 @@ class Request:
             cache[cache_key] = fp.hexdigest()
         return cache[cache_key]
 
-    def to_dict(self, spider=None) -> dict:
+    def to_dict(self, spider=None, encode_body=False) -> dict:
         """Return a dictionary containing the Request's data."""
         # callback or errback either be a string or None object or must be bound to a spider
         d = {
@@ -408,6 +409,8 @@ class Request:
                 elif isinstance(value, RequestsCookieJar):
                     value = value.get_dict()
                 d.setdefault(attr, value)
+            if encode_body and isinstance(d.get('body'), bytes):
+                d['body'] = base64.b64encode(d['body']).decode()
         if type(self) is not Request:
             d["_class"] = self.__module__ + '.' + self.__class__.__name__
         return d
