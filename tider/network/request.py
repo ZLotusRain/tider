@@ -397,11 +397,11 @@ class Request:
             "errback": _find_method(spider, self.errback) if callable(self.errback) else self.errback
         }
         for attr in (*self.__dict__.keys(), *self.INTERNAL_ATTRIBUTES):
-            if attr.startswith("_"):
-                continue
             value = getattr(self, attr)
-            if attr == 'prepared':
+            if attr == '_prepared':
                 d.update(value.to_dict())
+            elif attr.startswith("_"):
+                continue
             else:
                 if isinstance(value, tuple):
                     value = list(value)
