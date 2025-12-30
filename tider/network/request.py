@@ -1,7 +1,6 @@
 import time
 import hashlib
 import inspect
-from http.cookiejar import CookieJar
 from weakref import WeakKeyDictionary
 from w3lib.url import canonicalize_url
 from typing import Optional
@@ -13,7 +12,7 @@ from requests.exceptions import (
     MissingSchema,
 )
 from requests.structures import CaseInsensitiveDict
-from requests.cookies import cookiejar_from_dict, merge_cookies
+from requests.cookies import RequestsCookieJar, cookiejar_from_dict, merge_cookies
 
 from tider.network.proxy import Proxy
 from tider.exceptions import InvalidRequest
@@ -142,12 +141,13 @@ class PreparedRequest(_PreparedRequest):
         return p
 
     def to_dict(self):
+        cookies = self.cookies.get_dict() if isinstance(self.cookies, RequestsCookieJar) else self.cookies
         return {
             'method': self.method,
             'url': self.url,
             'auth': self.auth,
-            'headers': self.headers,
-            'cookies': self.cookies,
+            'headers': dict(self.headers),
+            'cookies': cookies,
             'body': self.body,
             'body_position': self._body_position,
         }
@@ -174,7 +174,7 @@ class Request:
         else:
             self._prepared = self._prepare(url=url, **request_kwargs)
 
-        if not isinstance(session_cookies, CookieJar):
+        if not isinstance(session_cookies, RequestsCookieJar):
             session_cookies = cookiejar_from_dict(session_cookies)
         self.session_cookies = merge_cookies(session_cookies, self.cookies)
 
@@ -403,6 +403,10 @@ class Request:
             if attr == 'prepared':
                 d.update(value.to_dict())
             else:
+                if isinstance(value, tuple):
+                    value = list(value)
+                elif isinstance(value, RequestsCookieJar):
+                    value = value.get_dict()
                 d.setdefault(attr, value)
         if type(self) is not Request:
             d["_class"] = self.__module__ + '.' + self.__class__.__name__
