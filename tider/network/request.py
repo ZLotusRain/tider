@@ -409,8 +409,8 @@ class Request:
                 elif isinstance(value, RequestsCookieJar):
                     value = value.get_dict()
                 d.setdefault(attr, value)
-            if encode_body and isinstance(d.get('body'), bytes):
-                d['body'] = base64.b64encode(d['body']).decode()
+        if encode_body and isinstance(d.get('body'), bytes):
+            d['body'] = base64.b64encode(d['body']).decode()
         if type(self) is not Request:
             d["_class"] = self.__module__ + '.' + self.__class__.__name__
         return d
