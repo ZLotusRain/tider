@@ -289,18 +289,37 @@ class Backend:
         """
         if not override:
             snapshot = self.get_spider_meta().get('meta') or {}
+            snapshot.setdefault('errors', [])
+            snapshot_errors = []
+            for error in snapshot.get('errors', []):
+                error = error.copy()
+                error.pop('meta', None)
+                error.pop('cb_kwargs', None)
+                snapshot_errors.append(error)
+            snapshot.setdefault('failures', [])
+            snapshot_failures = []
+            for failure in snapshot.get('failures', []):
+                failure = failure.copy()
+                failure.pop('meta', None)
+                failure.pop('cb_kwargs', None)
+                snapshot_failures.append(failure)
+
             new = self.encode_snapshot(state, exc=exc)
             new_errors = new.pop('errors', None)
             if new_errors:
-                snapshot.setdefault('errors', [])
                 for new_error in new_errors:
-                    if new_error not in snapshot['errors']:
+                    tmp = new_error.copy()
+                    tmp.pop('meta', None)
+                    tmp.pop('cb_kwargs', None)
+                    if tmp not in snapshot_errors:
                         snapshot['errors'].append(new_error)
             new_failures = new.pop('failures', None)
             if new_failures:
-                snapshot.setdefault('failures', [])
                 for new_failure in new_failures:
-                    if new_failure not in snapshot['failures']:
+                    tmp = new_failure.copy()
+                    tmp.pop('meta', None)
+                    tmp.pop('cb_kwargs', None)
+                    if tmp not in snapshot_failures:
                         snapshot['failures'].append(new_failure)
             snapshot.update(new)
         else:
