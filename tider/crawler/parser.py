@@ -142,7 +142,7 @@ class Parser:
                         response.check_error()
                     except DownloadError as exc:
                         failure = {
-                            "request": request.to_dict(spider=self.crawler.spider),
+                            "request": request.to_dict(spider=self.crawler.spider, encode_body=True),
                             "type": exc.__class__.__name__,
                             "reason": str(exc),
                             "time": int(time.time() * 1000)
@@ -172,7 +172,7 @@ class Parser:
         except Exception as e:
             logger.exception(f"Parser bug processing {request}")
             error = {
-                "request": request.to_dict(spider=self.crawler.spider),
+                "request": request.to_dict(spider=self.crawler.spider, encode_body=True),
                 "time": int(time.time() * 1000),
                 "type": e.__class__.__name__,
                 "traceback": traceback.format_exc()
@@ -214,7 +214,7 @@ class Parser:
                     {'maxdepth': self.max_depth, 'requrl': request.url},
                 )
                 failure = {
-                    "request": request.to_dict(spider=self.crawler.spider),
+                    "request": request.to_dict(spider=self.crawler.spider, encode_body=True),
                     "reason": "Exceeded max depth",
                     "time": int(time.time() * 1000)
                 }
@@ -231,7 +231,7 @@ class Parser:
                     {'max_parse_times': self.max_depth, 'requrl': request.url},
                 )
                 failure = {
-                    "request": request.to_dict(spider=self.crawler.spider),
+                    "request": request.to_dict(spider=self.crawler.spider, encode_body=True),
                     "reason": "Exceeded max parse times",
                     "time": int(time.time() * 1000)
                 }
