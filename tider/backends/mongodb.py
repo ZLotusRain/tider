@@ -206,9 +206,10 @@ class MongoBackend(Backend):
         except InvalidDocument as exc:
             raise EncodeError(exc)
 
-    def _get_spider_meta(self):
+    def _get_spider_meta(self, spider_id=None):
         """Get spider meta-data."""
-        obj = self.collection.find_one({'_id': self._store_id})
+        spider_id = spider_id or self._store_id
+        obj = self.collection.find_one({'_id': spider_id})
         if obj:
             return self.meta_from_decoded({
                 'group': obj['group'],
