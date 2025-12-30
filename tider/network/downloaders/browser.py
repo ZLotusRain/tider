@@ -472,7 +472,9 @@ class PlaywrightDownloader(BrowserDownloader):
             page.add_init_script(script=INIT_SCRIPT)
             if init_script or init_script_path:
                 page.add_init_script(script=init_script, path=init_script_path)
-            page.set_extra_http_headers(dict(request.headers))
+            headers = dict(request.headers)
+            headers.pop('Accept-Encoding', None)  # detected spider characteristic.
+            page.set_extra_http_headers(headers)
 
             page.on('response', self.on_response)
             page.route("**/*", functools.partial(self.handle_route, hooked=hooked, banned_routes=banned_routes))
