@@ -355,7 +355,7 @@ class Backend:
         """
         return False
 
-    def get_spider_meta(self):
+    def get_spider_meta(self, spider_id=None):
         """Get spider meta from backend.
 
         if always_retry_backend_operation is activated, in the event of a recoverable exception,
@@ -364,7 +364,7 @@ class Backend:
         retries = 0
         while True:
             try:
-                return self._get_spider_meta()
+                return self._get_spider_meta(spider_id=spider_id)
             except Exception as exc:
                 if self.always_retry and self.exception_safe_to_retry(exc):
                     if retries < self.max_retries:
@@ -458,18 +458,19 @@ class KeyValueStoreBackend(Backend):
     def expire(self, key, value):
         pass
 
-    def _get_spider_meta(self):
+    def _get_spider_meta(self, spider_id=None):
         """Get spider meta-data."""
-        meta = self.get(self.get_spider_key())
+        meta = self.get(self.get_spider_key(spider_id=spider_id))
         if not meta:
             return {'status': State.PENDING, 'meta': None}
         return self.decode_meta(meta)
 
-    def get_spider_key(self):
+    def get_spider_key(self, spider_id=None):
         """Get the cache key for spider."""
+        spider_id = spider_id or self._store_id
         key_t = self.key_t
         return key_t('').join([
-            self.spider_keyprefix, key_t(self._store_id)
+            self.spider_keyprefix, key_t(spider_id)
         ])
 
     def get_group_key(self):
