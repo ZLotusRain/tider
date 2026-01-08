@@ -4,7 +4,7 @@ from functools import reduce
 from importlib import import_module
 from types import ModuleType
 
-__all__ = ('Proxy', 'PromiseProxy')
+__all__ = ('Proxy', 'PromiseProxy', 'try_import')
 
 __module__ = __name__  # used by Proxy class body
 
@@ -27,6 +27,17 @@ def _default_cls_attr(name, type_, cls_value):
     return type(name, (type_,), {
         '__new__': __new__, '__get__': __get__,
     })
+
+
+def try_import(module, default=None):
+    """Try to import and return module.
+
+    Returns None if the module does not exist.
+    """
+    try:
+        return import_module(module)
+    except ImportError:
+        return default
 
 
 class Proxy:

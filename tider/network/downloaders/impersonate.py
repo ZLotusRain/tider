@@ -12,7 +12,6 @@ except ImportError:
 from tider import Request, Response
 from tider.utils.time import preferred_clock
 from tider.utils.log import get_logger
-from tider.utils.misc import try_import
 from tider.exceptions import ImproperlyConfigured
 
 logger = get_logger(__name__)
@@ -50,12 +49,17 @@ class ImpersonateDownloader:
 
     def __init__(self, concurrency=None):
         self._thread = None
-        gevent_monkey = try_import('gevent.monkey')
-        eventlet_patcher = try_import('eventlet.patcher')
-        if gevent_monkey and gevent_monkey.is_anything_patched():
-            self._thread = 'gevent'
-        elif eventlet_patcher and eventlet_patcher.already_patched:
-            self._thread = 'eventlet'
+        try:
+            import gevent.monkey
+            if gevent.monkey.is_anything_patched():
+                self._thread = 'gevent'
+        except ImportError:
+            try:
+                import eventlet.patcher
+                if eventlet.patcher.already_patched:
+                    self._thread = 'eventlet'
+            except ImportError:
+                pass
         if self._thread:
             logger.warning("Using greenlet with ImpersonateDownloader will obviously decrease the crawling speed.")
         if concurrency and concurrency >= 50:

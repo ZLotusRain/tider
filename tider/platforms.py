@@ -18,7 +18,7 @@ from kombu.utils.compat import maybe_fileno
 from billiard.compat import close_open_fds, get_fdmax
 from billiard.util import set_pdeathsig as _set_pdeathsig
 
-from tider.utils.misc import try_import
+from tider.local import try_import
 from tider.utils.nodenames import nodesplit
 from tider.exceptions import reraise, SecurityError
 
