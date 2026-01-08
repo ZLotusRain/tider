@@ -1,9 +1,12 @@
 import os
 import re
 import csv
-import json
 import xlrd
 import zipfile
+try:
+    import rarfile
+except ImportError:
+    rarfile = None
 import openpyxl
 from io import BytesIO, TextIOWrapper
 
@@ -12,12 +15,9 @@ from kombu.message import Message as KombuMessage
 from tider import Request
 from tider.brokers import Broker
 from tider.utils.log import get_logger
-from tider.utils.misc import try_import
 from tider.exceptions import ImproperlyConfigured
 
 logger = get_logger(__name__)
-
-rarfile = try_import('rarfile')
 
 
 class Message(KombuMessage):

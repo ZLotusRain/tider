@@ -1,11 +1,8 @@
-import sys
 import hashlib
-import importlib
-
 from typing import Iterable
-from pkgutil import iter_modules
 
 from tider.item import Item
+from tider.utils.imports import symbol_by_name
 from tider.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -69,96 +66,7 @@ def try_copy(obj):
         return type(obj)(obj)
     elif hasattr(obj, 'copy'):
         return obj.copy()
-    return obj
-
-
-def load_object(path):
-    """Load an object given its absolute object path, and return it.
-
-    The object can be the import path of a class, function, variable or an
-    instance.
-
-    If ``path`` is not a string, but is a callable object, such as a class or
-    a function, then return it as is.
-    """
-
-    if not isinstance(path, str):
-        if callable(path):
-            return path
-        else:
-            raise TypeError("Unexpected argument type, expected string "
-                            f"or object, got: {type(path)}")
-
-    try:
-        dot = path.rindex('.')
-    except ValueError:
-        raise ValueError(f"Error loading object '{path}': not a full path")
-
-    module, name = path[:dot], path[dot + 1:]
-    mod = importlib.import_module(module)
-
-    try:
-        obj = getattr(mod, name)
-    except AttributeError:
-        raise NameError(f"Module '{module}' doesn't define any object named '{name}'")
-
-    return obj
-
-
-def symbol_by_name(name, aliases=None, imp=None, package=None, sep='.', default=None):
-    """Get symbol by qualified name.
-
-    The name should be the full dot-separated path to the class::
-
-        modulename.ClassName
-
-    Example::
-
-        tider.concurrency.processes.TaskPool
-                                    ^- class name
-
-    or using ':' to separate module and symbol::
-
-        tider.concurrency.processes:TaskPool
-
-    If `aliases` is provided, a dict containing short name/long name
-    mappings, the name is looked up in the aliases first.
-
-    """
-    aliases = {} if not aliases else aliases
-    if imp is None:
-        imp = importlib.import_module
-
-    if not isinstance(name, str):
-        return name  # already a class
-
-    name = aliases.get(name) or name
-    sep = ':' if ':' in name else sep
-    module_name, _, cls_name = name.rpartition(sep)
-    if not module_name:
-        cls_name, module_name = None, package if package else cls_name
-    try:
-        try:
-            module = imp(module_name, package=package)
-        except ValueError as exc:
-            logger.error(f"Couldn't import {name!r}: {exc}")
-        else:
-            return getattr(module, cls_name) if cls_name else module
-    except (ImportError, AttributeError):
-        if default is None:
-            raise
-    return default
-
-
-def try_import(module, default=None):
-    """Try to import and return module.
-
-    Returns None if the module does not exist.
-    """
-    try:
-        return importlib.import_module(module)
-    except ImportError:
-        return default
+    raise TypeError(f"Not a copyable object, got: {type(obj)}")
 
 
 def build_from_crawler(objcls, crawler, *args, **kwargs):
@@ -180,29 +88,6 @@ def build_from_crawler(objcls, crawler, *args, **kwargs):
     if instance is None:
         raise TypeError(f"{objcls.__qualname__}.{method_name} returned None")
     return instance
-
-
-def walk_modules(path):
-    """Loads a module and all its submodules from the given module path and
-    returns them. If *any* module throws an exception while importing, that
-    exception is thrown back.
-
-    For example: walk_modules('tider.utils')
-    """
-
-    mods = []
-    sys.modules.pop(path, None)  # reload
-    mod = importlib.import_module(path)
-    mods.append(mod)
-    if hasattr(mod, '__path__'):
-        for _, subpath, ispkg in iter_modules(mod.__path__):
-            fullpath = path + '.' + subpath
-            if ispkg:
-                mods += walk_modules(fullpath)
-            else:
-                submod = importlib.import_module(fullpath)
-                mods.append(submod)
-    return mods
 
 
 def md5sum(file):
