@@ -6,13 +6,13 @@ from threading import RLock
 from collections import defaultdict
 
 try:
-    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+    from playwright.sync_api import (
+        sync_playwright,
+        TimeoutError as PlaywrightTimeoutError,
+        Error as PlaywrightError
+    )
 except ImportError:
-    sync_playwright = PlaywrightTimeoutError = None
-try:
-    from DrissionPage import Chromium, ChromiumOptions
-except ImportError:
-    Chromium = ChromiumOptions = None
+    sync_playwright = PlaywrightTimeoutError = PlaywrightError = None
 
 from tider import Request, Response
 from tider.utils.time import preferred_clock
@@ -21,7 +21,7 @@ from tider.utils.crypto import set_md5
 from tider.utils.log import get_logger
 from tider.exceptions import ImproperlyConfigured
 
-__all__ = ('PlaywrightDownloader', 'DrissionPageDownloader')
+__all__ = ('PlaywrightDownloader', )
 
 logger = get_logger(__name__)
 
@@ -246,16 +246,37 @@ DOM_LOAD_HOOK = f"""
 class BrowserResponse:
 
     def __init__(self, content: str, encoding: str = 'utf-8', http_version: str = 'HTTP/1.1',
-                 status_code=None, headers=None, cookies=None, reason=None, browser=None, page=None):
+                 status_code=None, headers=None, cookies=None, reason=None, browser=None, context=None, page=None):
         self._content = content
         self._encoding = encoding
         self.page = page
+        self.context = context
         self.browser = browser
         self.reason = reason
         self.status_code = status_code
         self.http_version = http_version
         self.headers = headers or {}
         self.cookies = cookies or {}
+
+    def screenshot(self, path, width=1920, height=1080, selector=None, timeout=0):
+        self.page.add_style_tag(content='body { height: "" !important; width: "" !important;}')
+        self.page.set_viewport_size({"width": width, "height": height})
+        self.page.evaluate(STYLE_PATCH)
+        if selector:
+            element = self.page.locator(selector)
+            element.wait_for(timeout=timeout)
+            return self.page.locator(selector).screenshot(path=path)
+        return self.page.screenshot(path=path, full_page=True)
+
+    def capture_snapshot(self, path=None):
+        cdp = self.context.new_cdp_session(self.page)
+        data = cdp.send("Page.captureSnapshot", {"format": "mhtml"})
+        mhtml = data['data']
+        if path:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(mhtml)
+        cdp.detach()
+        return mhtml
 
     def stream(self, chunk_size=None, **_):
         """
@@ -295,7 +316,7 @@ class BrowserDownloader:
     @staticmethod
     def get_static_name(url):
         if "?" in url:
-            url, _ = url.split('?')
+            url, _ = url.split('?', maxsplit=1)
         parts = url.split('/')
         if parts == 1:
             name = parts[0]
@@ -303,6 +324,15 @@ class BrowserDownloader:
             name = ".".join((parts[-2], parts[-1]))
         # name = re.sub(r'[\\/:*?<>|"]+', '_', name)
         return name
+
+    @staticmethod
+    def is_reusable_static(name):
+        dots_num = name.count('.')
+        splits = [name.split('.', maxsplit=num)[-1] for num in range(dots_num + 1)]
+        if 'umd.min.js' in splits or 'umd.js' in splits or 'index.css' in splits:
+            # reuse umd scripts may fail to execute some documents methods like `write`.
+            return False
+        return True
 
     def download_request(self, request: Request, **_):
         pass
@@ -322,7 +352,7 @@ class PlaywrightDownloader(BrowserDownloader):
                 'You need to install the playwright library to use PlaywrightDownloader.'
             )
         super().__init__(**kwargs)
-        self._wlock = RLock()
+        self._cache_lock = RLock()
 
     def handle_route(self, route, *_, hooked, banned_routes=None):
         # arg_count = len(inspect.signature(handler).parameters)
@@ -347,7 +377,7 @@ class PlaywrightDownloader(BrowserDownloader):
 
             hooking = False
             if not name.endswith('.min.js') and 'element-ui' not in name and 'ajax.js' not in name:
-                if not name.split('?')[0].endswith('.js') and b'function' not in body:
+                if name.endswith(('.shtml', 'aspx')) or not name.endswith('.js') and b'function' not in body:
                     # some scripts maybe contain dynamic json contents.
                     hooking = False
                 elif 'google' in route.request.url or 'baidu' in route.request.url:
@@ -357,8 +387,10 @@ class PlaywrightDownloader(BrowserDownloader):
                     hooking = True
                     hooked[frame].append(name)
             if hooking:
-                body = b'try {\n' + body + b'\n} catch (e) { throw e; } finally {'
-                body += b'\n' + VUE_DOM_LOAD_HOOK.format(name=set_md5(name)).encode('utf-8') + b'}'
+                head_hook = b'try {\n// source script start\n'
+                dom_hook = VUE_DOM_LOAD_HOOK.format(name=set_md5(name)).encode('utf-8')
+                tail_hook = b'\n// source script end\n} catch (e) { throw e; } finally {\n' + dom_hook + b'}'
+                body = head_hook + body + tail_hook
             # maybe replace $createElement in vue.min.js
             route.fulfill(
                 response=original_response,
@@ -375,16 +407,23 @@ class PlaywrightDownloader(BrowserDownloader):
     def on_response(self, response):
         if not self._cache_statics or response.request.method != 'GET':
             return
-        if response.request.resource_type in ('xhr', 'document', 'fetch', 'image', 'other', 'websocket'):
+        if response.request.resource_type in ('xhr', 'document', 'fetch', 'image', 'other', 'websocket', 'font'):
+            # fonts may differ every time.
             return
         if response.frame.page.is_closed():
             # don't try to fetch response.body
             return
 
         name = self.get_static_name(response.request.url)
+        if not self.is_reusable_static(name):
+            return
+
+        head_hook = b'try {\n// source script start\n'
+        dom_hook = VUE_DOM_LOAD_HOOK.format(name=set_md5(name)).encode('utf-8')
+        tail_hook = b'\n// source script end\n} catch (e) { throw e; } finally {\n' + dom_hook + b'}'
         host_dir = self._cache_dir / parse_url_host(response.request.url)
         cached_path = host_dir / name
-        with self._wlock:
+        with self._cache_lock:
             if not os.path.exists(host_dir):
                 os.makedirs(host_dir)
             if not os.path.exists(cached_path):
@@ -398,7 +437,9 @@ class PlaywrightDownloader(BrowserDownloader):
                     # some scripts maybe contain dynamic json contents.
                     return
                 # recover modified body.
-                body = body.replace(b'\n' + VUE_DOM_LOAD_HOOK.format(name=set_md5(name)).encode('utf-8'), b'')
+                if body.startswith(head_hook):
+                    body = body.replace(head_hook, b'', 1)
+                body = body.replace(tail_hook, b'', 1)
                 with open(cached_path, 'wb') as fo:
                     fo.write(body)
 
@@ -411,11 +452,11 @@ class PlaywrightDownloader(BrowserDownloader):
         except PlaywrightTimeoutError as e:
             if raise_for_timeout:
                 raise e
-        frame.wait_for_timeout(300)
+        frame.wait_for_timeout(100)
 
     def wait_for_hooked_frames(self, hooked, timeout=0, wait_for_load=False, raise_for_timeout=True):
         for frame in hooked:
-            hooked[frame] = list(set(hooked[frame]))  # maybe exists duplicated scripts
+            hooked[frame] = list(set(hooked[frame]))  # maybe exist duplicated scripts
             hooks = hooked[frame]
             if frame.url == frame.page.url and wait_for_load:
                 hooks.append("")
@@ -435,7 +476,6 @@ class PlaywrightDownloader(BrowserDownloader):
 
         headless = request.meta.get('browser_headless', True)
         keep_alive = request.meta.get('browser_keep_alive', False)
-        screenshot_path = request.meta.get('browser_screenshot_path')
         init_script = request.meta.get('browser_init_script')
         init_script_path = request.meta.get('browser_init_script_path')
         device = request.meta.get('browser_device')
@@ -482,14 +522,32 @@ class PlaywrightDownloader(BrowserDownloader):
             start = preferred_clock()
             # automatically dismiss dialogs.
             browser_response = page.goto(request.url, wait_until='networkidle')
-            page.add_script_tag(content=DOM_LOAD_HOOK)
-            self.wait_for_hooked_frames(hooked, timeout=request.timeout * 1000, wait_for_load=True, raise_for_timeout=False)
+            wait_for_init_hook = True
+            try:
+                page.add_script_tag(content=DOM_LOAD_HOOK)
+            except PlaywrightError:
+                # maybe relocate or redirect.
+                page.wait_for_timeout(500)
+                try:
+                    page.add_script_tag(content=DOM_LOAD_HOOK)
+                except PlaywrightError:
+                    wait_for_init_hook = False
+            self.wait_for_hooked_frames(hooked, timeout=request.timeout * 1000, wait_for_load=wait_for_init_hook, raise_for_timeout=False)
 
+            # scroll examples:
             # https://www.reddit.com/
             # https://www.steelwood.amsterdam/
             current_position = 0
             history_heights = []
-            page_height = page.evaluate("document.body.scrollHeight")
+            try:
+                page_height = page.evaluate("document.body.scrollHeight")
+            except PlaywrightError:
+                # maybe relocate or redirect.
+                page.wait_for_timeout(300)
+                try:
+                    page_height = page.evaluate("document.body.scrollHeight")
+                except PlaywrightError:
+                    page_height = page.viewport_size.get('height', 0)
             scroll_start = preferred_clock()
             while True:
                 history_heights.append(page_height)
@@ -512,24 +570,39 @@ class PlaywrightDownloader(BrowserDownloader):
                 page.locator(span).click()
             self.wait_for_hooked_frames(hooked, timeout=request.timeout * 1000)
 
+            for frame in page.frames:
+                if frame == page.main_frame:
+                    continue
+                try:
+                    iframe_content = frame.content()
+                    iframe_element = frame.frame_element()
+                    iframe_element.evaluate("""(element, content) => { element.innerHTML = content; }""", iframe_content)
+                except PlaywrightError:
+                    pass
             html = page.content()
             html = html.replace(DOM_LOAD_HOOK, '').replace(LAST_SCRIPT, '')
             status_code = browser_response.status
             reason = browser_response.status_text
             response_headers = browser_response.headers
-            if screenshot_path:
-                page.add_style_tag(content='body { height: "" !important; width: "" !important;}')
-                page.set_viewport_size({"width": 1920, "height": 1080})
-                page.evaluate(STYLE_PATCH)
-                page.screenshot(path=screenshot_path, full_page=True)
-            elapsed = preferred_clock() - start
-
             context_cookies = context.cookies()
             cookies = {cookie['name']: cookie['value'] for cookie in context_cookies}
-            resp = BrowserResponse(html, headers=response_headers, status_code=status_code, cookies=cookies, reason=reason)
-            if keep_alive:
-                resp.page = page
-                resp.browser = browser
+            resp = BrowserResponse(
+                html, headers=response_headers, status_code=status_code, cookies=cookies,
+                reason=reason, browser=browser, context=context, page=page
+            )
+            screenshot_path = request.meta.get('browser_screenshot_path')
+            if screenshot_path:
+                resp.screenshot(
+                    path=screenshot_path,
+                    width=request.meta.get('browser_screenshot_width'),
+                    height=request.meta.get('browser_screenshot_height'),
+                    selector=request.meta.get('browser_screenshot_selector'),
+                    timeout=request.timeout * 1000
+                )
+            mhtml_path = request.meta.get('browser_mhtml_path')
+            if mhtml_path:
+                resp.capture_snapshot(mhtml_path)
+            elapsed = preferred_clock() - start
             response = Response.from_origin_resp(resp=resp, request=request)
             response.elapsed = elapsed
             return response
@@ -543,65 +616,9 @@ class PlaywrightDownloader(BrowserDownloader):
                 response.fail(error=e)
             return response
         finally:
+            if not keep_alive:
+                if page is not None:
+                    page.unroute_all(behavior='ignoreErrors')
+                browser and browser.close()
+                playwright_context and playwright_context.__exit__()
             hooked.clear()
-            if keep_alive:
-                return
-            if page is not None:
-                page.unroute_all(behavior='ignoreErrors')
-            browser and browser.close()
-            playwright_context and playwright_context.__exit__()
-
-
-class DrissionPageDownloader(BrowserDownloader):
-
-    def __init__(self, **kwargs):
-        if not Chromium:
-            raise ImproperlyConfigured(
-                'You need to install the DrissionPage library to use DrissionPageDownloader.'
-            )
-        super().__init__(**kwargs)
-
-    def download_request(self, request: Request, **_):
-        screenshot_path = request.meta.get('browser_screenshot_path')
-        response_headers = {}
-        browser = tab = None
-        try:
-            co = ChromiumOptions(ini_path=request.meta.get('browser_ini_path'))
-            co.no_imgs(False).mute(True).incognito().headless().auto_port()
-            timeout = request.timeout
-            co.set_timeouts(base=timeout, page_load=timeout, script=timeout).set_retry(times=0)
-            proxy = request.selected_proxy
-            co.set_argument('--no-sandbox').set_proxy(proxy)
-            ua = request.headers.get('User-Agent')
-            if ua:
-                co.set_user_agent(user_agent=ua)
-            browser = Chromium(addr_or_opts=co, session_options=False)
-            tab = browser.latest_tab
-            cookies = request.headers.get('Cookie') or request.cookies
-            if cookies:
-                tab.set.cookies(cookies=cookies)
-
-            start = preferred_clock()
-            tab.get(url=request.url, show_errmsg=True, timeout=timeout)
-            tab.run_js(script=INIT_SCRIPT)
-            tab.wait(second=timeout - (preferred_clock() - start))
-            if screenshot_path:
-                tab.set.window.size(1920, 1080)
-                tab.run_js(STYLE_PATCH)
-                tab.get_screenshot(path=screenshot_path, full_page=True)
-            html = tab.html
-            cookies = tab.cookies().as_dict()
-            resp = BrowserResponse(html, headers=response_headers, status_code=200, cookies=cookies)
-            elapsed = preferred_clock() - start
-
-            response = Response.from_origin_resp(resp=resp, request=request)
-            response.elapsed = elapsed
-            return response
-        except Exception as e:
-            response = Response(request)
-            if not response.failed:  # maybe already failed in response.read().
-                response.fail(error=e)
-            return response
-        finally:
-            tab and tab.close()
-            browser and browser.quit()
