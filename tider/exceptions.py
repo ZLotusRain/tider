@@ -88,6 +88,13 @@ class FileStoreError(TiderException):
     """Failed to persist file."""
 
 
+class _InvalidMiddlewareOutput(TypeError, TiderException):
+    """
+    Indicates an invalid value has been returned by a middleware's processing method.
+    Internal and undocumented, it should not be raised or caught by user code.
+    """
+
+
 class DownloadError(TiderException):
     pass
 
