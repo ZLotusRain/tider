@@ -92,7 +92,6 @@ class Session:
         'wget': 'tider.network.downloaders:WgetDownloader',
         'impersonate': 'tider.network.downloaders:ImpersonateDownloader',
         'playwright': 'tider.network.downloaders:PlaywrightDownloader',
-        'dp': 'tider.network.downloaders:DrissionPageDownloader',
     }
 
     __attrs__ = [
