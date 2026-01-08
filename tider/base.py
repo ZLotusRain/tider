@@ -13,7 +13,7 @@ from tider.spiders import Spider
 from tider._state import (_register_app, _deregister_app,
                           get_current_app, _set_current_app, set_default_app)
 from tider.settings import Settings
-from tider.utils.misc import symbol_by_name
+from tider.utils.imports import symbol_by_name
 from tider.utils.time import to_utc, timezone
 
 __all__ = ('Tider',)

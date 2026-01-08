@@ -1,6 +1,6 @@
 """Pool implementation abstract factory, and alias definitions."""
 
-from tider.utils.misc import symbol_by_name
+from tider.utils.imports import symbol_by_name
 
 __all__ = ('get_implementation', 'get_available_pool_names',)
 

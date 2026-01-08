@@ -11,7 +11,7 @@ from tider import Request, Item, Response
 from tider.spiders import Spider
 from tider.spiders.graph.functions import Functions
 from tider.selector import Selector
-from tider.utils.misc import symbol_by_name
+from tider.utils.imports import symbol_by_name
 from tider.utils.url import parse_url_host
 
 

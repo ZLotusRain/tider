@@ -5,7 +5,7 @@ import types
 
 from .base import Backend, KeyValueStoreBackend, State, backend_serializer_registry
 
-from tider.utils.misc import symbol_by_name
+from tider.utils.imports import symbol_by_name
 from tider.exceptions import reraise, ImproperlyConfigured
 
 __all__ = (

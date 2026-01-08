@@ -26,7 +26,8 @@ from tider.concurrency import get_implementation
 from tider.platforms import EX_FAILURE, EX_OK, create_pidlock
 from tider.network.user_agent import set_default_ua
 from tider.utils.log import get_logger, in_sighandler, set_in_sighandler
-from tider.utils.misc import symbol_by_name, build_from_crawler
+from tider.utils.imports import symbol_by_name
+from tider.utils.misc import build_from_crawler
 from tider.utils.nodenames import gethostname, nodename, nodesplit, default_nodename, node_format
 
 try:

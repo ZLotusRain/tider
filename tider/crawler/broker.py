@@ -1,4 +1,4 @@
-from tider.utils.misc import symbol_by_name
+from tider.utils.imports import symbol_by_name
 
 
 class BrokersManager:
