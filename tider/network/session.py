@@ -20,7 +20,8 @@ from tider.network.proxy import Proxy
 from tider.network.user_agent import default_user_agent
 from tider.utils.log import get_logger
 from tider.utils.network import cookiejar_from_str, extract_cookies_to_jar
-from tider.utils.misc import symbol_by_name, build_from_crawler
+from tider.utils.imports import symbol_by_name
+from tider.utils.misc import build_from_crawler
 from tider.exceptions import ProxyError
 
 logger = get_logger(__name__)

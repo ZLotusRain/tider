@@ -10,7 +10,8 @@ from contextlib import suppress
 
 from urllib.parse import urlparse
 
-from tider.utils.misc import symbol_by_name, build_from_crawler
+from tider.utils.imports import symbol_by_name
+from tider.utils.misc import build_from_crawler
 from tider.utils.collections import DummyLock
 from tider.utils.time import preferred_clock
 from tider.utils.url import prepend_scheme_if_needed

@@ -7,7 +7,7 @@ from urllib.parse import urljoin, quote, unquote
 from collections import namedtuple
 
 from tider.selector import extract_regex, Selector
-from tider.utils.misc import symbol_by_name
+from tider.utils.imports import symbol_by_name
 
 
 func_info_t = namedtuple('func_info_t', [

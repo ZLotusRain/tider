@@ -3,8 +3,8 @@ from abc import abstractmethod
 from kombu.utils import cached_property
 
 from tider.utils.log import get_logger
-from tider.utils.misc import symbol_by_name, build_from_crawler
-
+from tider.utils.imports import symbol_by_name
+from tider.utils.misc import build_from_crawler
 
 logger = get_logger(__name__)
 

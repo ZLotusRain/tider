@@ -6,7 +6,8 @@ from tider import Promise, Request, Item, Response
 from tider.spiders import Spider
 from tider.extractors.link_extractor import LinkExtractor
 from tider.utils.url import parse_url_host, url_is_from_any_domain
-from tider.utils.misc import symbol_by_name, arg_to_iter
+from tider.utils.imports import symbol_by_name
+from tider.utils.misc import arg_to_iter
 from tider.utils.functional import iter_generator
 
 

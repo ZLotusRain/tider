@@ -21,7 +21,8 @@ from tider.utils.log import get_logger
 from tider.utils.serialize import pickle_loads
 from tider.utils.network import copy_cookie_jar
 from tider.utils.curl import curl_to_request_kwargs
-from tider.utils.misc import symbol_by_name, to_bytes
+from tider.utils.imports import symbol_by_name
+from tider.utils.misc import to_bytes
 
 logger = get_logger(__name__)
 
