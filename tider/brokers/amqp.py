@@ -658,7 +658,8 @@ class AMQPBroker(Broker):
                         count += 1
                     except redis.exceptions.ResponseError:
                         logger.critical('Could not restore message: %r', M, exc_info=True)
-            logger.info(f'Restored {count}/{len(data)} message(s) from {chan.unacked_key}')
+            # may retry transaction if sth changed in unacked key.
+            logger.info(f'Ready to restore {count}/{len(data)} message(s) from {chan.unacked_key}')
 
         # restore at start.
         with chan.conn_or_acquire() as client:
@@ -691,7 +692,9 @@ class AMQPBroker(Broker):
         consumer.consume()
         # restore unacked messages from memory on startup.
         # consumer.recover(requeue=True)
-        self._restore_messages(consumer)
+        if self.crawler.hostname == self.crawler.group:
+            # duplicate spiders have unique hostnames.
+            self._restore_messages(consumer)
 
         logged = False
         if getattr(connection.transport, 'driver_type', None):
