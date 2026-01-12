@@ -2,7 +2,7 @@ import warnings
 import traceback
 from collections import defaultdict
 
-from tider.utils.misc import walk_modules
+from tider.utils.imports import walk_modules
 from tider.utils.spider import iter_spider_classes
 
 
