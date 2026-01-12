@@ -24,12 +24,14 @@ except ImportError:
 from urllib.parse import urlparse, urlunparse
 from requests.utils import to_native_string
 
+from http.client import HTTPException as HTTPException
 from urllib3.response import HTTPResponse as _HTTPResponse
 from urllib3._collections import RecentlyUsedContainer as _RecentlyUsedContainer
-from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.connection import HTTPConnection, HTTPSConnection, BaseSSLError
 from urllib3.connectionpool import HTTPConnectionPool as _HTTPConnectionPool
 from urllib3.connectionpool import HTTPSConnectionPool as _HTTPSConnectionPool
 from urllib3.exceptions import (
+    HTTPError,
     ClosedPoolError,
     EmptyPoolError,
     PoolError,
@@ -699,6 +701,21 @@ class HTTPResponse(_HTTPResponse):
         if not hasattr(self, "_decoded_buffer "):
             # Used to return the correct amount of bytes for partial read()s
             self._decoded_buffer = BytesQueueBuffer()
+
+    def drain_conn(self) -> None:
+        """
+        Read and discard any remaining HTTP response data in the response connection.
+
+        Unread data in the HTTPResponse connection blocks the connection from being released back to the pool.
+        """
+        try:
+            self.read(
+                # Do not spend resources decoding the content unless
+                # decoding has already been initiated.
+                decode_content=self._has_decoded_content,
+            )
+        except (HTTPError, OSError, BaseSSLError, HTTPException):
+            pass
 
     def _init_decoder(self) -> None:
         """
