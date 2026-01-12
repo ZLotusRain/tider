@@ -103,12 +103,16 @@ def status(ctx, timeout, destination, json, **kwargs):
               '--pattern',
               type=str,
               help='pattern string for node names.')
+@click.option('-m',
+              '--matcher',
+              type=click.Choice(['glob', 'regex', 'exact']),
+              help='match mode.')
 @click.option('-j',
               '--json',
               is_flag=True,
               help='Use json as output format.')
 @click.pass_context
-def inspect(ctx, action, timeout, destination, pattern, json, **kwargs):
+def inspect(ctx, action, timeout, destination, pattern, matcher, json, **kwargs):
     """Inspect the worker at runtime.
 
     Availability: RabbitMQ (AMQP) and Redis transports.
@@ -119,7 +123,7 @@ def inspect(ctx, action, timeout, destination, pattern, json, **kwargs):
     inspector = Inspect(app=ctx.obj.app,
                         timeout=timeout,
                         destination=destination,
-                        pattern=pattern,
+                        pattern=pattern, matcher=matcher,
                         callback=callback)
     replies = inspector._request(action,
                                  **arguments)
@@ -157,12 +161,16 @@ def inspect(ctx, action, timeout, destination, pattern, json, **kwargs):
               '--pattern',
               type=str,
               help='pattern string for node names.')
+@click.option('-m',
+              '--matcher',
+              type=click.Choice(['glob', 'regex', 'exact']),
+              help='match mode.')
 @click.option('-j',
               '--json',
               is_flag=True,
               help='Use json as output format.')
 @click.pass_context
-def control(ctx, action, timeout, destination, pattern, json):
+def control(ctx, action, timeout, destination, pattern, matcher, json):
     """Spider remote control."""
     callback = None if json else partial(_say_remote_command_reply, ctx,
                                          show_reply=True)
@@ -170,7 +178,7 @@ def control(ctx, action, timeout, destination, pattern, json):
     arguments = _compile_arguments(action, args)
     replies = ctx.obj.tider.control.broadcast(action, timeout=timeout,
                                               destination=destination,
-                                              pattern=pattern,
+                                              pattern=pattern, matcher=matcher,
                                               callback=callback,
                                               reply=True,
                                               arguments=arguments)
