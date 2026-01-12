@@ -99,12 +99,16 @@ def status(ctx, timeout, destination, json, **kwargs):
               '--destination',
               type=COMMA_SEPARATED_LIST,
               help='Comma separated list of destination node names.')
+@click.option('-p',
+              '--pattern',
+              type=str,
+              help='pattern string for node names.')
 @click.option('-j',
               '--json',
               is_flag=True,
               help='Use json as output format.')
 @click.pass_context
-def inspect(ctx, action, timeout, destination, json, **kwargs):
+def inspect(ctx, action, timeout, destination, pattern, json, **kwargs):
     """Inspect the worker at runtime.
 
     Availability: RabbitMQ (AMQP) and Redis transports.
@@ -115,6 +119,7 @@ def inspect(ctx, action, timeout, destination, json, **kwargs):
     inspector = Inspect(app=ctx.obj.app,
                         timeout=timeout,
                         destination=destination,
+                        pattern=pattern,
                         callback=callback)
     replies = inspector._request(action,
                                  **arguments)
@@ -148,12 +153,16 @@ def inspect(ctx, action, timeout, destination, json, **kwargs):
 @click.option('-d',
               '--destination',
               help='Comma separated list of destination node names.')
+@click.option('-p',
+              '--pattern',
+              type=str,
+              help='pattern string for node names.')
 @click.option('-j',
               '--json',
               is_flag=True,
               help='Use json as output format.')
 @click.pass_context
-def control(ctx, action, timeout, destination, json):
+def control(ctx, action, timeout, destination, pattern, json):
     """Spider remote control."""
     callback = None if json else partial(_say_remote_command_reply, ctx,
                                          show_reply=True)
@@ -161,6 +170,7 @@ def control(ctx, action, timeout, destination, json):
     arguments = _compile_arguments(action, args)
     replies = ctx.obj.tider.control.broadcast(action, timeout=timeout,
                                               destination=destination,
+                                              pattern=pattern,
                                               callback=callback,
                                               reply=True,
                                               arguments=arguments)
