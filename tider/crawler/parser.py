@@ -138,7 +138,7 @@ class Parser:
             if response.failed:
                 if errback:
                     spider_outputs = errback(response)
-                else:
+                elif request.meta.get('save_unhandled_failure', True):
                     try:
                         response.check_error()
                     except DownloadError as exc:
