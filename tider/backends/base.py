@@ -287,28 +287,30 @@ class Backend:
         if always_retry_backend_operation is activated, in the event of a recoverable exception,
         then retry operation with an exponential backoff until a limit has been reached.
         """
+        # cookies maybe causes `The dotted field is not valid for storage` in mongodb.
+        EXCLUDE_REQUEST_KEYS = {'cb_kwargs', 'session_cookies', 'auth', 'cookies'}
+
+        meta = self.encode_snapshot(state, exc=exc)
         if not override:
-            snapshot = self.get_spider_meta().get('meta') or {}
-            new = self.encode_snapshot(state, exc=exc)
-            for field in ('errors', 'failures'):
-                existing_items = snapshot.setdefault(field, [])
-                existing_fps = set()
-                for item in existing_items:
-                    fp = item.copy()
-                    fp.pop('meta', None)
-                    fp.pop('cb_kwargs', None)
-                    existing_fps.add(fp)
-                new_items = new.pop(field, None)
-                if new_items:
-                    for new_item in new_items:
-                        fp = new_item.copy()
-                        fp.pop('meta', None)
-                        fp.pop('cb_kwargs', None)
-                        if fp not in existing_fps:
-                            existing_items.append(new_item)
-            snapshot.update(new)
+            snapshot = self.get_spider_meta().get('meta') or {}  # maybe large.
         else:
-            snapshot = self.encode_snapshot(state, exc=exc)
+            snapshot = {}
+        for field in ('errors', 'failures'):
+            new_items = meta.pop(field, None)
+            if not new_items:
+                continue
+            existing_fps = []
+            existing_items = snapshot.setdefault(field, [])[-50:]  # match the length of in-memory meta.
+            for item in existing_items:
+                if 'request' in item:
+                    item['request'] = {k: v for k, v in item['request'].items() if k not in EXCLUDE_REQUEST_KEYS}
+                existing_fps.append(item)
+            for new_item in new_items:
+                if 'request' in new_item:
+                    new_item['request'] = {k: v for k, v in new_item['request'].items() if k not in EXCLUDE_REQUEST_KEYS}
+                if new_item not in existing_fps:
+                    snapshot[field].append(new_item)
+        snapshot.update(meta)
         retries = 0
         while True:
             try:
