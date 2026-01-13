@@ -731,7 +731,6 @@ class AMQPBroker(Broker):
                                                             accept=None, on_decode_error=on_decode_error)
                             consumer.on_message = on_message
                             consumer.consume()
-                            self._restore_messages(consumer)
                 except connection.connection_errors + response_errors as e:
                     if isinstance(e, ResponseError):
                         info = consumer.channel.client.info(section='replication')
@@ -746,7 +745,6 @@ class AMQPBroker(Broker):
                                                     accept=None, on_decode_error=on_decode_error)
                     consumer.on_message = on_message
                     consumer.consume()
-                    self._restore_messages(consumer)
                     on_message_consumed and on_message_consumed()
                 except OSError:
                     if self.crawler.crawling:
