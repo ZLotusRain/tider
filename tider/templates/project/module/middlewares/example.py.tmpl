@@ -1,0 +1,29 @@
+# Define here the models for your middleware
+
+
+
+class ${ProjectName}ExplorerMiddleware:
+    # Not all methods need to be defined. If a method is not defined,
+    # tider acts as if the middleware does not modify the passed objects.
+
+    @classmethod
+    def from_crawler(cls, crawler):
+        # This method is used by Tider to create your middlewares.
+        return cls()
+
+    def process_request(self, request):
+        # Called for each request that processed by the downloader.
+
+        # Must either:
+        # - return None: continue processing this request
+        # - or return a Response object
+        # - or return a Request object
+        return None
+
+    def process_response(self, request, response):
+        # Called with the response returned from the downloader.
+
+        # Must either;
+        # - return a Response object
+        # - return a Request object
+        return response
