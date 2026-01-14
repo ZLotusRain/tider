@@ -363,11 +363,9 @@ class DaemonContext:
                 # We need to keep /dev/urandom from closing because
                 # shelve needs it, and Beat needs shelve to start.
                 keep = list(self.stdfds) + fd_by_path(['/dev/urandom'])
-                try:
-                    close_open_fds(keep)
-                except OSError:
-                    # compat for gevent(>=25.4.1)
-                    pass
+                # don't patch gevent before detached to compat for gevent(>=25.4.1)
+                # to avoid OSError and SystemError.
+                close_open_fds(keep)  # avoid resources leaking
                 for fd in self.stdfds:
                     self.redirect_to_null(maybe_fileno(fd))
                 if self.after_forkers and mputil is not None:
@@ -384,6 +382,9 @@ class DaemonContext:
     __exit__ = close
 
     def _detach(self):
+        # https://mdgsf.github.io/2016/08/29/c-double-fork/
+        # double-fork to make sure the second child process
+        # detaches from terminal
         if os.fork() == 0:  # first child
             os.setsid()  # create new session
             if os.fork() > 0:  # pragma: no cover
