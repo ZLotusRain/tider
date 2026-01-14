@@ -303,7 +303,7 @@ class Response:
 
         content_type = self.headers.get('Content-Type', '')
         filetype = list(filter(lambda x: x.startswith("."), content_type.split(";")))
-        filetype = filetype[0] if filetype else ""
+        filetype = filetype[0] if filetype else None
 
         for each in content_type.split(';'):
             if not each or each.lower().startswith("charset="):
@@ -318,7 +318,9 @@ class Response:
                 filetype = mimetypes.guess_extension(each) or filetype
             if filetype:
                 return filetype.split('.', maxsplit=1)[-1]
-        return self.filename.split(".", maxsplit=1)[-1]
+        if "." in self.filename:
+            filetype = self.filename.split(".", maxsplit=1)[-1]
+        return filetype
 
     @property
     def apparent_encoding(self):
