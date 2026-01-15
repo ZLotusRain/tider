@@ -1,23 +1,22 @@
 import os
-import re
 import csv
-import xlrd
 import zipfile
-try:
-    import rarfile
-except ImportError:
-    rarfile = None
-import openpyxl
 from io import BytesIO, TextIOWrapper
 
 from kombu.message import Message as KombuMessage
 
 from tider import Request
 from tider.brokers import Broker
+from tider.local import try_import
+from tider.utils.file import fix_xlsx_styles
 from tider.utils.log import get_logger
 from tider.exceptions import ImproperlyConfigured
 
 logger = get_logger(__name__)
+
+xlrd = try_import('xlrd')
+rarfile = try_import('rarfile')
+openpyxl = try_import('openpyxl')
 
 
 class Message(KombuMessage):
@@ -61,32 +60,17 @@ class FilesBroker(Broker):
             on_message_consumed and on_message_consumed()
 
     def _consume_xlsx(self, file, on_message=None, on_message_consumed=None):
-        fp = BytesIO()
-        zout = zipfile.ZipFile(fp, "w")
-        zin = zipfile.ZipFile(file, "r")
-        for item in zin.infolist():
-            buffer = zin.read(item.filename)
-            if item.filename == "xl/styles.xml":
-                styles = buffer.decode("utf-8")
-                styles = styles.replace("<x:fill />", "")
-                # https://learn.microsoft.com/zh-cn/dotnet/api/documentformat.openxml.spreadsheet.fills?view=openxml-3.0.1
-                styles = styles.replace('<fills count="1"><fill/></fills>', '').replace('<fill/>', '')
-                cell_styles = re.findall(r'(<cellStyle\s*xfId.*?/>)', styles)
-                for style in cell_styles:
-                    if not re.findall(r'(name=".*?")', style):
-                        new_style = style.replace("/>", ' name=""/>')
-                        styles = styles.replace(style, new_style)
-                buffer = styles.encode("utf-8")
-            zout.writestr(item, buffer)
-        zin.close()
-        zout.close()
-
+        if not openpyxl:
+            raise ImproperlyConfigured(
+                'You need to install the openpyxl library to consume messages from .xlsx files.'
+            )
+        fp = fix_xlsx_styles(file.read())
         wb = openpyxl.load_workbook(fp, read_only=True, data_only=True, keep_links=False, keep_vba=False)
         for name in wb.sheetnames:
             sheet = wb[name]
             titles = None
             for idx, row in enumerate(sheet.iter_rows(values_only=True)):
-                if all([x is None for x in row]):
+                if all([x is None or not str(x).strip() for x in row]):
                     continue
                 if idx == 0:
                     titles = row
@@ -98,6 +82,10 @@ class FilesBroker(Broker):
         fp.close()
 
     def _consume_xls(self, file, on_message=None, on_message_consumed=None):
+        if not xlrd:
+            raise ImproperlyConfigured(
+                'You need to install the xlrd library to consume messages from .xls files.'
+            )
         wb = xlrd.open_workbook(file_contents=file.read(), on_demand=True)
         for sheet in wb.sheets():
             invalid_count = 0
