@@ -1,6 +1,7 @@
 import re
 import operator
 from functools import partial
+from enum import StrEnum
 from typing import Union, Iterable
 
 from lxml import etree
@@ -46,49 +47,63 @@ def _identity(x):
     return x
 
 
+class FiletypeCategory(StrEnum):
+
+    Archives = 'Archives'
+    BitmapImages = 'Bitmap images'
+    DigitalCameraRAWPhotos = 'Digital camera RAW photos'
+    VectorGraphics = 'Vector graphics'
+    FontFiles = 'Font files'
+    AudioFiles = 'Audio files'
+    VideoFiles = 'Video files'
+    OfficeSuites = 'Office suites'
+    Documents = 'Documents'
+    SimpleTextFiles = 'Simple text files'
+    PossiblyDangerousFiles = 'Possibly dangerous files'
+
+
 class FileExtExtractor:
     # Extension refs:
     # 1.https://www.file-extensions.org
     # 2.https://support.microsoft.com/en-us/windows/common-file-name-extensions-in-windows-da4a4430-8e76-89c5-59f7-1cdbbc75cb01
 
     COMMON_EXTENSIONS = {
-        'Archives': {
+        FiletypeCategory.Archives: {
             '7z', '7zip', 'bz2', 'rar', 'tar', 'tar.gz', 'xz', 'zip'
         },
-        'Bitmap images': {
+        FiletypeCategory.BitmapImages: {
             'bmp', 'cpt', 'dds', 'dib', 'dng', 'gif', 'ico', 'icon',
             'jpeg', 'jpg', 'pcx', 'pic', 'png', 'psd', 'psdx', 'raw',
             'tif', 'tiff', 'webp'
         },
-        'Digital camera RAW photos': {
+        FiletypeCategory.DigitalCameraRAWPhotos: {
             'arw', 'crw', 'dcr', 'dng', 'pcd', 'ptx', 'rw2'
         },
-        'Vector graphics': {
-            'ai', 'cdr', 'csh', 'cls', 'drw', 'odg',
-            'svg', 'svgz', 'swf'
+        FiletypeCategory.VectorGraphics: {
+            'ai', 'cdr', 'csh', 'cls', 'drw', 'odg', 'svg', 'svgz', 'swf'
         },
-        'Font files': {
+        FiletypeCategory.FontFiles: {
             'eot', 'otf', 'ttc', 'ttf', 'woff'
         },
-        'Audio files': {
+        FiletypeCategory.AudioFiles: {
             'mp3', 'wma', 'ogg', 'wav', 'ra', 'aac', 'mid', 'au', 'aiff',
         },
-        'Video files': {
+        FiletypeCategory.VideoFiles: {
             '264', '3g2', '3gp', 'asf', 'asx', 'avi',
             'bik', 'dat', 'h264', 'mov', 'mp4', 'mpg', 'qt', 'rm', 'swf', 'wmv',
             'm4a', 'm4v', 'flv', 'webm', 'mpeg', 'f4v', 'rmvb', 'vob', 'mkv',
         },
-        'Office suites': {
+        FiletypeCategory.OfficeSuites: {
             'xls', 'xlsm', 'xlsx', 'xltm', 'xltx', 'potm', 'potx', 'ppt', 'pptm', 'pptx', 'pps',
             'doc', 'docb', 'docm', 'docx', 'dotm', 'dotx', 'odt', 'ods', 'odg', 'odp', 'xps'
         },
-        'Documents': {
+        FiletypeCategory.Documents: {
             'abw', 'pdf', 'djvu ', 'epub', 'mht', 'pages', 'vsd',
         },
-        'Simple text files': {
+        FiletypeCategory.SimpleTextFiles: {
             'txt', 'csv', 'xml', 'rb'
         },
-        'Possibly dangerous files': {
+        FiletypeCategory.PossiblyDangerousFiles: {
             'exe', 'sys', 'com', 'bat', 'bin', 'rss',
             'dmg', 'iso', 'apk', 'ipa', 'chm', 'class',
             'dll', 'drv', 'jar', 'js', 'lnk', 'ocx', 'msi',
@@ -103,7 +118,7 @@ class FileExtExtractor:
         'htm', 'html', 'jhtml', 'shtml', 'asp', 'aspx', 'jsp', 'jspx', 'php', 'css', 'js',
     }
 
-    def __init__(self, ignored_types=('Possibly dangerous files', ), guess=True, includes=(), excludes=()):
+    def __init__(self, ignored_types=(FiletypeCategory.PossiblyDangerousFiles, ), guess=True, includes=(), excludes=()):
         self.ignored_types = ignored_types
         self.guess = guess
         self._excludes = set(excludes)
@@ -218,7 +233,7 @@ class LinkExtractor:
     def __init__(self, allow=(), deny=(), allow_domains=(), deny_domains=(), restrict_xpaths=(),
                  tags=('a', 'area'), attrs=('href',), on_extract=None, unique=False,
                  allow_titles=(), deny_titles=(), deny_extensions=None, restrict_css=(),
-                 file_only=False, ignored_file_types=('Possibly dangerous files',), guess_extension=True,
+                 file_only=False, ignored_file_types=(FiletypeCategory.PossiblyDangerousFiles,), guess_extension=True,
                  include_extensions=(), file_hints=(), file_tags=('img', ), strip=True):
         self.tags, self.attrs = set(arg_to_iter(tags)), set(arg_to_iter(attrs))
         self.scan_tags = partial(operator.contains, self.tags)
