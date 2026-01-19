@@ -287,8 +287,9 @@ class Backend:
         if always_retry_backend_operation is activated, in the event of a recoverable exception,
         then retry operation with an exponential backoff until a limit has been reached.
         """
+        # cb_kwargs/meta may contain non-serializable objects.
         # cookies maybe causes `The dotted field is not valid for storage` in mongodb.
-        EXCLUDE_REQUEST_KEYS = {'cb_kwargs', 'session_cookies', 'auth', 'cookies'}
+        EXCLUDE_REQUEST_KEYS = {'cb_kwargs', 'meta', 'session_cookies', 'auth', 'cookies'}
 
         meta = self.encode_snapshot(state, exc=exc)
         if not override:
