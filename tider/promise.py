@@ -8,8 +8,7 @@ from enum import Enum
 from typing import Iterator
 
 from tider.network import Request
-from tider.utils.misc import evaluate_callable
-from tider.utils.functional import noop, iter_generator
+from tider.utils.functional import iter_generator, evaluate_callable
 
 __all__ = ('is_unresolved', 'is_pending', 'is_scheduled',
            'is_executed', 'is_rejected', 'is_resolved', 'Promise', 'NodeState')
@@ -260,7 +259,7 @@ class Promise:
         if inspect.ismethod(callback):
             self.callback = weakref.WeakMethod(callback)
         else:
-            self.callback = callback or noop
+            self.callback = callback
         self.cb_kwargs = dict(cb_kwargs) if cb_kwargs else {}
 
         self.delay = delay

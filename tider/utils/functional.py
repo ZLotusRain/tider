@@ -3,6 +3,8 @@ import inspect
 from itertools import count
 from typing import Iterator
 
+from tider.utils.imports import symbol_by_name
+
 
 def dictfilter(d=None, **kw):
     """Remove all keys from dict ``d`` whose value is :const:`None`."""
@@ -117,3 +119,13 @@ def iter_generator(iterable, sleep=time.sleep):
         if isinstance(iterable, Iterator) and hasattr(iterable, 'close'):
             iterable.close()
         del iterable, it
+
+
+def evaluate_callable(callback):
+    if not callback:
+        callback = noop
+    elif isinstance(callback, str):
+        callback = symbol_by_name(callback)
+    if not callable(callback):
+        raise TypeError("Callback must be a callable object")
+    return callback
