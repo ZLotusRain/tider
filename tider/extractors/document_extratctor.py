@@ -418,7 +418,11 @@ class XlsxParser:
 
         if content.startswith((b'<!DOCTYPE', b'<?xml')):
             if to_markdown:
-                return self._html_converter.convert_string(content.decode('utf-8'), **kwargs).markdown.strip()
+                return self._html_converter.convert_string(
+                    content.decode('utf-8'),
+                    ignored_tags=ignored_tags,
+                    **kwargs
+                ).markdown.strip()
             return content.decode('utf-8')
 
         document = ""
@@ -472,7 +476,10 @@ class XlsParser:
         if content.startswith((b'<!DOCTYPE', b'<?xml')):
             if to_markdown:
                 return self._html_converter.convert_string(
-                    content.decode('utf-8'), ignored_tags=ignored_tags, **kwargs).markdown.strip()
+                    content.decode('utf-8'),
+                    ignored_tags=ignored_tags,
+                    **kwargs
+                ).markdown.strip()
             return content.decode('utf-8')
 
         file = BytesIO(content)
