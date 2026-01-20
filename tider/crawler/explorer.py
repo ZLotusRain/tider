@@ -3,12 +3,14 @@
 import re
 import time
 from queue import Full
-from collections import deque
-from typing import Optional
+from operator import itemgetter
+from collections import deque, defaultdict
+from typing import Union
 
 from tider import Request
 from tider.network import Session, ProxyPoolManager, Response
 from tider.exceptions import (
+    _InvalidMiddlewareOutput,
     ConnectionError,
     DownloadError,
     HTTPError,
@@ -18,11 +20,12 @@ from tider.exceptions import (
     ExclusiveProxy,
     Timeout,
     SpiderShutdown,
-    SpiderTerminate
+    SpiderTerminate,
 )
 from tider.crawler import state
 from tider.platforms import EX_FAILURE
 from tider.utils.log import get_logger
+from tider.utils.imports import symbol_by_name
 from tider.utils.misc import build_from_crawler
 
 logger = get_logger(__name__)
@@ -99,6 +102,67 @@ class ConcurrencyLimits:
         return len(self._limits[limit_type][pattern]['free_slots'])
 
 
+class MiddlewareManager:
+
+    def __init__(self, *middlewares, crawler):
+        self.crawler = crawler
+        self.middlewares = middlewares
+        self.methods = defaultdict(deque)
+        for mw in middlewares:
+            self._add_middleware(mw)
+
+    @classmethod
+    def from_crawler(cls, crawler):
+        middlewares_dict = crawler.settings.getdict("EXPLORER_MIDDLEWARES")
+        mwlist = [k for k, v in sorted(middlewares_dict.items(), key=itemgetter(1))]
+        middlewares = []
+        for clspath in mwlist:
+            try:
+                mwcls = symbol_by_name(clspath)
+                mw = build_from_crawler(mwcls, crawler)
+                middlewares.append(mw)
+            except ImportError:
+                logger.warning(f"Invalid middleware: {clspath}")
+        return cls(*middlewares, crawler=crawler)
+
+    def _add_middleware(self, mw) -> None:
+        if hasattr(mw, "process_request"):
+            self.methods["process_request"].append(mw.process_request)
+        if hasattr(mw, "process_response"):
+            self.methods["process_response"].appendleft(mw.process_response)
+
+    def process_request(self, request) -> Union[Response, Request]:
+        """process explorer Request-like input."""
+        for method in self.methods["process_request"]:
+            result = method(request=request)
+            if result is not None and not isinstance(result, (Response, Request)):
+                raise _InvalidMiddlewareOutput(
+                    f"Middleware {method.__qualname__} must return None, Response or "
+                    f"Request, got {result.__class__.__name__}"
+                )
+            if isinstance(result, Response):
+                return result
+        return request
+
+    def process_response(self, request, response) -> Union[Response, Request]:
+        """process middleware/downloader Response-like output."""
+        if response is None:
+            raise TypeError("Received None in process_response")
+        if isinstance(response, Request):
+            return response
+
+        for method in self.methods["process_response"]:
+            response = method(request=request, response=response)
+            if not isinstance(response, (Response, Request)):
+                raise _InvalidMiddlewareOutput(
+                    f"Middleware {method.__qualname__} must return Response or Request, "
+                    f"got {type(response)}"
+                )
+            if isinstance(response, Request):
+                return response
+        return response
+
+
 class Explorer:
 
     def __init__(self, crawler, concurrency=4, concurrency_limits=None, priority_adjust=0, retry_until_valid_proxy=True):
@@ -107,7 +171,8 @@ class Explorer:
         self.pool = crawler.create_pool(limit=concurrency, thread_name_prefix="ExplorerWorker")
         self.climits = ConcurrencyLimits(concurrency_limits)
 
-        self.session: Optional[Session] = build_from_crawler(Session, crawler)
+        self.session: Session = build_from_crawler(Session, crawler)
+        self.middleware: MiddlewareManager = build_from_crawler(MiddlewareManager, crawler)
         self.proxypool = build_from_crawler(ProxyPoolManager, crawler)
         self.priority_adjust = priority_adjust  # adjust priority when retrying.
         self.retry_until_valid_proxy = retry_until_valid_proxy
@@ -322,14 +387,18 @@ class Explorer:
     def _explore(self, request):
         self._crawler.stats.inc_value("request/count")
         # use `request.request_kwargs` directly may lead memory leak on CentOS.
-        response = None
-        try:
+        result = self.middleware.process_request(request)
+        if isinstance(result, Request):
+            request = result
             self.build_request_proxy(request)
-            if self.session is not None:
-                response = self.session.download_request(request)
-            else:
-                with build_from_crawler(Session, self._crawler) as session:
-                    response = session.download_request(request)
+            response = self.session.download_request(request)
+            result = self.middleware.process_response(request=request, response=response)
+        if isinstance(result, Request):
+            return result
+
+        # default procedure
+        response = result
+        try:
             response.check_error()
             if request.raise_for_status:
                 response.raise_for_status()
