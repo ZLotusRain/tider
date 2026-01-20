@@ -356,7 +356,7 @@ class LinkExtractor:
             links.append(Link(url=url, tag=el.tag, title=str(title).strip(), text=text, alt=alt, ext=ext,  nofollow=rel_has_nofollow(el.get("rel"))))
         return links
 
-    def extract_links(self, response):
+    def extract(self, response):
         all_links = []
 
         if self.restrict_xpaths:
@@ -375,3 +375,5 @@ class LinkExtractor:
         if self.unique:
             return unique_list(all_links, key=lambda link: link["url"], prefer=lambda link: link["title"] or link["text"])
         return all_links
+
+    extract_links = extract

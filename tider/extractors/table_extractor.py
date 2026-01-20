@@ -71,7 +71,7 @@ class HtmlTableExtractor:
             return True
         return False
 
-    def extract_tables(self, response):
+    def extract(self, response):
         tables = []  # {'title': '', 'content': {}}
         soup = response.soup('lxml')
         tbodys = soup.find_all("tbody")
@@ -80,6 +80,8 @@ class HtmlTableExtractor:
         for tbody in tbodys:
             tables.append(self._extract_table(tbody))
         return tables
+
+    extract_tables = extract
 
     def _extract_table(self, tbody: Tag) -> Table:
         if self._is_vertical(tbody):

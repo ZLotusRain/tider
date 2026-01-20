@@ -615,7 +615,7 @@ class ArticleExtractor:
         except json.JSONDecodeError:
             return False
 
-    def extract_article(self, response) -> Article:
+    def extract(self, response) -> Article:
         if self._is_json_capable(response):
             return Article()
         root = self._clean_root(response.soup('lxml'))
@@ -634,6 +634,8 @@ class ArticleExtractor:
         if self.on_extract:
             self.on_extract(root=root, content_node=content_node, article=article)
         return article
+
+    extract_artile = extract
 
     def _finalize_content(self, best_candidate, candidates, recursive=True):
         # Now that we have the top candidate, look through its siblings for content that might also be related.
