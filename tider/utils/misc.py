@@ -2,14 +2,13 @@ import hashlib
 from typing import Iterable
 
 from tider.item import Item
-from tider.utils.imports import symbol_by_name
 from tider.utils.log import get_logger
 
 logger = get_logger(__name__)
 
 __all__ = (
     'is_iterable', 'arg_to_iter', 'str_to_list', 'unique_list',
-    'evaluate_callable', 'try_copy', 'build_from_crawler',
+    'try_copy', 'build_from_crawler',
     'md5sum', 'to_bytes',
 )
 
@@ -55,16 +54,6 @@ def unique_list(list_, key=lambda x: x, prefer=lambda x: x):
             seen[seenkey] = item
 
     return list(seen.values())
-
-
-def evaluate_callable(callback):
-    if callable(callback):
-        callback = callback
-    elif isinstance(callback, str):
-        callback = symbol_by_name(callback)
-    else:
-        callback = None
-    return callback
 
 
 def try_copy(obj):
