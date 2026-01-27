@@ -828,6 +828,14 @@ class PdfParser:
         return "\n".join(pdf_contents)
     
     def _extract_by_markitdown(self, content, to_markdown=False, **kwargs):
+        if _markitdown_dependency_exc_info:
+            raise ImproperlyConfigured(
+                "You need to install the markitdown library to enable markitdown engine to parse pdf files."
+            ) from _markitdown_dependency_exc_info[
+                1
+            ].with_traceback(  # type: ignore[union-attr]
+                _markitdown_dependency_exc_info[2]
+            )
         file_stream = BytesIO(content)
         return PdfConverter().convert(file_stream, StreamInfo(), **kwargs)
 
