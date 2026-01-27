@@ -241,7 +241,8 @@ class ProbeSpider(Spider):
             ('WRONG_VERSION_NUMBER' in str(response._error) or
              'EOF occurred in violation of protocol' in str(response._error) or
              '631 Internal Server Error' in str(response._error) or
-             not response.status_code)
+             not response.status_code or
+             '<h1>404 Not Found</h1>' in response.text)
         )
         if start and https_errors and self.retry_on_https_errors:
             url = response.request.url.replace('https', 'http')
