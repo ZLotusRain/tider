@@ -112,9 +112,8 @@ class FileExtExtractor:
     }
 
     NETWORK_RELATED = {
-        'com', 'org', 'net', 'int', 'edu', 'gov', 'mil',
-        'arpa', 'cn', 'xyz', 'info', 'icu', 'top', 'cc',
-        'de', 'app', 'pub', 'do', 'action', 'sg',
+        'com', 'cn', 'com.cn', 'edu.cn', 'org', 'net', 'int', 'edu', 'gov', 'mil',
+        'arpa',  'xyz', 'info', 'icu', 'top', 'cc', 'de', 'app', 'pub', 'do', 'action', 'sg',
         'htm', 'html', 'jhtml', 'shtml', 'asp', 'aspx', 'jsp', 'jspx', 'php', 'css', 'js',
     }
 
