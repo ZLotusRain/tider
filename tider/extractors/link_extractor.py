@@ -1,5 +1,4 @@
 import re
-import operator
 from functools import partial
 from enum import StrEnum
 from typing import Union, Iterable
@@ -45,6 +44,10 @@ def _nons(tag):
 
 def _identity(x):
     return x
+
+
+def _contains(container, x):
+    return x.lower() in container
 
 
 class FiletypeCategory(StrEnum):
@@ -112,8 +115,9 @@ class FileExtExtractor:
     }
 
     NETWORK_RELATED = {
-        'com', 'cn', 'com.cn', 'edu.cn', 'org', 'net', 'int', 'edu', 'gov', 'mil',
-        'arpa',  'xyz', 'info', 'icu', 'top', 'cc', 'de', 'app', 'pub', 'do', 'action', 'sg',
+        'com', 'org', 'net', 'int', 'edu', 'gov', 'mil',
+        'arpa', 'cn', 'xyz', 'info', 'icu', 'top', 'cc',
+        'de', 'app', 'pub', 'do', 'action', 'sg',
         'htm', 'html', 'jhtml', 'shtml', 'asp', 'aspx', 'jsp', 'jspx', 'php', 'css', 'js',
     }
 
@@ -234,9 +238,11 @@ class LinkExtractor:
                  allow_titles=(), deny_titles=(), deny_extensions=None, restrict_css=(),
                  file_only=False, ignored_file_types=(FiletypeCategory.PossiblyDangerousFiles,), guess_extension=True,
                  include_extensions=(), file_hints=(), file_tags=('img', ), strip=True):
-        self.tags, self.attrs = set(arg_to_iter(tags)), set(arg_to_iter(attrs))
-        self.scan_tags = partial(operator.contains, self.tags)
-        self.scan_attrs = partial(operator.contains, self.attrs)
+        tags = [tag.lower() for tag in arg_to_iter(tags)]
+        attrs = [attr.lower() for attr in arg_to_iter(attrs)]
+        self.tags, self.attrs = set(tags), set(attrs)
+        self.scan_tags = partial(_contains, self.tags)
+        self.scan_attrs = partial(_contains, self.attrs)
         self.on_extract = on_extract if callable(on_extract) else _identity
         self.unique = unique
         self.strip = strip
