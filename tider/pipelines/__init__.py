@@ -5,7 +5,8 @@ from collections import defaultdict, deque
 
 from tider import Item
 from tider.utils.log import get_logger
-from tider.utils.misc import build_from_crawler, symbol_by_name
+from tider.utils.imports import symbol_by_name
+from tider.utils.misc import build_from_crawler
 
 logger = get_logger(__name__)
 
