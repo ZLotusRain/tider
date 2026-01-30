@@ -388,12 +388,15 @@ class Explorer:
         self._crawler.stats.inc_value("request/count")
         # use `request.request_kwargs` directly may lead memory leak on CentOS.
         result = self.middleware.process_request(request)
+        response = None
         if isinstance(result, Request):
             request = result
             self.build_request_proxy(request)
             response = self.session.download_request(request)
             result = self.middleware.process_response(request=request, response=response)
         if isinstance(result, Request):
+            if response is not None:
+                response.close()
             return result
 
         # default procedure
