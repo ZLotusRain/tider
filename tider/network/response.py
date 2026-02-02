@@ -188,11 +188,6 @@ class Response:
                 f"{self.status_code} Server Error: {reason} for url: {self.url}"
             )
 
-        elif self.status_code >= 600:
-            http_error_msg = (
-                f"{self.status_code} Custom Error: {reason} for url: {self.url}"
-            )
-
         if http_error_msg:
             raise HTTPError(http_error_msg)
 
