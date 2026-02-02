@@ -149,7 +149,6 @@ class HttpsToHttpMiddleware:
             not response.status_code or
             'WRONG_VERSION_NUMBER' in str(response._error) or
             'EOF occurred in violation of protocol' in str(response._error) or
-            '631 Internal Server Error' in str(response._error) or
             '<h1>404 Not Found</h1>' in response.text
         )
         if retry_with_http and https_errors:
