@@ -62,15 +62,14 @@ class ProbeRule:
             return
         if response.meta.get('depth', 0) == self.max_depth:
             return
-        if response.selector.type == 'html' and response.xpath('//a'):
-            links = self.link_extractor.extract_links(response)
-            self.process_links(links)
-            # add all to processing instead of trying stop.
-            for link in links:
-                if not self.link_allowed(link, response):
-                    continue
-                self._processing.append(link)
-                yield link
+        links = self.link_extractor.extract_links(response)
+        self.process_links(links)
+        # add all to processing instead of trying stop.
+        for link in links:
+            if not self.link_allowed(link, response):
+                continue
+            self._processing.append(link)
+            yield link
 
     def link_allowed(self, link, response) -> bool:
         """Overrides this method to see if a link should be allowed."""
