@@ -364,7 +364,9 @@ class LinkExtractor:
     def extract(self, response):
         all_links = []
 
-        if self.restrict_xpaths:
+        if response.selector.type in ('json', 'text'):
+            docs = []
+        elif self.restrict_xpaths:
             docs = [
                 sub_doc
                 for x in self.restrict_xpaths
