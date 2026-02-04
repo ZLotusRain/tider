@@ -635,7 +635,7 @@ class ArticleExtractor:
             self.on_extract(root=root, content_node=content_node, article=article)
         return article
 
-    extract_artile = extract
+    extract_article = extract
 
     def _finalize_content(self, best_candidate, candidates, recursive=True):
         # Now that we have the top candidate, look through its siblings for content that might also be related.
