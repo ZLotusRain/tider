@@ -231,7 +231,8 @@ class MultiParser:
         return (
             self._node_from_options(
                 p, name, schema, cmd, dict(options))
-            for schema in self.schemas for name in names
+            # matched spiders
+            for name in names for schema in self.schemas if name in self.schemas[schema]
         )
 
     def _node_from_options(self, p, spider, schema, cmd, options):
