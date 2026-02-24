@@ -19,6 +19,7 @@ from tider.utils.time import preferred_clock
 from tider.utils.url import parse_url_host
 from tider.utils.crypto import set_md5
 from tider.utils.log import get_logger
+from tider.utils.misc import arg_to_iter
 from tider.exceptions import ImproperlyConfigured
 
 __all__ = ('PlaywrightDownloader', )
@@ -245,9 +246,9 @@ DOM_LOAD_HOOK = f"""
 
 class BrowserResponse:
 
-    def __init__(self, content: str, encoding: str = 'utf-8', http_version: str = 'HTTP/1.1',
-                 status_code=None, headers=None, cookies=None, reason=None, browser=None, context=None, page=None):
-        self._content = content
+    def __init__(self, encoding: str = 'utf-8', http_version: str = 'HTTP/1.1',
+                 status_code=None, headers=None, cookies=None, reason=None, async_contents=None,
+                 pending_requests=None, browser=None, context=None, page=None):
         self._encoding = encoding
         self.page = page
         self.context = context
@@ -257,6 +258,9 @@ class BrowserResponse:
         self.http_version = http_version
         self.headers = headers or {}
         self.cookies = cookies or {}
+
+        self._async_contents = async_contents
+        self._pending_requests = pending_requests
 
     def screenshot(self, path, width=1920, height=1080, selector=None, timeout=0):
         self.page.add_style_tag(content='body { height: "" !important; width: "" !important;}')
@@ -278,13 +282,39 @@ class BrowserResponse:
         cdp.detach()
         return mhtml
 
+    def click(self, selector, wait_for_pending_requests=True, has=None, has_not=None,
+              has_not_text=None, has_text=None, delay=0, **kwargs):
+        element = self.page.locator(selector, has=has, has_not=has_not, has_not_text=has_not_text, has_text=has_text)
+        element.click(delay=delay, **kwargs)
+        if wait_for_pending_requests:
+            self.wait_for_pending_requests()
+
+    @property
+    def async_contents(self):
+        """Async XHR/Fetch(s) including relevant content."""
+        return list(arg_to_iter(self._async_contents))
+
+    def wait_for_timeout(self, timeout):
+        self.page.wait_for_timeout(timeout)
+
+    def wait_for_pending_requests(self):
+        self.wait_for_timeout(800)  # activate pending requests.
+        while self._pending_requests:
+            self.wait_for_timeout(500)
+
+    @property
+    def content(self):
+        content = self.page.content()
+        content = content.replace(DOM_LOAD_HOOK, '').replace(LAST_SCRIPT, '')
+        return content
+
     def stream(self, chunk_size=None, **_):
         """
         iterate streaming content chunk by chunk in bytes.
         """
         if chunk_size:
             warnings.warn("chunk_size is ignored, there is no way to tell browser that.")
-        yield self._content.encode(encoding=self._encoding)
+        yield self.content.encode(encoding=self._encoding)
 
     def close(self):
         if self.page is not None:
@@ -354,7 +384,7 @@ class PlaywrightDownloader(BrowserDownloader):
         super().__init__(**kwargs)
         self._cache_lock = RLock()
 
-    def handle_route(self, route, *_, hooked, banned_routes=None):
+    def handle_route(self, route, *_, hooked, pending_requests=None, banned_routes=None):
         # arg_count = len(inspect.signature(handler).parameters)
         name = self.get_static_name(route.request.url)
         cached_js = self._cache_dir / parse_url_host(route.request.url) / name
@@ -402,16 +432,24 @@ class PlaywrightDownloader(BrowserDownloader):
                 body = fo.read()
             route.fulfill(body=body)
         else:
+            if pending_requests is not None:
+                pending_requests.append(route.request)
             route.continue_()
 
-    def on_response(self, response):
+    def on_response(self, response, async_contents=None, pending_requests=None):
+        if pending_requests and response.request in pending_requests:
+            pending_requests.remove(response.request)
         if not self._cache_statics or response.request.method != 'GET':
             return
-        if response.request.resource_type in ('xhr', 'document', 'fetch', 'image', 'other', 'websocket', 'font'):
+        if response.request.resource_type in ('document', 'image', 'other', 'websocket', 'font'):
             # fonts may differ every time.
             return
         if response.frame.page.is_closed():
             # don't try to fetch response.body
+            return
+        if response.request.resource_type in ('xhr', 'fetch'):
+            if async_contents is not None and response.headers.get('content-type', '').lower().startswith(('application/json', 'text/html')):
+                async_contents.append({'request': response.request, 'response_body': response.text()})
             return
 
         name = self.get_static_name(response.request.url)
@@ -421,7 +459,7 @@ class PlaywrightDownloader(BrowserDownloader):
         head_hook = b'try {\n// source script start\n'
         dom_hook = VUE_DOM_LOAD_HOOK.format(name=set_md5(name)).encode('utf-8')
         tail_hook = b'\n// source script end\n} catch (e) { throw e; } finally {\n' + dom_hook + b'}'
-        host_dir = self._cache_dir / parse_url_host(response.request.url)
+        host_dir = self._cache_dir / parse_url_host(response.request.url).replace(':', '_')
         cached_path = host_dir / name
         with self._cache_lock:
             if not os.path.exists(host_dir):
@@ -475,16 +513,21 @@ class PlaywrightDownloader(BrowserDownloader):
             raise ImproperlyConfigured("Unsupported browser channel: %s" % browser_channel)
 
         headless = request.meta.get('browser_headless', True)
-        keep_alive = request.meta.get('browser_keep_alive', False)
         init_script = request.meta.get('browser_init_script')
         init_script_path = request.meta.get('browser_init_script_path')
         device = request.meta.get('browser_device')
         scroll_to_bottom = request.meta.get('browser_scroll_to_bottom', False)
         scroll_timeout = request.meta.get('browser_scroll_timeout', request.timeout)
+        browser_args = request.meta.get('browser_args', [])  # --no-sandbox/single-process/auto-open-devtools-for-tabs
+        if '--disable-blink-features=AutomationControlled' not in browser_args:
+            browser_args.append('--disable-blink-features=AutomationControlled')
         banned_routes = request.meta.get('browser_banned_routes', ['media'])
+        keep_alive = request.meta.get('browser_keep_alive', False)
 
         playwright_context = browser = page = None
         hooked = defaultdict(list)
+        async_contents = []
+        pending_requests = []
         try:
             playwright_context = sync_playwright()
             playwright = playwright_context.start()
@@ -500,9 +543,7 @@ class PlaywrightDownloader(BrowserDownloader):
             browser_type = getattr(playwright, browser_type)
             browser = browser_type.launch(
                 executable_path=request.meta.get('browser_executable_path'),
-                channel=browser_channel, headless=headless,
-                # devtools=True,
-                args=['--disable-blink-features=AutomationControlled', '--no-sandbox', '--single-process'],
+                channel=browser_channel, headless=headless, args=browser_args,
             )
             # clear caches manually if needed when something is always on load state.
             context = browser.new_context(**context_config, bypass_csp=True)
@@ -516,8 +557,9 @@ class PlaywrightDownloader(BrowserDownloader):
             headers.pop('Accept-Encoding', None)  # detected spider characteristic.
             page.set_extra_http_headers(headers)
 
-            page.on('response', self.on_response)
-            page.route("**/*", functools.partial(self.handle_route, hooked=hooked, banned_routes=banned_routes))
+            on_response = functools.partial(self.on_response, async_contents=async_contents, pending_requests=pending_requests)
+            page.on('response', on_response)
+            page.route("**/*", functools.partial(self.handle_route, hooked=hooked, pending_requests=pending_requests, banned_routes=banned_routes))
 
             start = preferred_clock()
             # automatically dismiss dialogs.
@@ -579,16 +621,14 @@ class PlaywrightDownloader(BrowserDownloader):
                     iframe_element.evaluate("""(element, content) => { element.innerHTML = content; }""", iframe_content)
                 except PlaywrightError:
                     pass
-            html = page.content()
-            html = html.replace(DOM_LOAD_HOOK, '').replace(LAST_SCRIPT, '')
             status_code = browser_response.status
             reason = browser_response.status_text
             response_headers = browser_response.headers
             context_cookies = context.cookies()
             cookies = {cookie['name']: cookie['value'] for cookie in context_cookies}
             resp = BrowserResponse(
-                html, headers=response_headers, status_code=status_code, cookies=cookies,
-                reason=reason, browser=browser, context=context, page=page
+                headers=response_headers, status_code=status_code, cookies=cookies, reason=reason,
+                async_contents=async_contents, pending_requests=pending_requests, browser=browser, context=context, page=page
             )
             screenshot_path = request.meta.get('browser_screenshot_path')
             if screenshot_path:
@@ -607,6 +647,7 @@ class PlaywrightDownloader(BrowserDownloader):
             response.elapsed = elapsed
             return response
         except Exception as e:
+            keep_alive = False
             if 'ERR_TUNNEL_CONNECTION_FAILED' in str(e):
                 request.invalidate_proxy()
             if 'ERR_INVALID_AUTH_CREDENTIALS' in str(e):
@@ -621,4 +662,4 @@ class PlaywrightDownloader(BrowserDownloader):
                     page.unroute_all(behavior='ignoreErrors')
                 browser and browser.close()
                 playwright_context and playwright_context.__exit__()
-            hooked.clear()
+            hooked.clear()  # release frames.
