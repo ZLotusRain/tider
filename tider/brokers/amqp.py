@@ -1,4 +1,5 @@
 """Sending/Receiving Messages (Kombu integration)."""
+import gc
 import errno
 import json
 import redis
@@ -739,6 +740,7 @@ class AMQPBroker(Broker):
                     logger.warning('Broker connection has broken, try reconnecting...')
                     ignore_errors(connection, consumer.close)
                     connection.release()
+                    gc.collect()  # clear threads in C-level.
 
                     connection = self.connect(transport_options=transport_options)  # change settings if needed.
                     consumer = self.MessageConsumer(channel=connection, queues=queues,
