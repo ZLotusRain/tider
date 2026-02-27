@@ -320,6 +320,9 @@ class ProbeSpider(Spider):
                     # avoid stopping rule before all links processed.
                     if new_link in seen:
                         probe_rules[rule].discard(new_link)
+                    elif new_link.ext:
+                        # support file parsing in the future.
+                        probe_rules[rule].discard(new_link)
                     elif new_link['url'] in start_urls or new_link['url'].strip('/') in start_urls:
                         # exclude first page
                         probe_rules[rule].discard(new_link)
