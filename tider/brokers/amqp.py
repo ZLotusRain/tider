@@ -1,5 +1,4 @@
 """Sending/Receiving Messages (Kombu integration)."""
-import gc
 import errno
 import json
 import redis
@@ -16,7 +15,6 @@ from weakref import WeakValueDictionary
 from redis.exceptions import ResponseError
 from kombu import Consumer, Exchange, Queue
 from kombu.transport.virtual.base import Message, Channel
-from kombu.connection import Connection as KombuConnection
 from kombu.common import ignore_errors
 from kombu.log import get_logger as k_get_logger
 from kombu.utils.json import dumps, loads
@@ -25,7 +23,7 @@ from kombu.utils.functional import maybe_list
 from kombu.utils.objects import cached_property
 from kombu.utils.compat import detect_environment
 
-from tider import signals
+from tider import signals, Connection as BaseConnection
 from tider.brokers import Broker
 from tider.utils.log import get_logger
 from tider.utils.crypto import set_md5
@@ -261,7 +259,7 @@ class RawMessageChannel(Channel):
             self._put(queue, message.body)
 
 
-class Connection(KombuConnection):
+class Connection(BaseConnection):
 
     def create_transport(self):
         transport = super().create_transport()
@@ -499,11 +497,11 @@ class AMQPBroker(Broker):
         transport_options.update({'body_encoding': body_encoding})
 
         return self.Connection(
-            url,
-            userid or settings.get('BROKER_USER'),
-            password or settings.get('BROKER_PASSWORD'),
-            virtual_host or settings.get('BROKER_VHOST'),
-            port or settings.get('BROKER_PORT'),
+            hostname=url,
+            userid=userid or settings.get('BROKER_USER'),
+            password=password or settings.get('BROKER_PASSWORD'),
+            virtual_host=virtual_host or settings.get('BROKER_VHOST'),
+            port=port or settings.get('BROKER_PORT'),
             transport=transport or settings.get('BROKER_TRANSPORT'),
             ssl=ssl,
             heartbeat=heartbeat,
@@ -513,6 +511,7 @@ class AMQPBroker(Broker):
             ),
             transport_options=transport_options,
             connect_timeout=connect_timeout,
+            sleep_func=self.crawler.sleep,
         )
 
     def connect(self, transport_options=None):
@@ -685,6 +684,7 @@ class AMQPBroker(Broker):
             'unacked_key': f'{key}.unacked',
             'unacked_index_key': f'{key}.unacked_index',
             'max_connections': self.crawler.concurrency,
+            'wait_time_seconds': 0.1  # don't wait too long in C-level.
         }
         connection = self.connect(transport_options=transport_options)
         consumer = self.MessageConsumer(channel=connection, queues=queues,
@@ -725,12 +725,7 @@ class AMQPBroker(Broker):
                             elapsed = 0
                             logger.info('No messages fetched, try rebalancing...')
                             ignore_errors(connection, consumer.close)
-                            connection.release()
-
-                            connection = self.connect(transport_options=transport_options)
-                            consumer = self.MessageConsumer(channel=connection, queues=queues,
-                                                            accept=None, on_decode_error=on_decode_error)
-                            consumer.on_message = on_message
+                            consumer.cancel()  # avoid uncollected threads in C-level.
                             consumer.consume()
                 except connection.connection_errors + response_errors as e:
                     if isinstance(e, ResponseError):
@@ -740,7 +735,6 @@ class AMQPBroker(Broker):
                     logger.warning('Broker connection has broken, try reconnecting...')
                     ignore_errors(connection, consumer.close)
                     connection.release()
-                    gc.collect()  # clear threads in C-level.
 
                     connection = self.connect(transport_options=transport_options)  # change settings if needed.
                     consumer = self.MessageConsumer(channel=connection, queues=queues,
