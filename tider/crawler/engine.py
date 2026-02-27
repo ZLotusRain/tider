@@ -24,8 +24,8 @@ def active_thread_count():
 
 class MockConnection:
 
-    def __init__(self, sleep=None):
-        self._sleep = sleep or time.sleep
+    def __init__(self, sleep_func=None):
+        self._sleep = sleep_func or time.sleep
 
     def drain_events(self, timeout=None):
         self._sleep(timeout)
@@ -54,7 +54,7 @@ class HeartEngine:
         self.paused = False
         self.polling = False
         if getattr(self.crawler.Pool, 'is_green', False):
-            self.connection = MockConnection(sleep=self.crawler.sleep)
+            self.connection = MockConnection(sleep_func=self.crawler.sleep)
         else:
             self.connection = self.crawler.connection
 
