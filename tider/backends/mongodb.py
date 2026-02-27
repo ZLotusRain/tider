@@ -169,11 +169,12 @@ class MongoBackend(Backend):
             if self.read_preference:
                 conf['read_preference'] = self.MODES.get(self.read_preference)
             conf['replicaSet'] = self.replica_set
-            # if self.username:
-            #     conf['username'] = self.username
-            # if self.password:
-            #     conf['password'] = self.password
-            # conf['authSource'] = self.database_name
+            if not SUPPORTS_MONGODB32:
+                if self.username:
+                    conf['username'] = self.username
+                if self.password:
+                    conf['password'] = self.password
+                conf['authSource'] = self.database_name
 
             self._connection = MongoClient(**conf)
 
@@ -280,7 +281,7 @@ class MongoBackend(Backend):
     def _get_database(self):
         conn = self._get_connection()
         database = conn[self.database_name]
-        if self.username or self.password:
+        if SUPPORTS_MONGODB32 and (self.username or self.password):
             database.authenticate(self.username, self.password)
         return database
 
