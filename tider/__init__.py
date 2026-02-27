@@ -10,7 +10,7 @@ from functools import wraps
 from . import local
 
 __all__ = (
-    'Tider', 'Item', 'Field', 'Promise',
+    'Tider', 'Connection', 'Item', 'Field', 'Promise',
     'Request', 'Response', '__version__', 'version_info',
 )
 
@@ -33,7 +33,7 @@ if sys.version_info < (3, 8):
 STATICA_HACK = True
 globals()['kcah_acitats'[::-1].upper()] = False
 if STATICA_HACK:  # pragma: no cover
-    from tider.base import Tider
+    from tider.base import Tider, Connection
     from tider.promise import Promise
     from tider.item import Item, Field
     from tider.network import Request, Response
@@ -205,7 +205,7 @@ def maybe_patch_third_party():
 old_module, new_module = local.recreate_module(  # pragma: no cover
     __name__,
     by_module={
-        'tider.base': ['Tider'],
+        'tider.base': ['Tider', 'Connection'],
         'tider.item': ['Item', 'Field'],
         'tider.promise': ['Promise'],
         'tider.network': ['Request', 'Response'],

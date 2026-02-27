@@ -1,10 +1,13 @@
 import sys
+import time
+import socket
 import threading
 from datetime import datetime
 from operator import attrgetter
+from queue import Empty
 from click.exceptions import Exit
 
-from kombu import Connection
+from kombu import Connection as KombuConnection
 from kombu.clocks import LamportClock
 from kombu.utils import cached_property
 
@@ -16,7 +19,7 @@ from tider.settings import Settings
 from tider.utils.imports import symbol_by_name
 from tider.utils.time import to_utc, timezone
 
-__all__ = ('Tider',)
+__all__ = ('Tider', 'Connection')
 
 
 def _unpickle(cls, kwargs):
@@ -34,6 +37,55 @@ def _unpickle_appattr(reverse_name, args):
 def appstr(app):
     """String used in __repr__ etc, to id app instances."""
     return f'{app.main or "__main__"} at {id(app):#x}'
+
+
+def _is_overridden_method(obj, method):
+    cls = obj.__class__
+    if not hasattr(obj, method):
+        return False
+
+    current_method = getattr(cls, method)
+    for base in cls.__mro__[1:]:
+        if hasattr(base, method):
+            base_method = getattr(base, method)
+            return current_method is not base_method
+
+    return False
+
+
+class Connection(KombuConnection):
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._sleep = kwargs.get('sleep_func') or time.sleep
+
+    def drain_events(self, **kwargs):
+        transport = self.transport
+        if _is_overridden_method(transport, method='drain_events'):
+            return transport.drain_events(self.connection, **kwargs)
+
+        timeout = kwargs.get('timeout')
+        time_start = time.monotonic()
+        get = transport.cycle.get
+        polling_interval = transport.polling_interval
+        if timeout and polling_interval and polling_interval > timeout:
+            polling_interval = timeout
+        waited = False  # avoid stuck in non-Python environment like C-level.
+        while 1:
+            try:
+                get(transport._deliver, timeout=timeout)
+            except Empty:
+                if timeout is not None and time.monotonic() - time_start >= timeout:
+                    raise socket.timeout()
+                if polling_interval is not None:
+                    self._sleep(polling_interval)
+                    waited = True
+            else:
+                break
+            finally:
+                if not waited:
+                    self._sleep(0.001)  # switch greenlet if needed.
+                waited = False
 
 
 class Tider:
@@ -184,7 +236,8 @@ class Tider:
 
         return type(name or Class.__name__, (Class,), attrs)
 
-    def connection_for_control(self, url=None, heartbeat=120, heartbeat_checkrate=3.0, transport_options=None, **kwargs):
+    def connection_for_control(self, url=None, heartbeat=120, heartbeat_checkrate=3.0,
+                               transport_options=None, sleep_func=None, **kwargs):
         """Establish connection used for controlling.
 
          Returns:
@@ -201,6 +254,7 @@ class Tider:
             failover_strategy=None,
             transport_options=transport_options,
             connect_timeout=4,
+            sleep_func=sleep_func,
             **kwargs
         )
 
