@@ -184,12 +184,14 @@ class Tider:
 
         return type(name or Class.__name__, (Class,), attrs)
 
-    def connection_for_control(self, url=None, heartbeat=120, heartbeat_checkrate=3.0, **kwargs):
+    def connection_for_control(self, url=None, heartbeat=120, heartbeat_checkrate=3.0, transport_options=None, **kwargs):
         """Establish connection used for controlling.
 
          Returns:
             kombu.Connection: the lazy connection instance.
         """
+        transport_options = dict(transport_options or {})
+        transport_options.setdefault('wait_time_seconds', 0.1)  # don't wait too long in C-level.
         return Connection(
             hostname=url or self.conf.get('CONTROL_URL'),
             ssl=False,
@@ -197,7 +199,7 @@ class Tider:
             heartbeat_checkrate=heartbeat_checkrate,
             login_method=None,
             failover_strategy=None,
-            transport_options={},
+            transport_options=transport_options,
             connect_timeout=4,
             **kwargs
         )
