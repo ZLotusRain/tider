@@ -439,6 +439,10 @@ class PlaywrightDownloader(BrowserDownloader):
     def on_response(self, response, async_contents=None, pending_requests=None):
         if pending_requests and response.request in pending_requests:
             pending_requests.remove(response.request)
+        if response.request.resource_type in ('xhr', 'fetch'):
+            if async_contents is not None and response.headers.get('content-type', '').lower().startswith(('application/json', 'text/html')):
+                async_contents.append({'request': response.request, 'response_body': response.text()})
+            return
         if not self._cache_statics or response.request.method != 'GET':
             return
         if response.request.resource_type in ('document', 'image', 'other', 'websocket', 'font'):
@@ -446,10 +450,6 @@ class PlaywrightDownloader(BrowserDownloader):
             return
         if response.frame.page.is_closed():
             # don't try to fetch response.body
-            return
-        if response.request.resource_type in ('xhr', 'fetch'):
-            if async_contents is not None and response.headers.get('content-type', '').lower().startswith(('application/json', 'text/html')):
-                async_contents.append({'request': response.request, 'response_body': response.text()})
             return
 
         name = self.get_static_name(response.request.url)
