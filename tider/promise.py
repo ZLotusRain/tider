@@ -107,15 +107,16 @@ class PromiseNode:
         if isinstance(request, Request):
             promise_node = request.meta.get('promise_node')
             if promise_node:
+                node = promise_node.request.meta.setdefault('promise_root', promise_node.root)
                 # # use this request to update promise values.
                 # # copy request state to avoid lose cb_kwargs
-                node = promise_node.root
                 if node.parent and node.parent is not self:
                     raise ValueError("Can't add root from another promise.")
                 node.parent = self  # add parent promise, do not use proxy here
                 # old_request, promise_node.request = promise_node.request, request
                 # old_request.close()
                 # promise_node.reset()  # SCHEDULED to PENDING
+                promise_node.request.meta['promise_root'] = self.root  # keep current top root.
                 promise_node.merge_values(request)
             else:
                 node = PromiseNode(request=request, parent=self)
