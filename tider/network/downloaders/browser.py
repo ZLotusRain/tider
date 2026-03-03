@@ -317,10 +317,13 @@ class BrowserResponse:
         yield self.content.encode(encoding=self._encoding)
 
     def close(self):
-        if self.page is not None:
-            self.page.unroute_all(behavior='ignoreErrors')
-        if self.browser is not None:
-            self.browser.close()
+        try:
+            if self.page is not None:
+                self.page.unroute_all(behavior='ignoreErrors')
+            if self.browser is not None:
+                self.browser.close()
+        except PlaywrightError:
+            pass
 
 
 class BrowserDownloader:
@@ -658,8 +661,6 @@ class PlaywrightDownloader(BrowserDownloader):
             return response
         finally:
             if not keep_alive:
-                if page is not None:
-                    page.unroute_all(behavior='ignoreErrors')
                 browser and browser.close()
                 playwright_context and playwright_context.__exit__()
             hooked.clear()  # release frames.
