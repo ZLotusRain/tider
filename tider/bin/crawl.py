@@ -2,12 +2,14 @@
 
 import os
 import sys
+import json
 import click
+import pathlib
 
 from tider import concurrency as _concurrency
 from tider.utils.log import get_logger
 from tider.utils.nodenames import node_format
-from tider.exceptions import SecurityError
+from tider.exceptions import SecurityError, ImproperlyConfigured
 from tider.platforms import EX_OK, EX_FAILURE, detached, maybe_drop_privileges
 from tider.bin.base import TiderDaemonCommand, TiderOption, LogLevel
 
@@ -119,11 +121,14 @@ def detach(path, argv, logfile=None, pidfile=None, allow_duplicates=False,
 @click.option('--mail-to',
               type=str,
               help='Mails to send stats mail to, separate with commas.')
+@click.option('--spider-config',
+              type=str,
+              help='Path to spider config file.')
 @click.pass_context
 def crawl(ctx, spider, hostname=None, transport=None, pool=None, concurrency=None,
           broker_wait_timeout=None, loglevel=None, logfile=None, uid=None, gid=None, pidfile=None,
           debug=False, allow_duplicates=False, data_source="", remove_files_after_consumed=False,
-          mail_to=None, **kwargs):
+          mail_to=None, spider_config=None, **kwargs):
     try:
         app = ctx.obj.app
         if data_source:
@@ -146,8 +151,18 @@ def crawl(ctx, spider, hostname=None, transport=None, pool=None, concurrency=Non
             app.conf.set("STATSMAILER_RCPTS", mail_to.split(','), 'cmdline')
             app.conf.set("STATS_CLASS", 'tider.statscollector.StatsMailer', 'cmdline')
 
+        if spider_config:
+            path = pathlib.Path(spider_config)
+            try:
+                spider_config = json.loads(path.read_text(encoding='utf-8'))
+            except json.decoder.JSONDecodeError:
+                raise ImproperlyConfigured("Unknown config format.")
+        spider_config.update(dict(x.split("=", 1) for x in ctx.args))
+
+        spidercls = app.load(spider or ctx.obj.spider, schema=ctx.obj.schema)
+        spidercls.name = spider_config.pop('name', None) or spidercls.name
         crawler = app.Crawler(
-            app.load(spider or ctx.obj.spider, schema=ctx.obj.schema),
+            spidercls,
             project=ctx.obj.project,
             schema=ctx.obj.schema,
             hostname=hostname,
@@ -185,11 +200,7 @@ def crawl(ctx, spider, hostname=None, transport=None, pool=None, concurrency=Non
                           hostname=crawler.group, group=crawler.group)
         maybe_drop_privileges(uid=uid, gid=gid)
 
-        spider_kwargs = dict(x.split("=", 1) for x in ctx.args)
-        if 'name' in spider_kwargs:
-            ctx.obj.echo("Detected conflict field `name` in user options, replaced with `name_`.")
-            spider_kwargs['name_'] = spider_kwargs.pop('name')
-        crawler.crawl(**spider_kwargs)
+        crawler.crawl(**spider_config)
         ctx.exit(crawler.exitcode)
     except SecurityError as e:
         ctx.obj.error(e.args[0])
