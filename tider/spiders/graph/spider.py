@@ -377,7 +377,8 @@ class Page:
         Check if the response is blocked by website security mechanisms.
         """
         if (
-            response.ok
+            response.failed
+            or response.ok
             or response.status_code >= 500
             or response.status_code == 404
         ):
