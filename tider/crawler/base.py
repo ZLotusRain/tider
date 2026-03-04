@@ -174,8 +174,11 @@ class Crawler:
         set_setting('BACKEND', self.backend_cls)
 
     def on_start(self):
-        self.pidbox = (gPidbox if getattr(self.Pool, 'is_green', False) else Pidbox)(self)
-        self.pidbox.start()
+        if not self.app.conf.get("CONTROL_URL"):
+            print("CONTROL_URL has not been provided, skip configuring control broker.")
+        else:
+            self.pidbox = (gPidbox if getattr(self.Pool, 'is_green', False) else Pidbox)(self)
+            self.pidbox.start()
         self.pidfile = node_format(self.pidfile, self.hostname, g=self.group)
         if self.pidfile:
             self.pidlock = create_pidlock(self.pidfile, group=self.group, allow_duplicates=self.allow_duplicates)
@@ -239,13 +242,15 @@ class Crawler:
 
     def get_hostname(self, hostname):
         hostname = self._default_hostname(hostname)
-        # note: do not use self.connection here to avoid connection loss in pidbox.
-        # adjust timeout to avoid spawning duplicate hostname when using multi.
-        inspect = self.app.control.inspect(timeout=1.0)
         print("Checking if hostname duplicates...")
+        replies = None
+        if self.app.conf.get("CONTROL_URL"):
+            # note: do not use self.connection here to avoid connection loss in pidbox.
+            # adjust timeout to avoid spawning duplicate hostname when using multi.
+            inspect = self.app.control.inspect(timeout=1.0)
 
-        # illegal address: not allowed address
-        replies = inspect.ping(destination=[hostname])
+            # illegal address: not allowed address
+            replies = inspect.ping(destination=[hostname])
         if replies or (self.pidfile and os.path.exists(node_format(self.pidfile, hostname, g=hostname))):
             # avoid duplicates in multi start.
             if self.allow_duplicates:

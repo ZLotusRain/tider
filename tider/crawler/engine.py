@@ -53,7 +53,7 @@ class HeartEngine:
         self.running = False
         self.paused = False
         self.polling = False
-        if getattr(self.crawler.Pool, 'is_green', False):
+        if not self.crawler.app.conf.get("CONTROL_URL") or getattr(self.crawler.Pool, 'is_green', False):
             self.connection = MockConnection(sleep_func=self.crawler.sleep)
         else:
             self.connection = self.crawler.connection

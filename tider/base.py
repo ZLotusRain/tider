@@ -107,7 +107,6 @@ class Tider:
     loader_cls = 'tider.spiderloader:SpiderLoader'
     control_cls = 'tider.crawler.control:Control'
     log_cls = 'tider.log:Logging'
-    control_url = 'amqp://guest:guest@localhost//'
 
     crawlers = property(
         lambda self: self._crawlers,
@@ -115,7 +114,7 @@ class Tider:
         ":meth:`crawl` and managed by this class.",
     )
 
-    def __init__(self, main=None, loader=None, control=None, log=None, settings=None, set_as_current=True):
+    def __init__(self, main=None, loader=None, control=None, control_url=None, log=None, settings=None, set_as_current=True):
 
         self._local = threading.local()
         self.clock = LamportClock()
@@ -129,6 +128,9 @@ class Tider:
 
         self._config_source = settings
         self._conf = None
+        if control_url:
+            self.conf.set("CONTROL_URL", control, priority='project')
+
 
         if self.set_as_current:
             self.set_current()
