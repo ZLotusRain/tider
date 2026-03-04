@@ -160,7 +160,7 @@ def crawl(ctx, spider, hostname=None, transport=None, pool=None, concurrency=Non
         spider_config.update(dict(x.split("=", 1) for x in ctx.args))
 
         spidercls = app.load(spider or ctx.obj.spider, schema=ctx.obj.schema)
-        spidercls.name = spider_config.pop('name', None) or spidercls.name
+        spidercls.name = spider_config.get('name') or spidercls.name
         crawler = app.Crawler(
             spidercls,
             project=ctx.obj.project,
