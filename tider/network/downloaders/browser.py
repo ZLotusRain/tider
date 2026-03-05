@@ -327,23 +327,25 @@ class BrowserResponse:
 
 
 class BrowserDownloader:
-
     lazy = True
+    single_instance = False
 
     CACHE_DIR = '/data/tider/BrowserDownloader'
 
-    def __init__(self, cache_statics=True, cache_dir=None):
+    def __init__(self, cache_statics=True, cache_dir=None, single_instance=False):
         self._cache_dir = pathlib.Path(cache_dir or self.CACHE_DIR)
         if cache_statics:
             if not os.path.exists(self._cache_dir):
                 os.makedirs(self._cache_dir)
         self._cache_statics = cache_statics
+        self.single_instance = single_instance
 
     @classmethod
     def from_crawler(cls, crawler):
         return cls(
             cache_statics=crawler.settings.getbool('DOWNLOADER_BROWSER_CACHE_STATICS', True),
             cache_dir=crawler.settings.get('DOWNLOADER_BROWSER_CACHE_DIR'),
+            single_instance=crawler.settings.getbool('DOWNLOADER_BROWSER_SINGLE_INSTANCE', False),
         )
 
     @staticmethod
@@ -385,6 +387,10 @@ class PlaywrightDownloader(BrowserDownloader):
                 'You need to install the playwright library to use PlaywrightDownloader.'
             )
         super().__init__(**kwargs)
+        self._playwright_context = self._playwright = None
+        if self.single_instance:
+            self._playwright_context = sync_playwright()
+            self._playwright = self._playwright_context.start()
         self._cache_lock = RLock()
 
     def handle_route(self, route, *_, hooked, pending_requests=None, banned_routes=None):
@@ -527,13 +533,15 @@ class PlaywrightDownloader(BrowserDownloader):
         banned_routes = request.meta.get('browser_banned_routes', ['media'])
         keep_alive = request.meta.get('browser_keep_alive', False)
 
-        playwright_context = browser = page = None
+        playwright_context = browser = None
         hooked = defaultdict(list)
         async_contents = []
         pending_requests = []
         try:
-            playwright_context = sync_playwright()
-            playwright = playwright_context.start()
+            playwright = self._playwright
+            if not playwright:
+                playwright_context = sync_playwright()
+                playwright = playwright_context.start()
 
             context_config = {'ignore_https_errors': True}
             if request.selected_proxy:
@@ -610,7 +618,10 @@ class PlaywrightDownloader(BrowserDownloader):
                 if scroll_timeout:
                     if scroll_elapsed > scroll_timeout or len(history_heights) == 5 and len(set(history_heights)) == 1:
                         break
-            page.wait_for_load_state('networkidle')
+            try:
+                page.wait_for_load_state('networkidle')
+            except PlaywrightTimeoutError:
+                pass
             for span in page.evaluate('getSpansWithClick()'):
                 page.locator(span).click()
             self.wait_for_hooked_frames(hooked, timeout=request.timeout * 1000)
@@ -664,3 +675,8 @@ class PlaywrightDownloader(BrowserDownloader):
                 browser and browser.close()
                 playwright_context and playwright_context.__exit__()
             hooked.clear()  # release frames.
+
+    def close(self):
+        if self._playwright_context:
+            self._playwright_context.__exit__()
+
