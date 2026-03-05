@@ -1,4 +1,5 @@
 import json
+import pathlib
 import openpyxl
 from openpyxl.cell import Cell
 from collections import defaultdict
@@ -15,30 +16,32 @@ class TitleRow:
 
     def __init__(self, name: str, titles: list):
         self.name = name
-        self.titles = sorted(titles)
+        self.titles = titles
 
     def __eq__(self, other):
         if isinstance(other, TitleRow):
-            return self.name == other.name and self.titles == other.titles
+            return self.name == other.name and sorted(self.titles) == sorted(other.titles)
         return False
 
     def __hash__(self) -> int:
+        titles = sorted(self.titles)
         hashed = hash("")
-        for each in self.titles:
+        for each in titles:
             hashed ^= hash(each)
         return hashed ^ hash(self.name)
 
 
 class ExcelPipeline:
 
-    def __init__(self, output):
+    def __init__(self, crawler, output):
+        self.crawler = crawler
         self.wb = openpyxl.Workbook()
         self.sheets = defaultdict(list)
-        self.output = output
+        self.output = pathlib.Path(output)
 
     @classmethod
-    def from_settings(cls, settings):
-        return cls(output=settings["EXCEL_PIPELINE_OUTPUT"])
+    def from_crawler(cls, crawler):
+        return cls(crawler=crawler, output=crawler.settings["EXCEL_PIPELINE_OUTPUT"])
 
     def process_item(self, item):
         if not isinstance(item, Item):
@@ -46,16 +49,18 @@ class ExcelPipeline:
         if item.discarded:
             return
         name = item.__class__.__name__
-        titles = list(item.fields.keys())
-        row = TitleRow(name=name, titles=titles)
+
+        titles = []
         values = []
-        for each in list(item.values()):
-            if not isinstance(each, str):
+        for key, value in item.items():
+            if not isinstance(value, str):
                 try:
-                    each = json.dumps(each, ensure_ascii=False)
+                    value = json.dumps(value, ensure_ascii=False)
                 except json.JSONDecodeError:
                     pass
-            values.append(each)
+            values.append(value)
+            titles.append(key)
+        row = TitleRow(name=name, titles=titles)
         self.sheets[row].append(values)
         logger.info(f'Obtained item: {item.jsonify()}')
 
@@ -76,5 +81,9 @@ class ExcelPipeline:
                 ws._cells[(row_idx, col_idx)] = cell
             for row in self.sheets[sheet]:
                 ws.append(row)
-        self.wb.save(self.output)
+
+        output = self.output
+        if output.is_dir():
+            output = output / (self.crawler.spidername + '.xlsx')
+        self.wb.save(output)
         self.wb.close()
