@@ -157,6 +157,8 @@ def crawl(ctx, spider, hostname=None, transport=None, pool=None, concurrency=Non
                 spider_config = json.loads(path.read_text(encoding='utf-8'))
             except json.decoder.JSONDecodeError:
                 raise ImproperlyConfigured("Unknown config format.")
+        else:
+            spider_config = {}
         spider_config.update(dict(x.split("=", 1) for x in ctx.args))
 
         spidercls = app.load(spider or ctx.obj.spider, schema=ctx.obj.schema)
