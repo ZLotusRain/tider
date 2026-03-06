@@ -570,6 +570,7 @@ class PlaywrightDownloader(BrowserDownloader):
 
             on_response = functools.partial(self.on_response, async_contents=async_contents, pending_requests=pending_requests)
             page.on('response', on_response)
+            page.on("requestfailed", lambda r: pending_requests.remove(r))
             page.route("**/*", functools.partial(self.handle_route, hooked=hooked, pending_requests=pending_requests, banned_routes=banned_routes))
 
             start = preferred_clock()
