@@ -46,15 +46,15 @@ from tider.utils.nodenames import node_format
 from tider.utils.saferepr import saferepr
 
 try:
-    from importlib.metadata import distribution, distributions
+    from importlib.metadata import distribution
 except ModuleNotFoundError:
-    from importlib_metadata import distribution, distributions
+    from importlib_metadata import distribution
 
 # tricky way to decide how to start a tider program.
-INSTALLED_PACKAGES = [dist.metadata["Name"] for dist in distributions() if "Name" in dist.metadata]
-TIDER_EXE = 'tider' if 'tider' in INSTALLED_PACKAGES else '-m tider'
-
-del INSTALLED_PACKAGES
+# INSTALLED_PACKAGES = [dist.metadata["Name"] for dist in distributions() if "Name" in dist.metadata]
+# TIDER_EXE = 'tider' if 'tider' in INSTALLED_PACKAGES else '-m tider'
+# del INSTALLED_PACKAGES
+TIDER_EXE = 'tider'
 
 
 USAGE = """\
@@ -281,9 +281,7 @@ class Node:
         self.app = app
         self.spider = spider
         self.schema = schema
-        self.cmd = cmd or tider_exe('crawl', '--detach')
-        if 'crawl' not in self.cmd:
-            self.cmd += ' crawl --detach'
+        self.cmd = cmd or f"-m {tider_exe('crawl', '--detach')}"
         self.append = append
         self.extra_args = extra_args or ''
         self.options = options  # avoid options loss
