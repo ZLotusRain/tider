@@ -1,5 +1,6 @@
 """Tider Command Line Interface."""
 import os
+import sys
 import pathlib
 import traceback
 try:
@@ -38,22 +39,32 @@ Unable to load tider application.
 {0}""")
 
 
-def _get_default_app(src_dirname, proj, custom_settings):
+def _get_default_app(proj, custom_settings, src_dirname=None):
     # settings
     # if not settings, then use default settings
     # if not schema, then load all valid spiders in settings
     settings = Settings()
-    default_module_path = 'settings.default_settings'
+    current_dir = pathlib.Path().cwd()
+
+    default_module_path = proj_settings_path = None
     if src_dirname:
-        default_module_path = f"{src_dirname}.{default_module_path}"
-    settings.setmodule(default_module_path, priority='default')
+        default_module_path = f"{src_dirname}.settings.default_settings"
+    elif os.path.exists(current_dir / 'settings' / 'default_settings.py'):
+        default_module_path = 'settings.default_settings'
+    elif os.path.exists(current_dir / 'settings.py'):
+        default_module_path = 'settings'
+    if default_module_path:
+        settings.setmodule(default_module_path, priority='default')
+
     if custom_settings:
         settings.setmodule(custom_settings, priority='project')
     elif proj:
-        proj_settings_path = f"settings.settings_{proj}"
         if src_dirname:
-            proj_settings_path = f"{src_dirname}.{proj_settings_path}"
-        settings.setmodule(proj_settings_path, priority='project')
+            proj_settings_path = f"{src_dirname}.settings.settings_{proj}"
+        elif os.path.exists(current_dir / 'settings' / f'settings_{proj}.py'):
+            proj_settings_path = f"settings.settings_{proj}"
+        if proj_settings_path:
+            settings.setmodule(proj_settings_path, priority='project')
 
     app = Tider(settings=settings)
     return app
@@ -105,6 +116,12 @@ except AttributeError:
     plugins = list(entry_points().select(name='tider.commands'))
 
 
+def _chdir(_, __, wd):
+    if wd:
+        os.chdir(wd)
+    return wd
+
+
 @with_plugins(plugins)
 @click.group(cls=DYMGroup, invoke_without_command=True)
 @click.option('-A',
@@ -116,7 +133,6 @@ except AttributeError:
               help_group="Global Options")
 @click.option('--src',
               cls=TiderOption,
-              default='src',
               help="Project implementation dirname",
               help_group="Global Options")
 @click.option('--proj',
@@ -137,7 +153,7 @@ except AttributeError:
 @click.option('--workdir',
               cls=TiderOption,
               type=pathlib.Path,
-              callback=lambda _, __, wd: os.chdir(wd) if wd else None,
+              callback=_chdir,
               is_eager=True,
               help_group="Global Options")
 @click.option('--version',
@@ -154,6 +170,10 @@ def tider(ctx, app, src, proj, settings, schema, spider, workdir, version):
         click.echo(ctx.get_help())
         ctx.exit()
 
+    workdir = workdir or ""
+    if workdir not in sys.path:
+        # use `python -m` to automatically add current path.
+        sys.path.insert(0, str(workdir))
     if not app:
         app = _get_default_app(src_dirname=src,
                                proj=proj,
