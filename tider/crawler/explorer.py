@@ -3,7 +3,9 @@
 import re
 import time
 from queue import Full
+from uuid import uuid4
 from operator import itemgetter
+from w3lib.url import parse_data_uri
 from collections import deque, defaultdict
 from typing import Union
 
@@ -30,10 +32,8 @@ from tider.utils.misc import build_from_crawler
 
 logger = get_logger(__name__)
 
-FREE_SLOTS = deque()
 
-
-def _dummy_handler(response):
+def _dummy_handler(response, **_):
     request = response.request
     logger.info(f"Downloaded {request} and got {response}.")
 
@@ -180,9 +180,12 @@ class Explorer:
         self.loop = crawler.settings.getbool('EXPLORER_USE_LOOP', False)
         self.queue = deque()
         self.on_response = None
+        self.free_slots = deque()
+        self.transports = deque()  # transport ids
 
         self.transferring = set()
         self.running = False
+        self._transferring_count = 0
 
     @classmethod
     def from_crawler(cls, crawler):
@@ -195,7 +198,7 @@ class Explorer:
         )
 
     def active(self):
-        return self.running and len(self.transferring) + len(self.queue) > 0
+        return self.running and self._transferring_count + len(self.transferring) + len(self.queue) > 0
 
     def close(self, reason):
         self.running = False
@@ -230,16 +233,16 @@ class Explorer:
         if len(self.transferring) < self.concurrency and len(self.queue) > 0:
             # avoid stuck in threadpool executor when putting work item.
             try:
-                FREE_SLOTS.pop()
+                transport_id = self.free_slots.pop()
                 self.pool.apply_async(
                     self._transport,
                     (queue, download_func, on_response),
-                    kwargs={'transferring': transferring, 'loop': self.loop},
+                    kwargs={'transport_id': transport_id, 'transferring': transferring, 'loop': self.loop},
                 )
             except IndexError:
                 pass
             except Full:
-                FREE_SLOTS.append(None)
+                self.free_slots.append(str(uuid4()))
 
     def clear_idle_conns(self):
         # don't use `len(self.transferring) + len(self.queue) < self.concurrency`,
@@ -249,18 +252,24 @@ class Explorer:
         self.session.close_expired_connections()
 
     def needs_backout(self):
-        return len(self.queue) >= self.concurrency * 2
+        return len(self.queue) >= self.concurrency + 1
 
     def _on_response_consumed(self, response):
-        FREE_SLOTS.append(None)  # release slot to control concurrency.
+        self.free_slots.append(str(uuid4()))  # release slot to control concurrency.
         self.transferring.discard(response.request)
 
-    def _transport(self, queue, download_func, output_handler=_dummy_handler, transferring=None, loop=False):
+    def _transport(self, queue, download_func, output_handler=_dummy_handler, transport_id=None,
+                   transferring=None, loop=False):
+        if transferring is None:
+            transferring = set()
+        if transport_id:
+            self.transports.append(transport_id)
         while self.running:
             keep_slot = False
             try:
                 request = queue.popleft()
-                transferring and transferring.add(request)
+                self._transferring_count += 1
+                transferring.add(request)  # thread switch.
                 if request.meta.get('explore_after') and time.monotonic() < request.meta['explore_after']:
                     # queue.insert(len(queue)+1, request)  # append to the end of queue.
                     response = request
@@ -270,17 +279,16 @@ class Explorer:
                     response.on_consumed = self._on_response_consumed
                     keep_slot = True
                 # don't use thread lock in handler if possible.
-                output_handler(response)
+                output_handler(response, transport_id=transport_id)
                 del response
 
                 if keep_slot:
                     return  # keep slot due to stream.
                 transferring and transferring.discard(request)
+                self._transferring_count -= 1
             except IndexError:
                 if not loop:
                     break
-            except RuntimeError:
-                break
             except (SpiderTerminate, SpiderShutdown):
                 self.running = False
                 break
@@ -293,9 +301,10 @@ class Explorer:
                 # when the active one can't get the next request
                 # to avoid keeping loop.
                 self._crawler.sleep(0.001)
-
+        if transport_id:
+            self.transports.remove(transport_id)
         del download_func, output_handler
-        FREE_SLOTS.append(None)
+        self.free_slots.append(str(uuid4()))
 
     def build_request_proxy(self, request: Request):
         try:
@@ -319,9 +328,9 @@ class Explorer:
         self.pool.start()
 
         if not self.loop:
-            FREE_SLOTS.clear()
+            self.free_slots.clear()
             for _ in range(self.concurrency):
-                FREE_SLOTS.append(None)
+                self.free_slots.append(str(uuid4()))
             self.on_response = on_response
             return
         # By just passing a reference to the object allows the garbage collector
@@ -330,26 +339,26 @@ class Explorer:
         download_func = self.explore
         transferring = self.transferring
         for _ in range(self.concurrency):
+            transport_id = str(uuid4())
             self.pool.apply_async(
                 self._transport,
                 (queue, download_func, on_response),
-                kwargs={'transferring': transferring, 'loop': self.loop},
+                kwargs={'transport_id': transport_id, 'transferring': transferring, 'loop': self.loop},
             )
 
     def try_explore(self, method, url, params=None, data=None, headers=None, cookies=None,
                     files=None, auth=None, timeout=None, allow_redirects=True, proxies=None,
                     stream=None, verify=None, cert=None, json=None, raise_for_status=False,
-                    proxy_schema=0, proxy_params=None, delay=0, max_retries=0, meta=None,
-                    encoding=None, ignored_status_codes=(400, 412, 521), http2=False, downloader=None,
-                    impersonate=None, session_cookies=None):
+                    proxy_schema=0, proxy_params=None, delay=0, max_retries=0, encoding=None,
+                    ignored_status_codes=(400, 412, 521), http2=False, downloader=None, impersonate=None, **kwargs):
         """Simple request api."""
+        kwargs.pop('dup_check', None)
         request = Request(url=url, method=method, params=params, data=data, json=json, headers=headers,
                           cookies=cookies, files=files, auth=auth, timeout=timeout, allow_redirects=allow_redirects,
                           proxies=proxies, proxy_schema=proxy_schema, proxy_params=proxy_params,
-                          stream=stream, verify=verify, cert=cert, raise_for_status=raise_for_status,
-                          encoding=encoding, ignored_status_codes=ignored_status_codes, meta=meta,
-                          http2=http2, downloader=downloader, impersonate=impersonate, session_cookies=session_cookies,
-                          max_retries=max_retries, dup_check=False)
+                          stream=stream, verify=verify, cert=cert, raise_for_status=raise_for_status, encoding=encoding,
+                          ignored_status_codes=ignored_status_codes, http2=http2, downloader=downloader,
+                          impersonate=impersonate, max_retries=max_retries, dup_check=False, **kwargs)
         response = self._explore(request)
         while isinstance(response, Request):
             retry_times = request.meta.get('retry_times', 0) + 1
@@ -391,8 +400,13 @@ class Explorer:
         response = None
         if isinstance(result, Request):
             request = result
-            self.build_request_proxy(request)
-            response = self.session.download_request(request)
+            if request.url == 'about:blank':
+                response = Response(request)
+            elif request.url.startswith('data:'):
+                response = Response.dummy(request=request, content=parse_data_uri(request.url).data)
+            else:
+                self.build_request_proxy(request)
+                response = self.session.download_request(request)
             result = self.middleware.process_response(request=request, response=response)
         if isinstance(result, Request):
             if response is not None:
