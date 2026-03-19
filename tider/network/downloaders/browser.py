@@ -22,7 +22,7 @@ from tider.utils.log import get_logger
 from tider.utils.misc import arg_to_iter
 from tider.exceptions import ImproperlyConfigured
 
-__all__ = ('PlaywrightDownloader', )
+__all__ = ('PlaywrightDownloader',)
 
 logger = get_logger(__name__)
 
@@ -79,7 +79,7 @@ INIT_SCRIPT = """
     //     // difference between apply and call.
     //     return originElementAddEventListener.apply(this, arguments);
     // }
-    
+
     Object.defineProperty(Object.getPrototypeOf(navigator), 'webdriver', {
         set: undefined,
         enumerable: true,
@@ -93,22 +93,22 @@ INIT_SCRIPT = """
             }}
         )
     });
-    
+
     function delay(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
     };
-    
+
     wait = async function(seconds) {
         console.log(`Starting to wait for ${seconds} seconds...`);
         await delay(seconds * 1000);
         console.log(`${seconds} seconds have passed!`);
         return "Completed";
     };
-    
+
     function getResourceStats() {
          return window.performance.getEntries("resource") || [];
     }
-    
+
     let lastResources = getResourceStats();
 
     window.checkResourcesDone = function () {
@@ -129,12 +129,12 @@ INIT_SCRIPT = """
             return true;
         }
     }
-    
+
     function getCssSelector(element) {
         if (!(element instanceof Element)) {
             return null;
         }
-        
+
         let selector = '';
         while (element) {
             if (element.tagName) {
@@ -167,7 +167,7 @@ INIT_SCRIPT = """
         }
         return selector;
     }
-    
+
     window.getSpansWithClick = function () {
         const allElements = document.querySelectorAll('span');
         const spans = [];
@@ -200,11 +200,11 @@ STYLE_PATCH = """
             }
         }
     };
-    
+
     // window.scrollTo(0, document.body.scrollHeight);
     document.body.style.removeProperty('height');
     document.body.style.removeProperty('width');
-    
+
     document.documentElement.style.height = 'auto';
     document.documentElement.style.width = 'auto';
     document.body.style.height = 'auto';
@@ -240,7 +240,6 @@ DOM_LOAD_HOOK = f"""
     }} else {{
         (document?.body || document?.head || document).appendChild(newParagraph);
     }}
-    
 """
 
 
@@ -399,7 +398,7 @@ class PlaywrightDownloader(BrowserDownloader):
         cached_js = self._cache_dir / parse_url_host(route.request.url) / name
         if route.request.resource_type in banned_routes:
             route.abort()
-        elif name.endswith('.js') or route.request.resource_type == 'script':
+        elif (route.request.resource_type != 'other' and name.endswith('.js')) or route.request.resource_type == 'script':
             frame = route.request.frame
             original_response = None
             # Failed to load module script: Expected a JavaScript module script but the server responded with
@@ -420,6 +419,8 @@ class PlaywrightDownloader(BrowserDownloader):
                     # some scripts maybe contain dynamic json contents.
                     hooking = False
                 elif 'google' in route.request.url or 'baidu' in route.request.url:
+                    hooking = False
+                elif name.startswith(('js.', 'babel-', 'exposure.jiucuo')):
                     hooking = False
                 elif frame.url != 'about:blank' and frame.page.url != 'about:blank':
                     # include iframes.
@@ -490,6 +491,14 @@ class PlaywrightDownloader(BrowserDownloader):
                 with open(cached_path, 'wb') as fo:
                     fo.write(body)
 
+    def on_request_failed(self, request, hooked=None, pending_requests=None):
+        if pending_requests and request in pending_requests:
+            pending_requests.remove(request)
+        frame = request.frame
+        name = self.get_static_name(request.url)
+        if hooked and name in hooked.get(frame, []):
+            hooked[frame].remove(name)
+
     @staticmethod
     def _wait_for_hook(frame, name=None, timeout=0, raise_for_timeout=True):
         identity = f"foo-tider-{set_md5(name)}" if name else "foo-tider"
@@ -533,7 +542,7 @@ class PlaywrightDownloader(BrowserDownloader):
         banned_routes = request.meta.get('browser_banned_routes', ['media'])
         keep_alive = request.meta.get('browser_keep_alive', False)
 
-        playwright_context = browser = None
+        playwright_context = browser = page = None
         hooked = defaultdict(list)
         async_contents = []
         pending_requests = []
@@ -570,12 +579,13 @@ class PlaywrightDownloader(BrowserDownloader):
 
             on_response = functools.partial(self.on_response, async_contents=async_contents, pending_requests=pending_requests)
             page.on('response', on_response)
-            page.on("requestfailed", lambda r: pending_requests.remove(r))
+            on_requestfailed = functools.partial(self.on_request_failed, hooked=hooked, pending_requests=pending_requests)
+            page.on("requestfailed", on_requestfailed)
             page.route("**/*", functools.partial(self.handle_route, hooked=hooked, pending_requests=pending_requests, banned_routes=banned_routes))
 
             start = preferred_clock()
             # automatically dismiss dialogs.
-            browser_response = page.goto(request.url, wait_until='networkidle')
+            browser_response = page.goto(request.url, wait_until='load')
             wait_for_init_hook = True
             try:
                 page.add_script_tag(content=DOM_LOAD_HOOK)
@@ -649,8 +659,8 @@ class PlaywrightDownloader(BrowserDownloader):
             if screenshot_path:
                 resp.screenshot(
                     path=screenshot_path,
-                    width=request.meta.get('browser_screenshot_width'),
-                    height=request.meta.get('browser_screenshot_height'),
+                    width=request.meta.get('browser_screenshot_width', 1920),
+                    height=request.meta.get('browser_screenshot_height', 1080),
                     selector=request.meta.get('browser_screenshot_selector'),
                     timeout=request.timeout * 1000
                 )
@@ -673,6 +683,11 @@ class PlaywrightDownloader(BrowserDownloader):
             return response
         finally:
             if not keep_alive:
+                try:
+                    if page is not None:
+                        page.unroute_all(behavior='ignoreErrors')
+                except PlaywrightError:
+                    pass
                 browser and browser.close()
                 playwright_context and playwright_context.__exit__()
             hooked.clear()  # release frames.
