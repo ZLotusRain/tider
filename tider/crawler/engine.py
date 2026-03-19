@@ -22,6 +22,14 @@ def active_thread_count():
                if not t.name.startswith('Dummy-'))
 
 
+def _blank_item_request(item: Item):
+
+    def _item_callback(r):
+        yield item
+
+    return Request.blank(callback=_item_callback)
+
+
 class MockConnection:
 
     def __init__(self, sleep_func=None):
@@ -196,7 +204,7 @@ class HeartEngine:
                     self.parser.active() or
                     self.scheduler.has_pending_requests())
             if flag:
-                break
+                return flag
             # consider some message queues like redis
             self.crawler.sleep(0.15)
         return flag
@@ -264,14 +272,12 @@ class HeartEngine:
         return last_error_time, last_failure_time
 
     def _overload(self):
-        limit = self.crawler.concurrency * 3
+        limit = self.crawler.concurrency * 2
         return len(self.explorer.queue) + len(self.parser.queue) >= limit
 
     def schedule_request(self, request):
         if isinstance(request, Item):
-            self.crawler.stats.inc_value(f"item/count")
-            self.crawler.stats.inc_value(f"item/count/{request.__class__.__name__}")
-            return self.parser._quick_process_item(request)
+            request = _blank_item_request(item=request)
         if not self.scheduler.enqueue_request(request):
             logger.error(f"Request dropped: {request}")
             self.crawler.stats.inc_value("request/dropped")
@@ -282,23 +288,31 @@ class HeartEngine:
         schedule_request = self.schedule_request
 
         self.parser.start()
+        immediate_parse = self.parser.parse
         if async_parse:
             parse = self.parser.enqueue_parser
         else:
-            parse = self.parser.parse
+            parse = immediate_parse
+        transports = self.explorer.transports
 
-        def on_response(result):
+        def on_response(result, transport_id=None):
             if not isinstance(result, (Request, Response)):
                 raise TypeError(f"Incorrect type: expected Request, Response or Failure, "
                                 f"got {type(result)}: {result!r}")
             while overload():
+                if transports and transport_id == transports[0]:
+                    # shrink to single concurrency if overloaded.
+                    break
                 self.crawler.sleep(0.01)
             if isinstance(result, Request):
                 # if processed in explorer,
                 # the frame may be stuck for limited queue size.
                 schedule_request(result)
             else:
-                parse(result)
+                if not result.request.meta.get('immediate_parse'):
+                    parse(result)
+                else:
+                    immediate_parse(result)
 
         return on_response
 
