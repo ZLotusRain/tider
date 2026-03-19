@@ -26,6 +26,9 @@ class Table:
     def is_vertical(self):
         return self.orientation == "vertical"
 
+    def __iter__(self):
+        return iter(self.content)
+
     @staticmethod
     def dict_to_str(dic):
         string = ""
@@ -42,10 +45,16 @@ class Table:
 class HtmlTableExtractor:
 
     def __init__(self, titles=None):
-        self._titles = set(titles or []) | TABLE_TITLES
+        titles = list(titles or [])
+        keywords = [" ", " ", "　", " ", "\r", "\n", "\t"]
+        for title in titles.copy():
+            for key in keywords:
+                title = title.replace(key, "")
+            titles.append(title.strip())
+        self._titles = set(titles) | TABLE_TITLES
 
     def _get_title_density(self, tr: Tag):
-        tds = tr.find_all("td")
+        tds = tr.find_all("th") or tr.find_all("td")
         if not tds:
             return 0
         titles = [td for td in tds if self._get_td_text(td) in self._titles]
@@ -61,7 +70,7 @@ class HtmlTableExtractor:
 
     def _is_vertical(self, tbody: Tag) -> bool:
         trs = [tr for tr in tbody.find_all("tr")]
-        while trs and len(trs[0].find_all("td")) <= 1:
+        while trs and not trs[0].find_all("th") and len(trs[0].find_all("td")) <= 1:
             trs = trs[1:]
         if (
             not trs
@@ -74,7 +83,7 @@ class HtmlTableExtractor:
     def extract(self, response):
         tables = []  # {'title': '', 'content': {}}
         soup = response.soup('lxml')
-        tbodys = soup.find_all("tbody")
+        tbodys = soup.find_all("tbody") or soup.find_all("table")
         if not tbodys:
             return tables
         for tbody in tbodys:
@@ -123,17 +132,17 @@ class HtmlTableExtractor:
                 match_dict[key] = tmp_dict
                 i = i + int(rows) - 1
             i += 1
-        return Table(content=match_dict, orientation="horizontal")
+        return Table(content=[match_dict], orientation="horizontal")
 
     def _extract_vertical_table(self, tbody: Tag):
         trs = [tr for tr in tbody.find_all("tr")]
         result = []
-        while trs and len(trs[0].find_all("td")) <= 1:
+        while trs and not trs[0].find_all("th") and len(trs[0].find_all("td")) <= 1:
             if trs[0].find('td'):
                 result.append({self._get_td_text(trs[0].find('td')): ""})
             trs = trs[1:]
         if trs:
-            head = [self._get_td_text(td) for td in trs[0].find_all('td')]
+            head = [self._get_td_text(td) for td in trs[0].find_all('th') or trs[0].find_all('td')]
             for tr in trs[1:]:
                 result.append(dict(zip(head, [self._get_td_text(td) for td in tr.find_all('td')])))
         return Table(content=result, orientation="vertical")
