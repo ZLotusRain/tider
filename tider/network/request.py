@@ -79,20 +79,23 @@ class PreparedRequest(_PreparedRequest):
     ):
         """Prepares the entire request with the given parameters."""
         try:
-            self.prepare_method(method)
-            self.prepare_url(url, params)
-            headers = headers or {}
-            # Remove keys that are set to None.
-            none_keys = [k for (k, v) in headers.items() if v is None]
-            for key in none_keys:
-                del headers[key]
-            self.prepare_headers(headers)
-            self.prepare_cookies(cookies)
-            if self.body is None:
-                self.prepare_body(data, files, json)
-            # Note that prepare_auth must be last to enable authentication schemes
-            # such as OAuth to work on a fully prepared request.
-            self.prepare_auth(self.auth, url)
+            if url == 'about:blank' or url.startswith("data:"):
+                self.url = url
+            else:
+                self.prepare_method(method)
+                self.prepare_url(url, params)
+                headers = headers or {}
+                # Remove keys that are set to None.
+                none_keys = [k for (k, v) in headers.items() if v is None]
+                for key in none_keys:
+                    del headers[key]
+                self.prepare_headers(headers)
+                self.prepare_cookies(cookies)
+                if self.body is None:
+                    self.prepare_body(data, files, json)
+                # Note that prepare_auth must be last to enable authentication schemes
+                # such as OAuth to work on a fully prepared request.
+                self.prepare_auth(self.auth, url)
         except REQUEST_PREPARE_ERRORS as e:
             raise InvalidRequest('Failed to prepare request.') from e
 
@@ -312,6 +315,14 @@ class Request:
             self.proxy.invalidate()
 
     @classmethod
+    def blank(cls, callback=None, cb_kwargs=None, priority=0, meta=None):
+        return cls(url="data:,", callback=callback, cb_kwargs=cb_kwargs, priority=priority, meta=meta)
+
+    @classmethod
+    def about_blank(cls, callback=None, cb_kwargs=None, priority=0, meta=None):
+        return cls(url="about:blank", callback=callback, cb_kwargs=cb_kwargs, priority=priority, meta=meta)
+
+    @classmethod
     def from_curl(cls, curl_command: str, ignore_unknown_options: bool = True, **kwargs):
         """Create a Request object from a string containing a `cURL
         <https://curl.haxx.se/>`_ command. It populates the HTTP method, the
@@ -400,7 +411,7 @@ class Request:
         }
         for attr in (*self.__dict__.keys(), *self.INTERNAL_ATTRIBUTES):
             value = getattr(self, attr)
-            if attr == '_prepared':
+            if attr == '_prepared' and value is not None:
                 d.update(value.to_dict())
             elif attr.startswith("_"):
                 continue
