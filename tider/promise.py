@@ -75,6 +75,7 @@ class PromiseNode:
         self._pending = deque((1, ), maxlen=1)
         self._str = str(request) if request else None
         self._is_root = False if parent else True
+        self.promise_root = self.root
 
     @property
     def root(self):
@@ -107,7 +108,7 @@ class PromiseNode:
         if isinstance(request, Request):
             promise_node = request.meta.get('promise_node')
             if promise_node:
-                node = promise_node.request.meta.setdefault('promise_root', promise_node.root)
+                node = promise_node.promise_root
                 # # use this request to update promise values.
                 # # copy request state to avoid lose cb_kwargs
                 if node.parent and node.parent is not self:
@@ -116,7 +117,7 @@ class PromiseNode:
                 # old_request, promise_node.request = promise_node.request, request
                 # old_request.close()
                 # promise_node.reset()  # SCHEDULED to PENDING
-                promise_node.request.meta['promise_root'] = self.root  # keep current top root.
+                promise_node.promise_root = self.root  # keep current top root.
                 promise_node.merge_values(request)
             else:
                 node = PromiseNode(request=request, parent=self)
@@ -187,8 +188,9 @@ class PromiseNode:
             # if schedule happens in child promise, then the node in
             # child promise can't be updated with values in parent promise.
             # so we need to update values here.
-            for k, v in parent.root.promise.values.items():
-                request.cb_kwargs.setdefault(k, v)
+            keys = parent.root.promise.values.keys()
+            for k in keys:
+                request.cb_kwargs.setdefault(k, parent.root.promise.values.get(k))
             parent = parent.root.parent
         request.cb_kwargs.update(self.root.promise.values)
 
