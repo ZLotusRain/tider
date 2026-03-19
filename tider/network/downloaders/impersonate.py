@@ -83,7 +83,7 @@ class ImpersonateDownloader:
             if isinstance(request.impersonate, str):
                 impersonate = request.impersonate
             else:
-                impersonate = 'chrome100'
+                impersonate = 'chrome'
             headers = request.prepared.headers.copy()
             headers.pop('Content-Length', None)
 
