@@ -131,7 +131,6 @@ class Tider:
         if control_url:
             self.conf.set("CONTROL_URL", control, priority='project')
 
-
         if self.set_as_current:
             self.set_current()
         self._crawlers = set()
