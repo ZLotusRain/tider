@@ -278,7 +278,10 @@ class HeartEngine:
     def schedule_request(self, request):
         if isinstance(request, Item):
             request = _blank_item_request(item=request)
-        if not self.scheduler.enqueue_request(request):
+        if request.meta.get('immediate_download', False):
+            response = self.explorer.explore(request)
+            self.explorer.on_response(response)
+        elif not self.scheduler.enqueue_request(request):
             logger.error(f"Request dropped: {request}")
             self.crawler.stats.inc_value("request/dropped")
 
@@ -295,12 +298,13 @@ class HeartEngine:
             parse = immediate_parse
         transports = self.explorer.transports
 
-        def on_response(result, transport_id=None):
+        def on_response(result):
             if not isinstance(result, (Request, Response)):
                 raise TypeError(f"Incorrect type: expected Request, Response or Failure, "
                                 f"got {type(result)}: {result!r}")
+            transport_id = result.meta.get('transport_id')
             while overload():
-                if transports and transport_id == transports[0]:
+                if transport_id in transports[:1]:
                     # shrink to single concurrency if overloaded.
                     break
                 self.crawler.sleep(0.01)
