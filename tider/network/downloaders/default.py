@@ -479,7 +479,8 @@ class HTTPDownloader(RedirectMixin):
                 manager and manager.clear()
 
     def _clear_invalid_proxy(self):
-        for proxy_key in list(iter(self.proxy_manager.keys())):
+        proxy_keys = list(iter(self.proxy_manager.keys()))
+        for proxy_key in proxy_keys:
             proxy_ref, proxy_str = proxy_key
             proxy = proxy_ref()
             if not proxy or not proxy.valid:
