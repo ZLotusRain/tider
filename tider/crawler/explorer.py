@@ -33,9 +33,8 @@ from tider.utils.misc import build_from_crawler
 logger = get_logger(__name__)
 
 
-def _dummy_handler(response, **_):
-    request = response.request
-    logger.info(f"Downloaded {request} and got {response}.")
+def _dummy_handler(response):
+    logger.info(f"Got transport's output: {response}")
 
 
 class LimitsAllowed:
@@ -181,11 +180,11 @@ class Explorer:
         self.queue = deque()
         self.on_response = None
         self.free_slots = deque()
-        self.transports = deque()  # transport ids
+        self.transports = []  # transport ids
 
-        self.transferring = set()
         self.running = False
-        self._transferring_count = 0
+        self.transferring = set()
+        self._transferring_count = 0  # double-check active state.
 
     @classmethod
     def from_crawler(cls, crawler):
@@ -256,10 +255,18 @@ class Explorer:
 
     def _on_response_consumed(self, response):
         self.free_slots.append(str(uuid4()))  # release slot to control concurrency.
+        transport_id = response.meta.get('transport_id')
+        if transport_id:
+            try:
+                self.transports.remove(transport_id)
+            except ValueError:
+                pass
+        self._transferring_count -= 1
         self.transferring.discard(response.request)
 
     def _transport(self, queue, download_func, output_handler=_dummy_handler, transport_id=None,
                    transferring=None, loop=False):
+        exc = None
         if transferring is None:
             transferring = set()
         if transport_id:
@@ -269,34 +276,45 @@ class Explorer:
             try:
                 request = queue.popleft()
                 self._transferring_count += 1
-                transferring.add(request)  # thread switch.
+                should_free = True
+            except IndexError:
+                # avoid catching IndexError raised by output handler.
+                if not loop:
+                    break
+                continue
+            transferring.add(request)  # thread switch.
+            if transport_id:
+                request.meta['transport_id'] = transport_id
+            try:
                 if request.meta.get('explore_after') and time.monotonic() < request.meta['explore_after']:
                     # queue.insert(len(queue)+1, request)  # append to the end of queue.
                     response = request
                 else:
                     response = download_func(request)
-                if request.stream and isinstance(response, Response) and not response.failed:
+                if not loop and request.stream and isinstance(response, Response) and not response.failed:
                     response.on_consumed = self._on_response_consumed
                     keep_slot = True
                 # don't use thread lock in handler if possible.
-                output_handler(response, transport_id=transport_id)
+                output_handler(response)
                 del response
 
                 if keep_slot:
+                    should_free = False
                     return  # keep slot due to stream.
-                transferring and transferring.discard(request)
-                self._transferring_count -= 1
-            except IndexError:
-                if not loop:
-                    break
             except (SpiderTerminate, SpiderShutdown):
                 self.running = False
+                should_free = True
                 break
-            except Exception:
+            except Exception as e:
+                exc = e
                 self.running = False
+                should_free = True
                 state.should_terminate = EX_FAILURE
-                raise
+                break
             finally:
+                if should_free:
+                    self._transferring_count -= 1
+                    transferring and transferring.discard(request)
                 # switch greenlet if using gevent
                 # when the active one can't get the next request
                 # to avoid keeping loop.
@@ -305,6 +323,8 @@ class Explorer:
             self.transports.remove(transport_id)
         del download_func, output_handler
         self.free_slots.append(str(uuid4()))
+        if exc is not None:
+            raise exc
 
     def build_request_proxy(self, request: Request):
         try:
@@ -326,12 +346,11 @@ class Explorer:
         self.running = True
 
         self.pool.start()
-
+        self.on_response = on_response
         if not self.loop:
             self.free_slots.clear()
             for _ in range(self.concurrency):
                 self.free_slots.append(str(uuid4()))
-            self.on_response = on_response
             return
         # By just passing a reference to the object allows the garbage collector
         # to free self if nobody else has a reference to it.
@@ -377,7 +396,6 @@ class Explorer:
         allowed = self.climits.allow(request)
         if not allowed:
             return request
-        self.transferring.add(request)
         response = self._explore(request)
         if isinstance(response, Response):
             try:
@@ -390,7 +408,6 @@ class Explorer:
                     {'request': request, 'retry_times': retry_times, 'reason': e}
                 )
         self.climits.backtrack(allowed.backtracks)
-        self.transferring.discard(request)
         return response
 
     def _explore(self, request):
