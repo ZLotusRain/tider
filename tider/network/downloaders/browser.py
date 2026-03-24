@@ -258,6 +258,7 @@ class BrowserResponse:
         self.headers = headers or {}
         self.cookies = cookies or {}
 
+        self._content = self._get_page_content()
         self._async_contents = async_contents
         self._pending_requests = pending_requests
 
@@ -300,12 +301,18 @@ class BrowserResponse:
         self.wait_for_timeout(800)  # activate pending requests.
         while self._pending_requests:
             self.wait_for_timeout(500)
-
-    @property
-    def content(self):
+            
+    def _get_page_content(self):
         content = self.page.content()
         content = content.replace(DOM_LOAD_HOOK, '').replace(LAST_SCRIPT, '')
         return content
+
+    @property
+    def content(self):
+        try:
+            return self._get_page_content()
+        except PlaywrightError:
+            return self._content
 
     def stream(self, chunk_size=None, **_):
         """
