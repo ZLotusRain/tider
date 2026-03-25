@@ -45,7 +45,7 @@ class ExcelPipeline:
 
     def process_item(self, item):
         if not isinstance(item, Item):
-            item = Item(**item)
+            item = Item.from_dict(item)
         if item.discarded:
             return
         name = item.__class__.__name__
