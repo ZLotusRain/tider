@@ -316,11 +316,11 @@ class Request:
 
     @classmethod
     def blank(cls, callback=None, cb_kwargs=None, priority=0, meta=None):
-        return cls(url="data:,", callback=callback, cb_kwargs=cb_kwargs, priority=priority, meta=meta)
+        return cls(url="data:,", callback=callback, cb_kwargs=cb_kwargs, priority=priority, meta=meta, raise_for_status=False)
 
     @classmethod
     def about_blank(cls, callback=None, cb_kwargs=None, priority=0, meta=None):
-        return cls(url="about:blank", callback=callback, cb_kwargs=cb_kwargs, priority=priority, meta=meta)
+        return cls(url="about:blank", callback=callback, cb_kwargs=cb_kwargs, priority=priority, meta=meta, raise_for_status=False)
 
     @classmethod
     def from_curl(cls, curl_command: str, ignore_unknown_options: bool = True, **kwargs):
