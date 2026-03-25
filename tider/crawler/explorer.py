@@ -443,7 +443,8 @@ class Explorer:
                 request.invalidate_proxy()
             if status_code not in ignored_status_code:
                 response = self.get_retry_request(request, response, status_code=status_code, exc=e)
-        except DownloadError as e:
+        except (DownloadError, TypeError) as e:
+            # TypeError for no status_code.
             if isinstance(e, (ConnectionError, InvalidProxy, Timeout)):
                 request.invalidate_proxy()
             response = self.get_retry_request(request, response, exc=e)
