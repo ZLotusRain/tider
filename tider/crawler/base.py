@@ -146,15 +146,15 @@ class Crawler:
         logfile = logfile or get("LOG_FILE")
         self.logfile = os.path.join(get('LOG_DIRECTORY'), logfile) if logfile else logfile
         self.loglevel = loglevel or get("LOG_LEVEL")
+        if not self.concurrency:
+            self.concurrency = psutil.cpu_count()
         self.update_settings()
 
         self.debug = debug
         self.purge = purge
         self.allow_duplicates = allow_duplicates or get('CRAWLER_ALLOW_DUPLICATES')
-
         self.pidfile = pidfile
-        if not self.concurrency:
-            self.concurrency = psutil.cpu_count()
+
         self.spider = None
         self.engine = None
         self.Pool = get_implementation(self.pool_cls)
