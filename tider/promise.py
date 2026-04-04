@@ -183,17 +183,16 @@ class PromiseNode:
         return self.root.promise.then()
 
     def merge_values(self, request):
-        parent = self.root.parent
+        cb_kwargs = request.cb_kwargs
+        parent = self
         while parent:
             # if schedule happens in child promise, then the node in
             # child promise can't be updated with values in parent promise.
             # so we need to update values here.
-            keys = parent.root.promise.values.keys()
-            for k in keys:
-                request.cb_kwargs.setdefault(k, parent.root.promise.values.get(k))
+            for k, v in list(parent.root.promise.values.items()):
+                cb_kwargs.setdefault(k, v)
             parent = parent.root.parent
-        request.cb_kwargs.update(self.root.promise.values)
-
+     
     def on_executed(self):
         if not self._is_root:
             try:
