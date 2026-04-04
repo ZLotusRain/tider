@@ -303,8 +303,9 @@ class HeartEngine:
                 raise TypeError(f"Incorrect type: expected Request, Response or Failure, "
                                 f"got {type(result)}: {result!r}")
             transport_id = result.meta.get('transport_id')
+            immediate_download = result.meta.get('immediate_download')
             while overload():
-                if transport_id in transports[:1]:
+                if immediate_download or transport_id in transports[:1]:
                     # shrink to single concurrency if overloaded.
                     break
                 self.crawler.sleep(0.01)
