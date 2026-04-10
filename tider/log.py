@@ -16,8 +16,11 @@ from logging.handlers import RotatingFileHandler
 from kombu.utils.encoding import set_default_encoding_file
 
 from tider import signals
-from tider.utils.log import (ColorFormatter, LoggingProxy, get_logger, get_multiprocessing_logger, mlevel,
-                             reset_multiprocessing_logger)
+from tider.utils.log import (
+    ColorFormatter, LoggingProxy, OTLPHandler,
+    get_logger, get_multiprocessing_logger,
+    mlevel, reset_multiprocessing_logger
+)
 from tider.utils.nodenames import node_format
 
 __all__ = ('Logging',)
@@ -41,11 +44,12 @@ class Logging:
 
     def setup(self, loglevel=None, logfile=None, maxbytes=30*1024*1024, backup_count=1, encoding=None,
               fmt=None, redirect_stdouts=False, redirect_level='WARNING', colorize=None, hostname=None,
-              group=None, debug=False):
+              group=None, otlp_config=None, debug=False):
         loglevel = mlevel(loglevel)
         self.setup_logging_subsystem(
             loglevel, logfile, maxbytes=maxbytes, backup_count=backup_count,
-            encoding=encoding, fmt=fmt, colorize=colorize, hostname=hostname, group=group, debug=debug,
+            encoding=encoding, fmt=fmt, colorize=colorize, hostname=hostname, group=group,
+            otlp_config=otlp_config, debug=debug,
         )
         if redirect_stdouts:
             self.redirect_stdouts(redirect_level)
@@ -58,8 +62,8 @@ class Logging:
             get_logger(name), loglevel=loglevel
         )
 
-    def setup_logging_subsystem(self, loglevel=None, logfile=None, fmt=None,
-                                colorize=None, hostname=None, group=None, debug=False, **kwargs):
+    def setup_logging_subsystem(self, loglevel=None, logfile=None, fmt=None, colorize=None,
+                                hostname=None, group=None, otlp_config=None, debug=False, **kwargs):
         if hostname in self._setups:
             return
         if logfile and hostname:
@@ -90,14 +94,14 @@ class Logging:
 
             # Configure root logger
             self._configure_logger(
-                root, logfile, loglevel, fmt, colorize, debug=debug, **kwargs
+                root, logfile, loglevel, fmt, colorize, otlp_config=otlp_config, debug=debug, **kwargs
             )
 
             # Configure the multiprocessing logger
             self._configure_logger(
                 get_multiprocessing_logger(),
                 logfile, loglevel if MP_LOG else logging.ERROR,
-                fmt, colorize, debug=debug, **kwargs
+                fmt, colorize, otlp_config=otlp_config, debug=debug, **kwargs
             )
 
             signals.after_setup_logger.send(
@@ -121,10 +125,10 @@ class Logging:
                           _MP_FORK_LOGFORMAT_=fmt)
 
     def _configure_logger(self, logger, logfile, loglevel,
-                          fmt, colorize, debug=False, **kwargs):
+                          fmt, colorize, otlp_config=None, debug=False, **kwargs):
         if logger is not None:
-            self.setup_handlers(logger, logfile, fmt,
-                                colorize, debug=debug, **kwargs)
+            self.setup_handlers(logger, logfile, fmt, colorize,
+                                otlp_config=otlp_config, debug=debug, **kwargs)
             if loglevel:
                 logger.setLevel(loglevel)
 
@@ -157,7 +161,7 @@ class Logging:
             return logfile is None and sys.stderr.isatty()
         return colorize
 
-    def setup_handlers(self, logger, logfile, fmt, colorize, debug=False,
+    def setup_handlers(self, logger, logfile, fmt, colorize, otlp_config=None, debug=False,
                        formatter=ColorFormatter, maxbytes=0, backup_count=0, encoding=None):
         if self._is_configured(logger):
             return logger
@@ -168,6 +172,10 @@ class Logging:
         if debug and isinstance(handler, RotatingFileHandler):
             handler = logging.StreamHandler()
             handler.setFormatter(formatter(fmt, use_color=True))
+            logger.addHandler(handler)
+        if otlp_config:
+            handler = OTLPHandler(**otlp_config)
+            handler.setFormatter(formatter(fmt, use_color=False))
             logger.addHandler(handler)
         return logger
 

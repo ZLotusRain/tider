@@ -362,6 +362,7 @@ class Crawler:
             encoding=get('LOG_ENCODING'),
             hostname=self.hostname,
             group=self.group,
+            otlp_config=get('LOG_OTLP_CONFIG'),
             debug=self.debug,
         )
 
