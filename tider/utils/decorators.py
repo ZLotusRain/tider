@@ -1,8 +1,11 @@
 import warnings
 import threading
 from functools import wraps
+from typing import Optional, Callable, TypeVar
 
 from tider.exceptions import TiderDeprecationWarning
+
+_F = TypeVar('_F', bound=Callable[..., None])
 
 
 def deprecated(use_instead=None):
@@ -26,14 +29,12 @@ def deprecated(use_instead=None):
     return deco
 
 
-def inthread(name=None, daemon=True):
-    """Decorator to call a function in a thread and return a daemon
-    thread
-    """
+def inthread(name: Optional[str] = None, daemon: bool = True) -> Callable[[_F], Callable[..., threading.Thread]]:
+    """Decorator to call a function in a thread and return a daemon thread."""
 
-    def deco(func):
+    def deco(func: _F) -> Callable[..., threading.Thread]:
         @wraps(func)
-        def wrapped(*a, **kw):
+        def wrapped(*a, **kw) -> threading.Thread:
             return threading.Thread(target=func, name=name, args=a, kwargs=kw, daemon=daemon)
         return wrapped
     return deco
