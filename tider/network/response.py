@@ -6,7 +6,7 @@ import charset_normalizer
 from bs4 import BeautifulSoup, Comment
 from html import unescape as html_unescape
 from urllib.parse import urljoin, unquote
-from typing import Optional, Callable
+from typing import Optional, Union, Callable
 
 from requests.models import REDIRECT_STATI
 from requests.structures import CaseInsensitiveDict
@@ -86,7 +86,7 @@ class Response:
         self.request = request
         self._redirect_target = None
 
-        self._content: Optional[bool, bytes] = False
+        self._content: Union[bool, bytes, None] = False
         self._content_consumed = False
         self._cached_text = None
         self._cached_selector = None
