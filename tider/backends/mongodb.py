@@ -204,6 +204,16 @@ class MongoBackend(Backend):
 
         try:
             self.collection.replace_one({'_id': self._store_id}, meta, upsert=True)
+        except pymongo.errors.WriteError as e:
+            if "'code': 17419" not in str(e):
+                raise e
+            # limit the length of the list to 30
+            snapshot = meta['meta']
+            if snapshot.get('failures'):
+                snapshot['failures'] = snapshot['failures'][-30:]
+            if snapshot.get('errors'):
+                snapshot['errors'] = snapshot['errors'][-30:]
+            self.collection.replace_one({'_id': self._store_id}, meta, upsert=True)
         except InvalidDocument as exc:
             raise EncodeError(exc)
 
