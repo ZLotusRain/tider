@@ -1,4 +1,5 @@
 import time
+import inspect
 import traceback
 from queue import Full
 from collections import deque
@@ -23,6 +24,41 @@ def _maybe_close(obj):
         obj.close()
     elif hasattr(obj, 'clear'):
         obj.clear()
+
+
+def _get_accept_kwargs(func, cb_kwargs):
+    """Extract callback kwargs based on function signature.
+
+    Returns the kwargs that the function accepts (excluding 'response' parameter).
+    """
+    if not cb_kwargs:
+        return {}
+
+    try:
+        sig = inspect.signature(func)
+    except (ValueError, TypeError):
+        return {}
+
+    params = sig.parameters
+    # Filter cb_kwargs to only include parameters that the function accepts
+    # Exclude 'response' as it's passed separately
+    filtered_kwargs = {}
+    has_var_keyword = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+    for key, value in cb_kwargs.items():
+        if key == 'response':
+            continue
+        if has_var_keyword or key in params:
+            filtered_kwargs[key] = value
+
+    return filtered_kwargs
+
+
+def _get_spider_outputs(func, response, cb_kwargs):
+    """Extract spider outputs based on function signature."""
+    accept_kwargs = _get_accept_kwargs(func, cb_kwargs)
+    return func(response, **accept_kwargs)
 
 
 class Parser:
@@ -131,13 +167,14 @@ class Parser:
 
         errback = request.errback
         callback = request.callback or self.crawler.spider.parse
+        cb_kwargs = request.cb_kwargs
         node = request.meta.pop("promise_node", None)
 
         spider_outputs = None
         try:
             if response.failed:
                 if errback:
-                    spider_outputs = errback(response)
+                    spider_outputs = _get_spider_outputs(errback, response, cb_kwargs=cb_kwargs)
                 elif request.meta.get('save_unhandled_failure', True):
                     try:
                         response.check_error()
@@ -151,7 +188,7 @@ class Parser:
                         self.crawler.spider.meta['failures'].append(failure)
                 self.crawler.stats.inc_value("request/count/failed")
             else:
-                spider_outputs = callback(response)
+                spider_outputs = _get_spider_outputs(callback, response, cb_kwargs=cb_kwargs)
 
             order = 0
             # sleep to switch thread
