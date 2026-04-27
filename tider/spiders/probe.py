@@ -1,5 +1,6 @@
 from threading import RLock
 from collections import deque
+from w3lib import html
 from typing import Union
 
 from tider import Promise, Request, Item, Response
@@ -271,10 +272,12 @@ class ProbeSpider(Spider):
         accept_rules = response.cb_kwargs.get('accept_rules') or []
         source_link = response.cb_kwargs.get('source_link')
 
-        soup = response.soup('lxml')
-        refresh_meta = soup.find('meta', attrs={'http-equiv': 'refresh'})
-        refresh_url = refresh_meta.get('content', '').split('url=')[-1] if refresh_meta else None
-        should_refresh = refresh_url and refresh_url not in response.url
+        text = response.text[:4096]
+        text = text.replace('URL=', 'url=')
+        encoding = response.encoding or response.apparent_encoding
+        base_url = html.get_base_url(text, response.url, encoding=encoding)
+        interval, refresh_url = html.get_meta_refresh(text, base_url, encoding=encoding, ignore_tags=("script", "noscript"))
+        should_refresh = response.request.allow_redirects and refresh_url and refresh_url not in response.url
         if not source_link and should_refresh:
             parse_times = response.request.meta.get('parse_times', 0) - 1
             yield response.retry(url=response.urljoin(refresh_url), meta={'depth': 0, 'parse_times': parse_times})
