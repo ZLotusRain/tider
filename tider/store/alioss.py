@@ -96,16 +96,18 @@ class OssService(OssBase, oss2.Service):
 
 class AliOSSFilesStore:
 
-    def __init__(self, crawler, access_key_id, access_key_secret, endpoint,
+    def __init__(self, crawler, endpoint, access_key_id=None, access_key_secret=None,
                  domain="", bucket_name=None, timeout=None):
         self.crawler = crawler
-        self.auth = oss2.Auth(access_key_id, access_key_secret)
-        self.session = Session(crawler=crawler)
-
+        self.auth = None
+        if access_key_id and access_key_secret:
+            self.auth = oss2.Auth(access_key_id, access_key_secret)
         self._domain = domain
         self._endpoint = endpoint
-        self.timeout = timeout
         self._bucket_name = bucket_name
+
+        self.timeout = timeout
+        self.session = Session(crawler=crawler)
 
     @classmethod
     def from_crawler(cls, crawler):
@@ -128,12 +130,28 @@ class AliOSSFilesStore:
             session = getattr(bos.session, 'session', None)
             session and session.close()
 
-    def get_bucket(self, bucket_name):
+    def get_bucket(self, bucket_name, sts_credentials=None):
         bucket_name = bucket_name or self._bucket_name
-        return OssBucket(session=self.session, auth=self.auth, endpoint=self._endpoint, bucket_name=bucket_name)
+        if sts_credentials:
+            auth = oss2.StsAuth(
+                access_key_id=sts_credentials['access_key_id'],
+                access_key_secret=sts_credentials['access_key_secret'],
+                security_token=sts_credentials['security_token'],
+            )
+        else:
+            auth = self.auth
+        return OssBucket(session=self.session, auth=auth, endpoint=self._endpoint, bucket_name=bucket_name)
 
-    def list_buckets(self):
-        service = OssService(self.auth, self._endpoint, session=self.session, connect_timeout=self.timeout)
+    def list_buckets(self, sts_credentials=None):
+        if sts_credentials:
+            auth = oss2.StsAuth(
+                access_key_id=sts_credentials['access_key_id'],
+                access_key_secret=sts_credentials['access_key_secret'],
+                security_token=sts_credentials['security_token'],
+            )
+        else:
+            auth = self.auth
+        service = OssService(auth, self._endpoint, session=self.session, connect_timeout=self.timeout)
         buckets = oss2.BucketIterator(service)
         return buckets
 
@@ -163,8 +181,8 @@ class AliOSSFilesStore:
         except oss2.exceptions.NoSuchBucket:
             logger.exception('bucket does not exist.')
 
-    def view_bucket_root(self, bucket_name):
-        bucket = self.get_bucket(bucket_name)
+    def view_bucket_root(self, bucket_name, sts_credentials=None):
+        bucket = self.get_bucket(bucket_name, sts_credentials=sts_credentials)
         return bucket.get_bucket_acl().acl
 
     def set_bucket_root(self, root, bucket_name):
@@ -172,12 +190,12 @@ class AliOSSFilesStore:
         root = eval("oss2.%s" % root)
         self._ensure_read(bucket.put_bucket_acl, permission=root)
 
-    def delete_object(self, filename, bucket_name):
-        bucket = self.get_bucket(bucket_name)
+    def delete_object(self, filename, bucket_name, sts_credentials=None):
+        bucket = self.get_bucket(bucket_name, sts_credentials=sts_credentials)
         self._ensure_read(bucket.delete_object, key=filename)
 
-    def upload_resume(self, key, filename, bucket_name):
-        bucket = self.get_bucket(bucket_name)
+    def upload_resume(self, key, filename, bucket_name, sts_credentials=None):
+        bucket = self.get_bucket(bucket_name, sts_credentials=sts_credentials)
         self._ensure_read(
             oss2.resumable_upload,
             bucket, key, filename, store=oss2.ResumableStore(root='/tmp'), multipart_threshold=100*1024,
@@ -233,9 +251,9 @@ class AliOSSFilesStore:
         except DownloadError as e:
             logger.error(f"Failed to upload response content to oss, reason: {e}")
 
-    def persist_file(self, path, buf, bucket_name=None, **_):
+    def persist_file(self, path, buf, bucket_name=None, sts_credentials=None, **_):
         try:
-            bucket = self.get_bucket(bucket_name)
+            bucket = self.get_bucket(bucket_name, sts_credentials=sts_credentials)
             if isinstance(buf, Response):
                 self.upload_response_content(bucket, path, buf)
             elif isinstance(buf, bytes):
@@ -249,8 +267,8 @@ class AliOSSFilesStore:
         except oss2.exceptions.OssError as e:
             raise FileStoreError(e)
 
-    def stat_file(self, path, bucket_name=None, **_):
-        bucket = self.get_bucket(bucket_name)
+    def stat_file(self, path, bucket_name=None, sts_credentials=None, **_):
+        bucket = self.get_bucket(bucket_name, sts_credentials=sts_credentials)
         try:
             meta_info = bucket.get_object_meta(path)
             result = {'last_modified': meta_info.headers["Last-Modified"], 'checksum': meta_info.headers["ETag"]}
