@@ -5,6 +5,7 @@ import time
 from queue import Full
 from uuid import uuid4
 from operator import itemgetter
+from threading import Semaphore, Lock
 from w3lib.url import parse_data_uri
 from collections import deque, defaultdict
 from typing import Union
@@ -26,6 +27,7 @@ from tider.exceptions import (
 )
 from tider.crawler import state
 from tider.platforms import EX_FAILURE
+from tider.utils.url import parse_url_host
 from tider.utils.log import get_logger
 from tider.utils.imports import symbol_by_name
 from tider.utils.misc import build_from_crawler
@@ -48,23 +50,55 @@ class LimitsAllowed:
 
 
 class ConcurrencyLimits:
+    """Thread-safe concurrency limiter using Semaphore."""
 
-    def __init__(self, limits=None):
+    def __init__(self, limits=None, domain_concurrency=None):
         self._limits = {'url': {}, 'downloader': {}}
+        self._lock = Lock()  # protects _limits dict modification
 
         limits = dict(limits or {})
         for limit_type in limits:
             if limit_type not in ('url', 'downloader'):
                 continue
             for pattern, limit in limits[limit_type].items():
+                self._add_limit(limit_type, pattern, limit)
+
+        self._global_limits = None  # fetched from redis.
+        self._domain_concurrency = int(domain_concurrency) if domain_concurrency else None
+
+    @staticmethod
+    def _domain_url_pattern(domain):
+        """Build a regex that matches full URLs belonging to *domain*."""
+        return rf'https?://{re.escape(domain)}(/|\?|#|$)'
+
+    def _add_limit(self, limit_type, pattern, limit):
+        """Add or update the concurrency cap for *pattern* at runtime.
+
+        Uses double-checked locking for thread safety.
+        """
+        if pattern in self._limits[limit_type]:
+            return
+        with self._lock:
+            # double-check after acquiring lock
+            if pattern not in self._limits[limit_type]:
                 self._limits[limit_type][pattern] = {
                     'pattern': re.compile(pattern),
-                    'limit': limit,
-                    'free_slots': deque([None] * int(limit))
+                    'limit': int(limit),
+                    'semaphore': Semaphore(int(limit)),
                 }
-        self._global_limits = None  # fetched from redis.
+
+    def _register_domain(self, domain):
+        """Lazily register a per-domain URL limit on first encounter."""
+        pattern = self._domain_url_pattern(domain)
+        self._add_limit('url', pattern, self._domain_concurrency)
 
     def allow(self, request):
+        """Try to acquire slots for the request. Thread-safe."""
+        if self._domain_concurrency:
+            domain = parse_url_host(request.url)
+            if domain:
+                self._register_domain(domain)
+
         backtracks = []  # [(limit_type, pattern, request)], maybe processed in `on_response`
         for limit_type in self._limits:
             limits = self._limits[limit_type]
@@ -73,20 +107,21 @@ class ConcurrencyLimits:
                 continue  # default downloader
             for pattern in limits:
                 if limits[pattern]['pattern'].match(attr):
-                    try:
-                        limits[pattern]['free_slots'].pop()
+                    if limits[pattern]['semaphore'].acquire(blocking=False):
                         backtracks.append((limit_type, pattern))
-                    except IndexError:
+                    else:
                         self.backtrack(backtracks)
                         return LimitsAllowed(False)
         return LimitsAllowed(allowed=True, backtracks=backtracks)
 
     def backtrack(self, backtracks):
+        """Release acquired slots. Thread-safe."""
         for limit_type, pattern in backtracks:
-            self._limits[limit_type][pattern]['free_slots'].append(None)
+            self._limits[limit_type][pattern]['semaphore'].release()
 
     def match(self, request):
-        matched = []  # [(limit_type, pattern, request)]
+        """Return all limits that match the request (without acquiring)."""
+        matched = []  # [(limit, limit_type, pattern)]
         for limit_type in self._limits:
             limits = self._limits[limit_type]
             attr = getattr(request, limit_type)
@@ -98,7 +133,9 @@ class ConcurrencyLimits:
         return matched
 
     def qsize(self, limit_type, pattern):
-        return len(self._limits[limit_type][pattern]['free_slots'])
+        """Return available slots count."""
+        # Semaphore._value is CPython implementation detail but stable
+        return self._limits[limit_type][pattern]['semaphore']._value
 
 
 class MiddlewareManager:
@@ -164,11 +201,12 @@ class MiddlewareManager:
 
 class Explorer:
 
-    def __init__(self, crawler, concurrency=4, concurrency_limits=None, priority_adjust=0, retry_until_valid_proxy=True):
+    def __init__(self, crawler, concurrency=4, domain_concurrency=None, concurrency_limits=None,
+                 priority_adjust=0, retry_until_valid_proxy=True):
         self._crawler = crawler
         self.concurrency = concurrency
         self.pool = crawler.create_pool(limit=concurrency, thread_name_prefix="ExplorerWorker")
-        self.climits = ConcurrencyLimits(concurrency_limits)
+        self.climits = ConcurrencyLimits(concurrency_limits, domain_concurrency=domain_concurrency)
 
         self.session: Session = build_from_crawler(Session, crawler)
         self.middleware: MiddlewareManager = build_from_crawler(MiddlewareManager, crawler)
@@ -191,6 +229,7 @@ class Explorer:
         return cls(
             crawler=crawler,
             concurrency=crawler.concurrency,
+            domain_concurrency=crawler.settings.get('CONCURRENT_REQUESTS_PER_DOMAIN'),
             concurrency_limits=crawler.settings.getdict('EXPLORER_CONCURRENCY_LIMITS'),
             priority_adjust=crawler.settings.getint('EXPLORER_RETRY_PRIORITY_ADJUST'),
             retry_until_valid_proxy=crawler.settings.getint('EXPLORER_RETRY_UNTIL_VALID_PROXY', True)
