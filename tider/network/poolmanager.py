@@ -12,18 +12,22 @@ from urllib3.util.retry import Retry
 from urllib3.util.url import parse_url
 from urllib3.util.proxy import connection_requires_http_tunnel
 
-from tider.utils.log import get_logger
 from tider.network.compat import (
     RecentlyUsedContainer,
     HTTPConnectionPool,
     HTTPSConnectionPool,
+    SOCKSHTTPConnectionPool,
+    SOCKSHTTPSConnectionPool,
     close_expired_connections,
 )
 from tider.network.http2.connectionpool import is_same_host
+from tider.exceptions import InvalidSchema
+from tider.local import try_import
+from tider.utils.log import get_logger
 
-__all__ = ["PoolManager", "ProxyManager", "proxy_from_url"]
+__all__ = ["PoolManager", "ProxyManager", "SOCKSProxyManager", "proxy_from_url"]
 
-
+socks = try_import("socks")
 log = get_logger('urllib3.poolmanager')
 
 # Default value for `blocksize` - a new parameter introduced to
@@ -383,6 +387,69 @@ class ProxyManager(PoolManager):
             kw["headers"] = self._set_proxy_headers(url, headers)
 
         return super().urlopen(method, url, redirect=redirect, **kw)
+
+
+class SOCKSProxyManager(PoolManager):
+    """
+    A version of the urllib3 ProxyManager that routes connections via the
+    defined SOCKS proxy.
+    """
+
+    pool_classes_by_scheme = {
+        "http": SOCKSHTTPConnectionPool,
+        "https": SOCKSHTTPSConnectionPool,
+    }
+
+    def __init__(
+        self,
+        proxy_url,
+        username=None,
+        password=None,
+        num_pools=10,
+        headers=None,
+        **connection_pool_kw
+    ):
+        if not socks:
+            raise InvalidSchema("Missing dependencies for SOCKS support.")
+
+        parsed = parse_url(proxy_url)
+
+        if username is None and password is None and parsed.auth is not None:
+            split = parsed.auth.split(":")
+            if len(split) == 2:
+                username, password = split
+        if parsed.scheme == "socks5":
+            socks_version = socks.PROXY_TYPE_SOCKS5
+            rdns = False
+        elif parsed.scheme == "socks5h":
+            socks_version = socks.PROXY_TYPE_SOCKS5
+            rdns = True
+        elif parsed.scheme == "socks4":
+            socks_version = socks.PROXY_TYPE_SOCKS4
+            rdns = False
+        elif parsed.scheme == "socks4a":
+            socks_version = socks.PROXY_TYPE_SOCKS4
+            rdns = True
+        else:
+            raise ValueError("Unable to determine SOCKS version from %s" % proxy_url)
+
+        self.proxy_url = proxy_url
+
+        socks_options = {
+            "socks_version": socks_version,
+            "proxy_host": parsed.host,
+            "proxy_port": parsed.port,
+            "username": username,
+            "password": password,
+            "rdns": rdns,
+        }
+        connection_pool_kw["_socks_options"] = socks_options
+
+        super(SOCKSProxyManager, self).__init__(
+            num_pools, headers, **connection_pool_kw
+        )
+
+        self.pool_classes_by_scheme = SOCKSProxyManager.pool_classes_by_scheme
 
 
 def proxy_from_url(url, **kw):

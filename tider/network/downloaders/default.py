@@ -38,14 +38,13 @@ from requests.cookies import merge_cookies
 from tider import Request
 from tider.network import Response, Proxy
 from tider.network.request import PreparedRequest
-from tider.network.poolmanager import PoolManager, proxy_from_url
+from tider.network.poolmanager import PoolManager, SOCKSProxyManager, proxy_from_url
 from tider.exceptions import (
     DownloadError,
     ConnectionError,
     ConnectTimeout,
     InvalidHeader,
     InvalidProxyURL,
-    InvalidSchema,
     InvalidURL,
     ProtocolError,
     InvalidProxy,
@@ -58,13 +57,6 @@ from tider.utils.time import preferred_clock
 from tider.utils.text import enforce_str
 from tider.utils.network import copy_cookie_jar, extract_cookies_to_jar
 from tider.utils.url import get_auth_from_url
-
-try:
-    from urllib3.contrib.socks import SOCKSProxyManager
-except ImportError:
-
-    def SOCKSProxyManager(*args, **kwargs):
-        raise InvalidSchema("Missing dependencies for SOCKS support.")
 
 urllib3.disable_warnings()
 logging.getLogger('urllib3').setLevel(logging.ERROR)
@@ -407,8 +399,8 @@ class HTTPDownloader(RedirectMixin):
                 manager = self.proxy_manager[key]
                 return manager
 
+        username, password = get_auth_from_url(selected_proxy)
         if selected_proxy.lower().startswith("socks"):
-            username, password = get_auth_from_url(selected_proxy)
             manager = SOCKSProxyManager(
                 selected_proxy,
                 username=username,
@@ -420,12 +412,10 @@ class HTTPDownloader(RedirectMixin):
             )
         else:
             # clear proxymanager once the proxy is finalized.
-            proxy_key = (proxy.weak(), selected_proxy)
             proxy_headers = {}
-            username, password = get_auth_from_url(selected_proxy)
             if username:
                 proxy_headers["Proxy-Authorization"] = _basic_auth_str(username, password)
-            manager = self.proxy_manager[proxy_key] = proxy_from_url(
+            manager = proxy_from_url(
                 selected_proxy,
                 proxy_headers=proxy_headers,
                 num_pools=self._pool_connections,
@@ -433,7 +423,9 @@ class HTTPDownloader(RedirectMixin):
                 block=self._pool_block,
                 **proxy_kwargs,
             )
-            weakref.finalize(proxy, self._on_proxy_collected, proxy_key=proxy_key)
+        proxy_key = (proxy.weak(), selected_proxy)
+        self.proxy_manager[proxy_key] = manager
+        weakref.finalize(proxy, self._on_proxy_collected, proxy_key=proxy_key)
 
         return manager
 

@@ -28,6 +28,10 @@ from http.client import HTTPException as HTTPException
 from urllib3.response import HTTPResponse as _HTTPResponse
 from urllib3._collections import RecentlyUsedContainer as _RecentlyUsedContainer
 from urllib3.connection import HTTPConnection, HTTPSConnection, BaseSSLError
+try:
+    from urllib3.contrib.socks import SOCKSConnection, SOCKSHTTPSConnection
+except ImportError:
+    SOCKSConnection = SOCKSHTTPSConnection = object
 from urllib3.connectionpool import HTTPConnectionPool as _HTTPConnectionPool
 from urllib3.connectionpool import HTTPSConnectionPool as _HTTPSConnectionPool
 from urllib3.exceptions import (
@@ -47,8 +51,8 @@ from urllib3.util.connection import is_connection_dropped
 from tider.utils.log import get_logger
 
 __all__ = ('CookieCompatRequest', 'CookieCompatResponse', 'RecentlyUsedContainer',
-           'HTTPConnectionPool', 'HTTPSConnectionPool', 'ExpirableHTTPSConnection',
-           'ExpirableHTTPConnection', 'close_expired_connections')
+           'HTTPConnectionPool', 'HTTPSConnectionPool', 'SOCKSHTTPConnectionPool', 'SOCKSHTTPSConnectionPool',
+           'ExpirableHTTPSConnection', 'ExpirableHTTPConnection', 'close_expired_connections')
 
 urllib3_log = get_logger('urllib3.connectionpool')
 
@@ -289,6 +293,20 @@ class ExpirableHTTPSConnection(ExpirableConnection, HTTPSConnection, HTTPConnect
 
     def __init__(self, *args, keepalive_expiry=60, **kwargs):
         HTTPSConnection.__init__(self, *args, **kwargs)
+        ExpirableConnection.__init__(self, keepalive_expiry=keepalive_expiry)
+
+
+class ExpirableSOCKSConnection(ExpirableConnection, SOCKSConnection):
+
+    def __init__(self, *args, keepalive_expiry=60, **kwargs):
+        SOCKSConnection.__init__(self, *args, **kwargs)
+        ExpirableConnection.__init__(self, keepalive_expiry=keepalive_expiry)
+
+
+class ExpirableSOCKSHTTPSConnection(ExpirableConnection, SOCKSHTTPSConnection):
+
+    def __init__(self, *args, keepalive_expiry=60, **kwargs):
+        SOCKSHTTPSConnection.__init__(self, *args, **kwargs)
         ExpirableConnection.__init__(self, keepalive_expiry=keepalive_expiry)
 
 
@@ -1158,6 +1176,14 @@ class HTTPConnectionPool(ConnectionPool, _HTTPConnectionPool):
 class HTTPSConnectionPool(ConnectionPool, _HTTPSConnectionPool, _HTTPConnectionPool):
 
     ConnectionCls = ExpirableHTTPSConnection
+
+
+class SOCKSHTTPConnectionPool(HTTPConnectionPool):
+    ConnectionCls = ExpirableSOCKSConnection
+
+
+class SOCKSHTTPSConnectionPool(HTTPSConnectionPool):
+    ConnectionCls = ExpirableSOCKSHTTPSConnection
 
 
 def close_expired_connections(
