@@ -4,7 +4,6 @@ import logging
 import urllib3
 import weakref
 from base64 import b64encode
-from datetime import timedelta
 from typing import Dict, Any
 from urllib.parse import ParseResult, urlparse, urljoin
 
@@ -544,7 +543,7 @@ class HTTPDownloader(RedirectMixin):
             elapsed = preferred_clock() - start
 
             response = Response.from_origin_resp(resp=resp, request=request)
-            response.elapsed = timedelta(seconds=elapsed)
+            response.elapsed = elapsed
             if not request.stream:
                 response.read()
             return response
