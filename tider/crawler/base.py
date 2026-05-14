@@ -375,7 +375,7 @@ class Crawler:
             timestamp=datetime.now().replace(microsecond=0),
             settings=pprint.pformat(d),
         )
-        logger.info(f"Crawler info:\n{banner}", {'banner': banner})
+        logger.info(f"Crawler info:\n{banner}")
 
         self.settings.freeze()
         self.backend.mark_as_started()
