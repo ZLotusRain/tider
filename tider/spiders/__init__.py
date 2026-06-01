@@ -1,6 +1,6 @@
 import logging
 import warnings
-from typing import Optional
+from typing import Optional, Any
 from weakref import proxy
 
 from tider import Response
@@ -69,7 +69,7 @@ class Spider:
     def on_init(self):
         pass
 
-    def parse(self, response: Response):
+    def parse(self, response: Response, **kwargs: Any):
         raise NotImplementedError(f'{self.__class__.__name__}.parse callback is not defined')
 
     @classmethod
