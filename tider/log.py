@@ -184,7 +184,7 @@ class Logging:
         logfile = sys.__stderr__ if logfile is None else logfile
         if hasattr(logfile, 'write'):
             return logging.StreamHandler(logfile)
-        if isinstance(logfile, str):
+        if isinstance(logfile, str) and logfile:
             if not os.path.exists(os.path.dirname(logfile)):
                 os.makedirs(os.path.dirname(logfile))
         return RotatingFileHandler(logfile, maxBytes=maxbytes, backupCount=backup_count, encoding=encoding or 'utf-8')
