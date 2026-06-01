@@ -47,7 +47,7 @@ def _get_default_app(proj, custom_settings, src_dirname=None):
     current_dir = pathlib.Path().cwd()
 
     default_module_path = proj_settings_path = None
-    if src_dirname:
+    if src_dirname and os.path.exists(current_dir / src_dirname / 'settings' / 'default_settings.py'):
         default_module_path = f"{src_dirname}.settings.default_settings"
     elif os.path.exists(current_dir / 'settings' / 'default_settings.py'):
         default_module_path = 'settings.default_settings'
@@ -133,6 +133,7 @@ def _chdir(_, __, wd):
               help_group="Global Options")
 @click.option('--src',
               cls=TiderOption,
+              default='src',
               help="Project implementation dirname",
               help_group="Global Options")
 @click.option('--proj',

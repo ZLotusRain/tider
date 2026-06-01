@@ -356,7 +356,7 @@ class Node:
         options = self.options.copy()
         for opt, value in self.options.items():
             if opt in (
-                '-s', '--spider',
+                '--src',
                 '--settings',
                 '--proj',
                 '--schema',
