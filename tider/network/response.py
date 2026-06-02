@@ -5,16 +5,17 @@ import mimetypes
 import charset_normalizer
 from bs4 import BeautifulSoup, Comment
 from html import unescape as html_unescape
-from urllib.parse import urljoin, unquote
+from urllib.parse import urljoin, unquote, urlparse
 from typing import Optional, Union, Callable
 
 from requests.models import REDIRECT_STATI
 from requests.structures import CaseInsensitiveDict
 from requests.cookies import cookiejar_from_dict, merge_cookies, RequestsCookieJar
-from requests.utils import guess_json_utf
+from requests.utils import guess_json_utf, requote_uri
 
 from tider import Request
 from tider.utils.log import get_logger
+from tider.utils.text import enforce_str
 from tider.utils.network import extract_cookies_to_jar, guess_encoding_from_headers
 from tider.exceptions import DownloadError, HTTPError, ResponseReadError, ResponseStreamConsumed
 
@@ -148,18 +149,46 @@ class Response:
 
     @property
     def redirect_target(self):
-        if not self.is_redirect:
+        if not self.is_redirect or self.request is None:
             return None
         if not self._redirect_target:
             location = self.headers["location"]
-            # Currently the underlying http module on py3 decode headers
-            # in latin1, but empirical evidence suggests that latin1 is very
-            # rarely used with non-ASCII characters in HTTP headers.
-            # It is more likely to get UTF8 header rather than latin1.
-            # This causes incorrect handling of UTF8 encoded location headers.
-            # To solve this, we re-encode the location in latin1.
-            location = location.encode("latin1")
-            self._redirect_target = location.decode("utf8")
+            if not self.request.http2:
+                # Currently the underlying http module on py3 decode headers
+                # in latin1, but empirical evidence suggests that latin1 is very
+                # rarely used with non-ASCII characters in HTTP headers.
+                # It is more likely to get UTF8 header rather than latin1.
+                # This causes incorrect handling of UTF8 encoded location headers.
+                # To solve this, we re-encode the location in latin1.
+                try:
+                    location = location.encode("latin1").decode("utf8")
+                except UnicodeEncodeError:
+                    pass
+            url = self.request.url
+            # Handle redirection without scheme (see: RFC 1808 Section 4)
+            parsed_old_url = urlparse(url)
+            if location.startswith("//"):
+                location = ":".join([enforce_str(parsed_old_url.scheme), location])
+
+            previous_fragment = parsed_old_url.fragment
+            parsed_location = urlparse(location)
+            if parsed_location.fragment == "" and previous_fragment:
+                parsed_location = parsed_location._replace(fragment=previous_fragment)
+            if parsed_location.scheme and not parsed_location.hostname:
+                # https://github.com/encode/httpx/issues/771
+                parsed_location = parsed_location._replace(netloc=parsed_old_url.hostname + parsed_location.netloc)
+
+            location = parsed_location.geturl()
+
+            # Facilitate relative 'location' headers, as allowed by RFC 7231.
+            # (e.g. '/path/to/resource' instead of 'http://domain.tld/path/to/resource')
+            # Compliant with RFC3986, we percent encode the url.
+            if not parsed_location.netloc:
+                location = urljoin(url, requote_uri(location))
+            else:
+                location = requote_uri(location)
+
+            self._redirect_target = enforce_str(location)
         return self._redirect_target
 
     def raise_for_status(self):
