@@ -106,11 +106,8 @@ class Pidfile:
 
     def __init__(self, path, group=None):
         self.path = os.path.abspath(path)
-        self._dirname = os.path.dirname(self.path)
-        if self._dirname and not os.path.exists(self._dirname):
-            os.makedirs(self._dirname)
-
         self.group = group
+        self._dirname = os.path.dirname(self.path)
 
     def acquire(self):
         """Acquire lock."""
@@ -191,7 +188,12 @@ class Pidfile:
         pid = os.getpid()
         content = f'{pid}\n'
 
-        pidfile_fd = os.open(self.path, PIDFILE_FLAGS, PIDFILE_MODE)
+        try:
+            pidfile_fd = os.open(self.path, PIDFILE_FLAGS, PIDFILE_MODE)
+        except FileNotFoundError:
+            if self._dirname:
+                os.makedirs(self._dirname, exist_ok=True)
+            pidfile_fd = os.open(self.path, PIDFILE_FLAGS, PIDFILE_MODE)
         pidfile = os.fdopen(pidfile_fd, 'w')
         try:
             pidfile.write(content)
