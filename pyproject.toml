@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tider"
+dynamic = ["version", "dependencies", "optional-dependencies"]
+description = "Next-generation web crawling and scraping framework"
+readme = { file = "README.rst", content-type = "text/x-rst" }
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "LotusRain", email = "1161525789@qq.com" },
+]
+keywords = ["crawler", "scraping", "spider", "distributed", "http2"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Internet :: WWW/HTTP",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Topic :: System :: Distributed Computing",
+]
+
+[project.urls]
+Source = "https://github.com/ZLotusRain/tider"
+Issues = "https://github.com/ZLotusRain/tider/issues"
+Changelog = "https://github.com/ZLotusRain/tider/blob/main/CHANGELOG.md"
+
+[project.scripts]
+tider = "tider.__main__:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+exclude = ["tests", "tests.*"]
+
+[tool.setuptools.package-data]
+tider = ["VERSION"]
+
+[tool.setuptools.dynamic]
+version = { file = ["tider/VERSION"] }
+dependencies = { file = ["requirements/default.txt"] }
+
+[tool.setuptools.dynamic.optional-dependencies]
+curlcffi = { file = ["requirements/extras/curlcffi.txt"] }
+playwright = { file = ["requirements/extras/playwright.txt"] }
+rarfile = { file = ["requirements/extras/rarfile.txt"] }
+socks = { file = ["requirements/extras/socks.txt"] }
