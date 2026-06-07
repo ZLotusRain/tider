@@ -30,15 +30,6 @@ def _blank_item_request(item: Item):
     return Request.blank(callback=_item_callback)
 
 
-class MockConnection:
-
-    def __init__(self, sleep_func=None):
-        self._sleep = sleep_func or time.sleep
-
-    def drain_events(self, timeout=None):
-        self._sleep(timeout)
-
-
 class HeartEngine:
     """Heart Engine to run the spider."""
 
@@ -61,10 +52,7 @@ class HeartEngine:
         self.running = False
         self.paused = False
         self.polling = False
-        if not self.crawler.app.conf.get("CONTROL_URL") or getattr(self.crawler.Pool, 'is_green', False):
-            self.connection = MockConnection(sleep_func=self.crawler.sleep)
-        else:
-            self.connection = self.crawler.connection
+        self.connection = self.crawler.connection
 
         self._spider_closed = Event()
         self._is_shutdown = Event()
@@ -243,6 +231,9 @@ class HeartEngine:
                 # maybe stuck here when using threads
                 # and gevent monkey patch at the same time
                 self.connection.drain_events(timeout=0.5)  # keep CPU active.
+            except self.connection.connection_errors:
+                # will be reconnected in pidbox
+                pass
             except socket.timeout:
                 pass
             except (SpiderShutdown, SpiderTerminate):  # control shutdown
@@ -302,6 +293,15 @@ class HeartEngine:
             if not isinstance(result, (Request, Response)):
                 raise TypeError(f"Incorrect type: expected Request, Response or Failure, "
                                 f"got {type(result)}: {result!r}")
+            if self._is_shutdown.is_set() and self._spider_closed.is_set():
+                if isinstance(result, Request):
+                    request = result
+                else:
+                    request = result.request
+                    result.close()
+                if request is not None:
+                    request.close()
+                return
             transport_id = result.meta.get('transport_id')
             immediate_download = result.meta.get('immediate_download')
             while overload():

@@ -88,6 +88,16 @@ class Connection(KombuConnection):
                 waited = False
 
 
+class MockConnection:
+
+    def __init__(self, sleep_func=None):
+        self.connection_errors = ()
+        self._sleep = sleep_func or time.sleep
+
+    def drain_events(self, timeout=None):
+        self._sleep(timeout)
+
+
 class Tider:
     """Tider application.
     """
@@ -246,6 +256,9 @@ class Tider:
         """
         transport_options = dict(transport_options or {})
         transport_options.setdefault('wait_time_seconds', 0.1)  # don't wait too long in C-level.
+        url = url or self.conf.get('CONTROL_URL')
+        if not url:
+            return MockConnection()
         return Connection(
             hostname=url or self.conf.get('CONTROL_URL'),
             ssl=False,
