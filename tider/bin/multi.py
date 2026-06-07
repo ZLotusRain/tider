@@ -562,10 +562,13 @@ class Cluster(UserList):
 
     def _stop_nodes(self, retry=None, on_down=None, sig=signal.SIGTERM):
         on_down = on_down if on_down is not None else self.on_node_down
-        nodes = [node for node in self.getpids(on_down=on_down)]
+        down_nodes = []
+        nodes = [node for node in self.getpids(on_down=down_nodes.append)]
         if nodes:
             for node in self.shutdown_nodes(nodes, sig=sig, retry=retry):
                 maybe_call(on_down, node)
+        for node in down_nodes:
+            maybe_call(on_down, node)
 
     def shutdown_nodes(self, nodes, sig=signal.SIGTERM, retry=None):
         P = set(nodes)
