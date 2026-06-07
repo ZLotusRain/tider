@@ -160,7 +160,7 @@ class RecentlyUsedContainer(_RecentlyUsedContainer):
         if not self.clean_func:
             return
         # don't use lock here to avoid stuck.
-        for key in list(iter(self._container.keys())):
+        for key in list(self._container.keys()):
             item = self.get(key)
             if item is None:
                 continue
