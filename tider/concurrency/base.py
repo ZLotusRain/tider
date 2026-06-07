@@ -9,10 +9,11 @@ from tider.exceptions import SpiderShutdown, SpiderTerminate, reraise
 logger = get_logger(__name__)
 
 
-def apply_target(target, args=(), kwargs=None, callback=None, propagate=(), **_):
+def apply_target(target, args=(), kwargs=None, callback=None, cb_kwargs=None, propagate=(), **_):
     """Apply function within pool context."""
     kwargs = kwargs or {}
     args = args or ()
+    cb_kwargs = cb_kwargs or {}
     try:
         ret = target(*args, **kwargs)
     except (SpiderShutdown, SpiderTerminate):
@@ -27,12 +28,12 @@ def apply_target(target, args=(), kwargs=None, callback=None, propagate=(), **_)
                     sys.exc_info()[2])
         except WorkerLostError:
             if callback:
-                callback(ExceptionInfo())
+                callback(ExceptionInfo(), **cb_kwargs)
     else:
         if callback:
-            callback(ret)
+            callback(ret, **cb_kwargs)
     finally:
-        del target, args, kwargs, callback
+        del target, args, kwargs, callback, cb_kwargs
 
 
 class BasePool:
