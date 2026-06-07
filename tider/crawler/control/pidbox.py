@@ -2,7 +2,6 @@
 import time
 import socket
 import threading
-from gevent import spawn_raw
 from kombu.common import ignore_errors
 from kombu.utils.encoding import safe_str, safe_repr
 
@@ -33,6 +32,12 @@ class Pidbox:
     """Crawler mailbox."""
 
     consumer = None
+    # Runtime state for the dedicated control-consumer loop.
+    _connection = None
+    _node_shutdown = None
+    _node_stopped = None
+    _resets = 0
+    _thread = None
 
     def __init__(self, crawler):
         self.crawler = crawler
@@ -65,11 +70,82 @@ class Pidbox:
             logger.error('Control command error: %r', exc, exc_info=True)
             self.reset()
 
+    def _prepare_loop_state(self):
+        # do not start another control loop while the previous one is alive.
+        if self._node_stopped and not self._node_stopped.is_set():
+            return False
+        self._node_shutdown = threading.Event()
+        self._node_stopped = threading.Event()
+        return True
+
     def start(self):
-        self.node.channel = self.crawler.connection.channel()
+        if not self._prepare_loop_state():
+            return
+        # threads pool needs a real background thread to drain control events.
+        self._thread = threading.Thread(
+            target=self.loop,
+            name='Control', daemon=True,
+        )
+        self._thread.start()
+
+    def _do_reset(self, connection):
+        # rebuild only the pidbox channel/consumer on the existing connection.
+        self._close_channel()
+        self.node.channel = connection.channel()
         self.consumer = self.node.listen(callback=self.on_message)
-        # self.consumer.consume()  # already consumed in listen
+        # already consumed in listen
         self.consumer.on_decode_error = self.on_decode_error
+
+    def _reconnect(self, connection, shutdown):
+        """Reconnect the underlying transport without replacing connection."""
+        while not shutdown.is_set():
+            # keep the shared Connection object, but replace its transport state.
+            self._close_channel()
+            self.consumer = None
+            ignore_errors(connection, connection.release)
+            try:
+                connection.connect()
+                self._do_reset(connection)
+            except connection.connection_errors as exc:
+                logger.warning('Control connection has broken, try reconnecting: %r', exc)
+                time.sleep(1)
+            else:
+                return True
+        return False
+
+    def loop(self):
+        resets = [self._resets]
+        self._node_shutdown = self._node_shutdown or threading.Event()
+        self._node_stopped = self._node_stopped or threading.Event()
+        shutdown = self._node_shutdown
+        stopped = self._node_stopped
+        try:
+            connection = self.crawler.connection
+            self._connection = connection
+            self._do_reset(connection)
+            while not shutdown.is_set():
+                if resets[0] < self._resets:
+                    resets[0] += 1
+                    self._do_reset(connection)
+                try:
+                    # maybe spend more time than timeout value.
+                    connection.drain_events(timeout=2.0)
+                except socket.timeout:
+                    pass
+                except connection.connection_errors:
+                    if not self._reconnect(connection, shutdown):
+                        break
+                except SpiderShutdown:
+                    state.should_stop = True
+                    break
+                except SpiderTerminate:
+                    state.should_terminate = True
+                    break
+        finally:
+            # close channel inside the loop to avoid cross-greenlet races.
+            self._close_channel()
+            self._connection = None
+            stopped.set()
 
     @staticmethod
     def on_decode_error(message, exc):
@@ -80,76 +156,42 @@ class Pidbox:
         message.ack()
 
     def on_stop(self):
-        pass
+        shutdown = self._node_shutdown
+        stopped = self._node_stopped
+        if stopped:
+            if shutdown:
+                shutdown.set()
+            if self._thread is not threading.current_thread():
+                # wait for loop-owned cleanup instead of closing from here.
+                logger.debug('Waiting for broadcast thread to shutdown...')
+                stopped.wait()
+            self._thread = self._node_stopped = self._node_shutdown = None
+        else:
+            self._close_channel()
 
     def stop(self):
         self.on_stop()
         # noinspection PyNoneFunctionAssignment
-        self.consumer = self._close_channel()
+        self.consumer = None
 
     def reset(self):
-        self.stop()
-        self.start()
+        # ask the loop to rebuild channel/consumer on its next iteration.
+        self._resets += 1
 
     def _close_channel(self):
+        connection = self._connection or self.crawler.connection
         if self.node and self.node.channel:
-            ignore_errors(self.crawler.connection, self.node.channel.close)
+            ignore_errors(connection, self.node.channel.close)
 
     def shutdown(self):
-        self.on_stop()
-        if self.consumer:
-            logger.debug('Canceling broadcast consumer...')
-            ignore_errors(self.crawler.connection, self.node.channel.close)
         self.stop()
 
 
 class gPidbox(Pidbox):
     """Crawler pidbox (greenlet)."""
 
-    _node_shutdown = None
-    _node_stopped = None
-    _resets = 0
-
     def start(self):
+        if not self._prepare_loop_state():
+            return
+        from gevent import spawn_raw
         spawn_raw(self.loop)
-
-    def on_stop(self):
-        if self._node_stopped:
-            self._node_shutdown.set()
-            logger.debug('Waiting for broadcast thread to shutdown...')
-            self._node_stopped.wait()
-            self._node_stopped = self._node_shutdown = None
-
-    def reset(self):
-        self._resets += 1
-
-    def _do_reset(self, connection):
-        self._close_channel()
-        self.node.channel = connection.channel()
-        self.consumer = self.node.listen(callback=self.on_message)
-        self.consumer.consume()
-
-    def loop(self):
-        resets = [self._resets]
-        shutdown = self._node_shutdown = threading.Event()
-        stopped = self._node_stopped = threading.Event()
-        try:
-            with self.crawler.app.connection_for_control() as connection:
-                self._do_reset(connection)
-                while not shutdown.is_set():
-                    if resets[0] < self._resets:
-                        resets[0] += 1
-                        self._do_reset(connection)
-                    try:
-                        # maybe spend more time than timeout value.
-                        connection.drain_events(timeout=2.0)
-                    except socket.timeout:
-                        pass
-                    except SpiderShutdown:
-                        state.should_stop = True
-                        raise
-                    except SpiderTerminate:
-                        state.should_terminate = True
-                        raise
-        finally:
-            stopped.set()
