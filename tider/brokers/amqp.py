@@ -27,6 +27,7 @@ from tider import signals, Connection as BaseConnection
 from tider.brokers import Broker
 from tider.utils.log import get_logger
 from tider.utils.crypto import set_md5
+from tider.utils.functional import retry_over_time
 from tider.utils.time import humanize_seconds, preferred_clock
 from tider.utils.text import truncate, indent as textindent
 
@@ -209,6 +210,8 @@ def create_channel(self, connection, raw_create_channel):
 
 
 class RawMessage(Message):
+    ack_max_retries = 20
+
     def __init__(self, payload, channel=None, queue=None, **kwargs):
         if 'body' in payload and 'delivery_tag' in payload.get('properties', {}):
             payload = payload
@@ -226,6 +229,42 @@ class RawMessage(Message):
 
         self.topic = payload.get('topic')
         super(RawMessage, self).__init__(payload, channel, **kwargs)
+
+    def _ack_connection_errors(self):
+        errors = []
+        channel = self.channel
+        transport = getattr(channel, 'connection', None)
+        for source in (channel, transport):
+            for exc in getattr(source, 'connection_errors', ()) or ():
+                if isinstance(exc, type) and issubclass(exc, BaseException) and exc not in errors:
+                    errors.append(exc)
+        return tuple(errors)
+
+    def _on_ack_connection_error(self, exc, intervals, retries):
+        tts = next(intervals)
+        logger.warning(
+            'Message ack failed, broker connection has broken, '
+            'try reconnecting: %r. Trying again %s... (%s/%s)',
+            exc, humanize_seconds(tts, 'in', ' '),
+            retries + 1, self.ack_max_retries)
+        return tts
+
+    def ack(self, multiple=False):
+        connection_errors = self._ack_connection_errors()
+        if not connection_errors:
+            return super().ack(multiple=multiple)
+
+        def _ack():
+            return super(RawMessage, self).ack(multiple=multiple)
+
+        return retry_over_time(
+            _ack, connection_errors,
+            errback=self._on_ack_connection_error,
+            max_retries=self.ack_max_retries,
+            interval_start=1,
+            interval_step=1,
+            interval_max=2,
+        )
 
 
 class RawMessageChannel(Channel):

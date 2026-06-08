@@ -203,6 +203,17 @@ class HeartEngine:
     def needs_backout(self):
         return self.explorer.needs_backout()
 
+    def drain_control_events(self, timeout=0.5):
+        # Pidbox owns the control connection once enabled.  Draining the same
+        # Kombu/Redis connection from the engine thread races with pidbox
+        # channel close/reconnect and can leave kombu's poller with stale fds.
+        if self.crawler.pidbox is not None:
+            # Control events are drained by the dedicated pidbox loop.  Keep
+            # the engine loop cooperative without spinning when it is idle.
+            self.crawler.sleep(timeout)
+            return
+        self.connection.drain_events(timeout=timeout)
+
     def start(self, spider, broker):
         if self.running:
             raise RuntimeError("Engine already running")
@@ -230,7 +241,7 @@ class HeartEngine:
                 state.maybe_shutdown()
                 # maybe stuck here when using threads
                 # and gevent monkey patch at the same time
-                self.connection.drain_events(timeout=0.5)  # keep CPU active.
+                self.drain_control_events(timeout=0.5)  # keep CPU active.
             except self.connection.connection_errors:
                 # will be reconnected in pidbox
                 pass
