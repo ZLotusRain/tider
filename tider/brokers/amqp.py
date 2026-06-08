@@ -22,6 +22,7 @@ from kombu.utils.encoding import safe_repr, bytes_to_str
 from kombu.utils.functional import maybe_list
 from kombu.utils.objects import cached_property
 from kombu.utils.compat import detect_environment
+from kombu.utils.url import maybe_sanitize_url
 
 from tider import signals, Connection as BaseConnection
 from tider.brokers import Broker
@@ -83,6 +84,23 @@ def dump_body(m, body):
     body = m.body if body is None else body
     return '{} ({}b)'.format(truncate(safe_repr(body), 1024),
                              len(m.body))
+
+
+def _safe_connection_uri(conn):
+    try:
+        return conn.as_uri()
+    except Exception:  # pylint: disable=broad-except
+        hostname = getattr(conn, 'hostname', None) or getattr(conn, 'host', None) or '<unknown>'
+        try:
+            hostname = maybe_sanitize_url(hostname)
+        except Exception:  # pylint: disable=broad-except
+            hostname = safe_repr(hostname)
+        return (
+            f"{hostname} "
+            f"(transport={getattr(conn, 'transport_cls', None)!r}, "
+            f"port={getattr(conn, 'port', None)!r}, "
+            f"vhost={getattr(conn, 'virtual_host', None)!r})"
+        )
 
 
 def _quick_drain(connection, timeout=0.1):
@@ -513,7 +531,7 @@ class AMQPBroker(Broker):
                 not self.crawler.app.IS_WINDOWS)
 
     def on_connection_error_before_connected(self, exc):
-        logger.error(CONNECTION_ERROR, self._conninfo.as_uri(), exc,
+        logger.error(CONNECTION_ERROR, _safe_connection_uri(self._conninfo), exc,
                      'Trying to reconnect...')
 
     def _connection(self, url, userid=None, password=None,
@@ -584,7 +602,7 @@ class AMQPBroker(Broker):
                 when=humanize_seconds(interval, 'in', ' '),
                 retries=int(interval / 2),
                 max_retries=self.crawler.settings.get('BROKER_CONNECTION_MAX_RETRIES'))
-            logger.error(CONNECTION_ERROR, conn.as_uri(), exc, next_step)
+            logger.error(CONNECTION_ERROR, _safe_connection_uri(conn), exc, next_step)
 
         # Remember that the connection is lazy, it won't establish
         # until needed.
@@ -736,26 +754,27 @@ class AMQPBroker(Broker):
             # duplicate spiders have unique hostnames.
             self._restore_messages(consumer)
 
-        logged = False
         if getattr(connection.transport, 'driver_type', None):
             should_rebalance = connection.transport.driver_type in ('kafka', 'confluentkafka')
         else:
             should_rebalance = self.crawler.broker_transport in ('kafka', 'confluentkafka')
         response_errors = (ResponseError, )
+        idle_since = last_log_time = preferred_clock()
         elapsed = 0
         try:
             while not self._stopped.is_set():
                 try:
                     connection.drain_events(timeout=2.0)
-                    logged = False
+                    idle_since = preferred_clock()
                     elapsed = 0
                 except socket.timeout:
                     on_message_consumed and on_message_consumed()
-                    if not logged:
+                    current_time = preferred_clock()
+                    if current_time - idle_since > 180 and current_time - last_log_time > 180:
                         logger.info(f"No messages fetched or reached prefetch limit, "
                                     f"prefetch count: {consumer.prefetch_count}, "
                                     f"queues: {','.join([queue.name for queue in consumer.queues])}")
-                    logged = True
+                        last_log_time = current_time
                     consumer.channel.qos._flush()  # clear dirty.
                     if should_rebalance:
                         if not elapsed:
