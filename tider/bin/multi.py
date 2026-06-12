@@ -564,9 +564,11 @@ class Cluster(UserList):
         on_down = on_down if on_down is not None else self.on_node_down
         down_nodes = []
         nodes = [node for node in self.getpids(on_down=down_nodes.append)]
+        stopped_nodes = []
         if nodes:
-            for node in self.shutdown_nodes(nodes, sig=sig, retry=retry):
-                maybe_call(on_down, node)
+            stopped_nodes = list(self.shutdown_nodes(nodes, sig=sig, retry=retry))
+        for node in stopped_nodes:
+            maybe_call(on_down, node)
         for node in down_nodes:
             maybe_call(on_down, node)
 
@@ -579,8 +581,6 @@ class Cluster(UserList):
             # same group
             names = [n.name for n in list(to_remove)]
             if node.name in names:
-                to_remove.add(node)
-                yield node
                 continue
             names = [n.name for n in list(processed)]
             if node.name in names:
@@ -596,25 +596,17 @@ class Cluster(UserList):
                     # process still running
                     stopped = False
             if stopped:
-                to_remove.add(node)
-                yield node
+                same_nodes = {n for n in P if n.name == node.name}
+                to_remove.update(same_nodes)
+                yield from same_nodes
         P -= to_remove
         if retry:
             maybe_call(self.on_still_waiting_for, P)
             its = 0
-            to_remove_all = set()
             while P:
                 to_remove = set()
                 processed = set()
                 for node in P:
-                    # same group
-                    names = [n.name for n in list(to_remove_all)]
-                    if node.name in names:
-                        maybe_call(self.on_node_shutdown_ok, node)
-                        to_remove.add(node)
-                        yield node
-                        maybe_call(self.on_still_waiting_for, P)
-                        break
                     names = [n.name for n in list(processed)]
                     if node.name in names:
                         continue
@@ -625,12 +617,12 @@ class Cluster(UserList):
                     maybe_call(self.on_still_waiting_progress, P)
                     if all([not node.alive(pid=pid) for pid in node.pids]):
                         maybe_call(self.on_node_shutdown_ok, node)
-                        to_remove.add(node)
-                        to_remove_all.add(node)
-                        yield node
-                        maybe_call(self.on_still_waiting_for, P)
+                        same_nodes = {n for n in P if n.name == node.name}
+                        to_remove.update(same_nodes)
+                        yield from same_nodes
                         break
                 P -= to_remove
+                maybe_call(self.on_still_waiting_for, P)
                 if P and not its % len(P):
                     sleep(float(retry))
             maybe_call(self.on_still_waiting_end)
@@ -678,6 +670,8 @@ class TermLogger:
         self.quiet = quiet
         self.verbose = verbose
         self.no_color = no_color
+        self._waiting_crawlers = OrderedDict()
+        self._last_waiting_pidnames = OrderedDict()
 
     def ok(self, m, newline=True, file=None):
         self.say(m, newline=newline, file=file)
@@ -885,21 +879,58 @@ class MultiTool(TermLogger):
         self.note(self.colored.blue('> Stopping nodes...'))
 
     def on_send_signal(self, node, sig, pid=None):
+        if pid is not None:
+            self._waiting_crawlers[pid] = (
+                node.name, self._pid_display_name(node, pid))
         self.note('\t> {0.name}: {1} -> {pid}'.format(node, sig, pid=pid))
 
     def on_still_waiting_for(self, nodes):
-        num_left = len(nodes)
-        if num_left:
+        pidnames = self._remaining_pidnames_for(nodes)
+        completed = OrderedDict(
+            (pid, name) for pid, (_, name) in self._waiting_crawlers.items()
+            if pid not in pidnames
+        )
+        self._say_waiting_ok(completed)
+        for pid in completed:
+            self._waiting_crawlers.pop(pid, None)
+        if pidnames and pidnames != self._last_waiting_pidnames:
+            names = ', '.join(pidnames.values())
             self.note(self.colored.blue(
                 '> Waiting for {} {} -> {}...'.format(
-                    num_left, pluralize(num_left, 'node'),
-                    ', '.join(str(pid) for node in nodes for pid in node.pids if not node.piddirectory)),
+                    len(pidnames), pluralize(len(pidnames), 'crawler'), names),
             ), newline=False)
+            self._last_waiting_pidnames = pidnames
+
+    def _remaining_pidnames_for(self, nodes):
+        nodes = list({node.name: node for node in nodes}.values())
+        pidnames = OrderedDict()
+        for node in nodes:
+            for pid in sorted(node.pids or []):
+                pidnames[pid] = (
+                    self._waiting_crawlers.get(pid, (None, None))[1]
+                    or self._pid_display_name(node, pid)
+                )
+        return pidnames
+
+    def _say_waiting_ok(self, pidnames):
+        for name in pidnames.values():
+            self.note(f'\n\t> {name}: {self.OK}')
+
+    @staticmethod
+    def _pid_display_name(node, pid):
+        if not node.piddirectory or not pid or '@' not in node.name:
+            return node.name
+        name, host = node.name.split('@', 1)
+        if name.endswith(f'.{pid}'):
+            return node.name
+        return f'{name}.{pid}@{host}'
 
     def on_still_waiting_progress(self, nodes):
         self.note('.', newline=False)
 
     def on_still_waiting_end(self):
+        self._waiting_crawlers = OrderedDict()
+        self._last_waiting_pidnames = OrderedDict()
         self.note('')
 
     def on_node_signal_dead(self, node, pid):
@@ -912,13 +943,22 @@ class MultiTool(TermLogger):
 
     def on_node_restart(self, node):
         self.note(self.colored.blue(
-            f'> Restarting node {node.name}: '), newline=False)
+            f'> Restarting crawler {node.name}: '), newline=False)
 
     def on_node_down(self, node):
         self.note(f'> {node.name}: {self.DOWN}')
 
     def on_node_shutdown_ok(self, node):
-        self.note(f'\n\t> {node.name}: {self.OK}')
+        completed = OrderedDict(
+            (pid, name) for pid, (node_name, name) in self._waiting_crawlers.items()
+            if node_name == node.name
+        )
+        if completed:
+            self._say_waiting_ok(completed)
+            for pid in completed:
+                self._waiting_crawlers.pop(pid, None)
+        else:
+            self.note(f'\n\t> {node.name}: {self.OK}')
 
     def on_node_status(self, node, retval):
         self.note(retval and self.FAILED or self.OK)
