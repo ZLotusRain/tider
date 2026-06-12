@@ -12,7 +12,7 @@ from types import MethodType
 from collections.abc import Mapping
 from weakref import WeakValueDictionary
 
-from redis.exceptions import ResponseError
+from redis.exceptions import ResponseError, WatchError
 from kombu import Consumer, Exchange, Queue
 from kombu.transport.virtual.base import Message, Channel
 from kombu.common import ignore_errors
@@ -77,6 +77,16 @@ body: {0}
 
 k_logger = k_get_logger('kombu.transport.redis')
 crit, warn = k_logger.critical, logger.warn
+
+# Keep startup restore bounded without adding user-facing settings.  The
+# previous redis-py ``transaction`` helper retries WATCH conflicts forever; a
+# busy queue can therefore block broker startup indefinitely.
+RESTORE_TRANSACTION_MAX_RETRIES = 3
+RESTORE_TRANSACTION_BATCH_SIZE = 1000
+RESTORE_PROGRESS_EVERY = 1000
+
+NO_MESSAGE_FIRST_LOG_INTERVAL = 30
+NO_MESSAGE_LOG_INTERVAL = 180
 
 
 def dump_body(m, body):
@@ -691,41 +701,165 @@ class AMQPBroker(Broker):
         if not hasattr(chan, '_do_restore_message'):
             return
 
-        def restore_transaction(pipe, use_client=False):
-            data = pipe.hgetall(chan.unacked_key)
-            not use_client and pipe.multi()
-            # don't use multi here to avoid keys of command in MULTI calls must be in same slot.
-            # pipe.multi()
-            count = 0
-            for tag, P in data.items():
+        def remove_unacked(pipe, tag):
+            pipe.zrem(chan.unacked_index_key, tag)
+            pipe.hdel(chan.unacked_key, tag)
+
+        def restore_message(pipe, payload, exchange, routing_key, leftmost=False):
+            try:
+                payload['headers']['redelivered'] = True
+                payload['properties']['delivery_info']['redelivered'] = True
+            except KeyError:
+                pass
+            for queue in chan._lookup(exchange, routing_key):
+                # only push body.
+                (pipe.lpush if leftmost else pipe.rpush)(
+                    queue, dumps(payload['body']),
+                )
+
+        def restore_items(pipe, items, force=False):
+            restored = skipped = failed = 0
+            for tag, P in items:
                 tag = bytes_to_str(tag)
                 if not P:
+                    remove_unacked(pipe, tag)
+                    skipped += 1
                     continue
-                M, EX, RK = loads(bytes_to_str(P))  # json is unicode
-                if RK:
+                try:
+                    M, EX, RK = loads(bytes_to_str(P))  # json is Unicode
+                except (TypeError, ValueError, UnicodeError):
+                    remove_unacked(pipe, tag)
+                    failed += 1
+                    logger.warning(
+                        'Dropping malformed unacked message %s from %s',
+                        tag, chan.unacked_key, exc_info=True,
+                    )
+                    continue
+                if not RK:
+                    remove_unacked(pipe, tag)
+                    skipped += 1
+                    logger.warning(
+                        'Dropping unroutable unacked message %s from %s',
+                        tag, chan.unacked_key,
+                    )
+                    continue
+                if not isinstance(M, dict) or 'body' not in M:
+                    remove_unacked(pipe, tag)
+                    failed += 1
+                    logger.warning(
+                        'Dropping malformed unacked message %s from %s',
+                        tag, chan.unacked_key,
+                    )
+                    continue
+                try:
+                    # In the optimistic transaction path, keep the old
+                    # remove-then-restore command order inside one EXEC.  In
+                    # force mode there is no transaction, so restore first to
+                    # prefer at-least-once delivery over message loss.
+                    if force:
+                        restore_message(pipe, M, EX, RK, leftmost=False)
+                        remove_unacked(pipe, tag)
+                    else:
+                        remove_unacked(pipe, tag)
+                        restore_message(pipe, M, EX, RK, leftmost=False)
+                    restored += 1
+                except redis.exceptions.RedisError:
+                    if not force:
+                        raise
+                    failed += 1
+                    logger.critical('Could not restore message: %r', M, exc_info=True)
+            return restored, skipped, failed
+
+        def restore_transaction_batch(c):
+            last_watch_error = None
+            for attempt in range(1, RESTORE_TRANSACTION_MAX_RETRIES + 1):
+                with c.pipeline() as pipe:
                     try:
-                        # delete before successfully restore.
-                        if not use_client:
-                            pipe.zrem(chan.unacked_index_key, tag).hdel(chan.unacked_key, tag)
-                        else:
-                            pipe.zrem(chan.unacked_index_key, tag)
-                            pipe.hdel(chan.unacked_key, tag)
-                        # lpush if leftmost else rpush.
-                        chan._do_restore_message(M, EX, RK, pipe, leftmost=False)
-                        count += 1
-                    except redis.exceptions.ResponseError:
-                        logger.critical('Could not restore message: %r', M, exc_info=True)
-            # may retry transaction if sth changed in unacked key.
-            logger.info(f'Ready to restore {count}/{len(data)} message(s) from {chan.unacked_key}')
+                        pipe.watch(chan.unacked_key)
+                        data = pipe.hgetall(chan.unacked_key)
+                        batch = list(data.items())[:RESTORE_TRANSACTION_BATCH_SIZE]
+                        pipe.multi()
+                        restored, skipped, failed = restore_items(pipe, batch)
+                        pipe.execute()
+                        return {
+                            'total': len(data),
+                            'selected': len(batch),
+                            'restored': restored,
+                            'skipped': skipped,
+                            'failed': failed,
+                        }
+                    except WatchError as exc:
+                        last_watch_error = exc
+                        logger.warning(
+                            'Unacked key %s changed during restore; retrying '
+                            'transaction (%s/%s)',
+                            chan.unacked_key, attempt,
+                            RESTORE_TRANSACTION_MAX_RETRIES,
+                        )
+            raise last_watch_error
+
+        def force_restore(c):
+            data = c.hgetall(chan.unacked_key)
+            items = list(data.items())
+            total = len(items)
+            restored = skipped = failed = 0
+            logger.warning(
+                'Force restoring %s message(s) from %s without WATCH; '
+                'duplicates are possible under active competition',
+                total, chan.unacked_key,
+            )
+            for offset in range(0, total, RESTORE_PROGRESS_EVERY):
+                batch = items[offset:offset + RESTORE_PROGRESS_EVERY]
+                r, s, f = restore_items(c, batch, force=True)
+                restored += r
+                skipped += s
+                failed += f
+                logger.info(
+                    'Force restore progress for %s: %s/%s restored '
+                    '(skipped=%s failed=%s)',
+                    chan.unacked_key, min(offset + len(batch), total), total,
+                    skipped, failed,
+                )
+            logger.info(
+                'Force restored %s/%s message(s) from %s '
+                '(skipped=%s failed=%s)',
+                restored, total, chan.unacked_key, skipped, failed,
+            )
 
         # restore at start.
         with chan.conn_or_acquire() as client:
             try:
-                client.transaction(restore_transaction, chan.unacked_key)
+                total_restored = total_skipped = total_failed = 0
+                initial_total = None
+                while True:
+                    stats = restore_transaction_batch(client)
+                    if initial_total is None:
+                        initial_total = stats['total']
+                        logger.info(
+                            'Found %s unacked message(s) in %s to restore',
+                            initial_total, chan.unacked_key,
+                        )
+                    total_restored += stats['restored']
+                    total_skipped += stats['skipped']
+                    total_failed += stats['failed']
+                    logger.info(
+                        'Restored batch from %s: selected=%s restored=%s '
+                        'remaining~=%s',
+                        chan.unacked_key, stats['selected'], stats['restored'],
+                        max(stats['total'] - stats['selected'], 0),
+                    )
+                    if stats['total'] <= stats['selected'] or not stats['selected']:
+                        break
+                logger.info(
+                    'Restored %s/%s message(s) from %s '
+                    '(skipped=%s failed=%s)',
+                    total_restored, initial_total or 0, chan.unacked_key,
+                    total_skipped, total_failed,
+                )
             except Exception as e:
                 logger.warning(f'Restoring messages from {chan.unacked_key} failed by redis pipeline, '
                                f'try using redis client directly instead, reason: {e}')
-                restore_transaction(pipe=client, use_client=True)
+                force_restore(client)
 
     def consume(self, queues=None, on_message=None, on_message_consumed=None):
         on_decode_error = self.on_decode_error
@@ -760,6 +894,7 @@ class AMQPBroker(Broker):
             should_rebalance = self.crawler.broker_transport in ('kafka', 'confluentkafka')
         response_errors = (ResponseError, )
         idle_since = last_log_time = preferred_clock()
+        no_message_log_interval = NO_MESSAGE_FIRST_LOG_INTERVAL
         elapsed = 0
         try:
             while not self._stopped.is_set():
@@ -770,11 +905,12 @@ class AMQPBroker(Broker):
                 except socket.timeout:
                     on_message_consumed and on_message_consumed()
                     current_time = preferred_clock()
-                    if current_time - idle_since > 180 and current_time - last_log_time > 180:
+                    if current_time - idle_since > no_message_log_interval and current_time - last_log_time > no_message_log_interval:
                         logger.info(f"No messages fetched or reached prefetch limit, "
                                     f"prefetch count: {consumer.prefetch_count}, "
                                     f"queues: {','.join([queue.name for queue in consumer.queues])}")
                         last_log_time = current_time
+                        no_message_log_interval = NO_MESSAGE_LOG_INTERVAL
                     consumer.channel.qos._flush()  # clear dirty.
                     if should_rebalance:
                         if not elapsed:

@@ -97,6 +97,9 @@ class MockConnection:
     def drain_events(self, timeout=None):
         self._sleep(timeout)
 
+    def release(self):
+        pass
+
 
 class Tider:
     """Tider application.
