@@ -5,9 +5,25 @@ All notable changes to Tider are documented in this file.
 版本维护周期使用 `Maintenance:` 标注；每个版本的维护期从该版本发布开始，到下一个版本发布为止。
 
 
+## [3.4.1] - 2026-06-19
+
+Maintenance: 2026/06/19 - now
+
+### Changed
+
+- `ImpersonateDownloader` 改为直接使用 `curl_cffi` Curl 句柄，并在 greenlet 场景下通过线程池执行，以降低阻塞和资源残留风险。
+
+### Fixed
+
+- 修复 crawler、parser、pidbox 和 `tider multi` 在关闭、重启和退出码处理中的若干竞态与卡住问题。
+- 修复 AMQP/Redis ack、restore、reconnect 和 idle 处理在异常场景下可能导致的恢复失败或连接阻塞。
+- 修复 `BrowserDownloader` 透传 `Host` 请求头和响应 cookies 丢失的问题。
+- 修复 `Request.replace()` 在显式覆盖代理参数时仍继承原代理的问题。
+
+
 ## [3.4.0] - 2026-06-07
 
-Maintenance: 2026/06/07 - now
+Maintenance: 2026/06/07 - 2026/06/19
 
 ### Added
 
