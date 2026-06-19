@@ -374,10 +374,10 @@ class HeartEngine:
         consumed_time = int(end_time - self.crawler.stats.get_value('time/start_time', end_time))
         self.crawler.stats.set_value("time/consumed_time", consumed_time)
 
-        # keep the order
-        self.parser.close(reason=reason)
+        # Stop ingress and queued work before waiting for parser/explorer pools.
         self.broker.stop()
         self.scheduler.close(reason=reason)
+        self.parser.close(reason=reason)
         self.explorer.close(reason=reason)
 
         self.spider.close(reason=reason)

@@ -1,6 +1,8 @@
+import gc
 import time
 import inspect
 import traceback
+import threading
 from queue import Full
 from collections import deque
 
@@ -24,6 +26,30 @@ def _maybe_close(obj):
         obj.close()
     elif hasattr(obj, 'clear'):
         obj.clear()
+
+
+def _terminate_requested():
+    return state.should_terminate is not None and state.should_terminate is not False
+
+
+def _close_in_background(func, name):
+    error = []
+
+    def _close():
+        try:
+            func()
+        except Exception as exc:
+            error.append(exc)
+
+    thread = threading.Thread(target=_close, name=name, daemon=True)
+    thread.start()
+    while thread.is_alive():
+        if _terminate_requested():
+            return False
+        thread.join(timeout=1)
+    if error:
+        raise error[0]
+    return True
 
 
 def _get_accept_kwargs(func, cb_kwargs):
@@ -291,11 +317,37 @@ class Parser:
             typename = type(output).__name__
             logger.error(f'Spider must return request, item, or None, got {typename!r} in {request}')
 
+    def _discard_pending_itemproc(self):
+        if hasattr(self.itemproc, 'running'):
+            self.itemproc.running = False
+        _maybe_close(getattr(self.itemproc, 'items', None))
+        _maybe_close(getattr(self.itemproc, 'processing', None))
+
+    def _close_itemproc(self):
+        return _close_in_background(self.itemproc.close, name='ParserItemprocClose')
+
+    def _close_pool(self):
+        return _close_in_background(self.pool.stop, name='ParserPoolStop')
+
     def close(self, reason):
         self.running = False
         try:
-            self.itemproc.close()
-            self.pool.stop()  # stop pool first, maybe throw exception.
+            error = None
+            itemproc_closed = pool_closed = False
+            try:
+                itemproc_closed = self._close_itemproc()
+            except Exception as exc:
+                error = exc
+            try:
+                pool_closed = self._close_pool()  # maybe throw exception.
+            except Exception as exc:
+                if error is None:
+                    error = exc
+            if not (itemproc_closed and pool_closed):
+                self._discard_pending_itemproc()
+                gc.collect()
+            if error is not None:
+                raise error
             logger.info("Parser closed (%(reason)s)", {'reason': reason})
         except Exception as e:
             logger.error("Parser exception when closing, reason: %(reason)s", {'reason': e}, exc_info=True)
