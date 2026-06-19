@@ -582,6 +582,7 @@ class PlaywrightDownloader(BrowserDownloader):
                 page.add_init_script(script=init_script, path=init_script_path)
             headers = dict(request.headers)
             headers.pop('Accept-Encoding', None)  # detected spider characteristic.
+            headers.pop('Host', None)  # Invalid Argument Error
             page.set_extra_http_headers(headers)
 
             on_response = functools.partial(self.on_response, async_contents=async_contents, pending_requests=pending_requests)
@@ -676,6 +677,7 @@ class PlaywrightDownloader(BrowserDownloader):
                 resp.capture_snapshot(mhtml_path)
             elapsed = preferred_clock() - start
             response = Response.from_origin_resp(resp=resp, request=request)
+            response.cookies.update(cookies)
             response.elapsed = elapsed
             return response
         except Exception as e:
