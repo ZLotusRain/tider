@@ -365,6 +365,11 @@ class Request:
 
     def replace(self, *args, **kwargs):
         """Create a new Request with the same attributes except for those given new values"""
+        proxy_keys = ('proxies', 'proxy_schema', 'proxy_params')
+        proxy_overridden = any(kwargs.get(x) is not None for x in proxy_keys)
+        for x in proxy_keys:
+            if x in kwargs and kwargs[x] is None:
+                kwargs.pop(x)
         for x in (*self.__dict__.keys(), *self.INTERNAL_ATTRIBUTES):
             if x.startswith("_"):
                 continue
@@ -380,7 +385,8 @@ class Request:
         kwargs['url'] = prepared.url
         cls = kwargs.pop('cls', self.__class__)
         request = cls(*args, **kwargs)
-        request.update_proxy(self.proxy)
+        if not proxy_overridden:
+            request.update_proxy(self.proxy)
         return request
 
     def fingerprint(self, include_headers=None, keep_fragments=False):
