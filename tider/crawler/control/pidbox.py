@@ -8,6 +8,7 @@ from kombu.utils.encoding import safe_str, safe_repr
 from tider.crawler import state
 from tider.exceptions import SpiderShutdown, SpiderTerminate
 from tider.crawler.control.panel import Panel
+from tider.platforms import EX_FAILURE, EX_OK
 from tider.utils.text import truncate
 from tider.utils.log import get_logger
 from tider.utils.collections import AttributeDict
@@ -26,6 +27,12 @@ def dump_body(m, body):
     body = m.body if body is None else body
     return '{} ({}b)'.format(truncate(safe_repr(body), 1024),
                              len(m.body))
+
+
+def _maybe_set_state(name, exc, default):
+    if getattr(state, name) is None:
+        code = exc.code if exc.code is not None else default
+        setattr(state, name, code)
 
 
 class Pidbox:
@@ -135,11 +142,13 @@ class Pidbox:
                 except connection.connection_errors:
                     if not self._reconnect(connection, shutdown):
                         break
-                except SpiderShutdown:
-                    state.should_stop = True
+                except SpiderShutdown as exc:
+                    # Tider drains pidbox in a dedicated thread/greenlet, so translate
+                    # it into the shared shutdown flag for the engine loop.
+                    _maybe_set_state('should_stop', exc, EX_OK)
                     break
-                except SpiderTerminate:
-                    state.should_terminate = True
+                except SpiderTerminate as exc:
+                    _maybe_set_state('should_terminate', exc, EX_FAILURE)
                     break
         finally:
             # close channel inside the loop to avoid cross-greenlet races.
