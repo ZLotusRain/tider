@@ -139,6 +139,21 @@ def _do_restore_message(self, payload, exchange, routing_key,
         crit('Could not restore message: %r', payload, exc_info=True)
 
 
+def _get_redis_pop_count(transport_options):
+    value = transport_options.get('pop_count', 1)
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Redis transport option 'pop_count' must be a positive integer, got {value!r}"
+        ) from None
+    if count < 1 or isinstance(value, float) and not value.is_integer():
+        raise ValueError(
+            f"Redis transport option 'pop_count' must be a positive integer, got {value!r}"
+        )
+    return count
+
+
 def _redis_brpop_read(self, **options):
     try:
         try:
@@ -151,15 +166,36 @@ def _redis_brpop_read(self, **options):
             self.client.connection.disconnect()
             raise
         if dest__item:
-            dest, item = dest__item
-            dest = bytes_to_str(dest).rsplit(self.sep, 1)[0]
+            queue, item = dest__item
+            queue = bytes_to_str(queue)
+            dest = queue.rsplit(self.sep, 1)[0]
             self._queue_cycle.rotate(dest)
-            item = bytes_to_str(item)
-            try:
-                item = loads(item)
-            except json.JSONDecodeError:
-                pass
-            self.connection._deliver(item, dest)
+
+            def deliver(raw_item):
+                raw_item = bytes_to_str(raw_item)
+                try:
+                    raw_item = loads(raw_item)
+                except json.JSONDecodeError:
+                    pass
+                self.connection._deliver(raw_item, dest)
+
+            # BRPOP itself only returns one item.  Deliver it before removing
+            # more messages so QoS can register the first delivery and expose
+            # the remaining prefetch capacity.
+            deliver(item)
+
+            count = self.pop_count - 1
+            if count > 0:
+                remaining = self.qos.can_consume_max_estimate()
+                if remaining is not None:
+                    count = min(count, remaining)
+                if count > 0:
+                    with self.conn_or_acquire() as client:
+                        items = client.rpop(queue, count)
+                    if items is not None and not isinstance(items, (list, tuple)):
+                        items = [items]
+                    for item in items or ():
+                        deliver(item)
             return True
         else:
             raise Empty()
@@ -228,6 +264,7 @@ def create_channel(self, connection, raw_create_channel):
     if hasattr(chan, '_do_restore_message'):
         # redis transport
         # Pipelines do not work in cluster mode the same way they do in normal mode.
+        chan.pop_count = _get_redis_pop_count(chan.connection.client.transport_options)
         chan._do_restore_message = MethodType(_do_restore_message, chan)
         chan._brpop_read = MethodType(_redis_brpop_read, chan)
         chan.handlers['BRPOP'] = chan._brpop_read
@@ -638,7 +675,9 @@ class AMQPBroker(Broker):
     def MessageConsumer(self, channel, queues=None, accept=None, **kw):
         if accept is None:
             accept = self.crawler.settings.get('BROKER_ACCEPT_CONTENT')
-        no_ack = kw.pop('no_ack', None) or self.crawler.settings.getbool('BROKER_NO_ACK')
+        no_ack = kw.pop('no_ack', None)
+        if no_ack is None:
+            no_ack = self.crawler.settings.getbool('BROKER_NO_ACK')
         return self.Consumer(
             channel, accept=accept, prefetch_count=self.crawler.concurrency * 10,
             queues=queues, no_ack=no_ack, **kw
@@ -651,7 +690,7 @@ class AMQPBroker(Broker):
                                      safe_repr(message.delivery_info),
                                      safe_repr(message.headers))
 
-    def on_message_received(self, message, on_message=None, decode=False):
+    def on_message_received(self, message, on_message=None, decode=False, no_ack=False):
         """process raw message"""
         on_unknown_message = self.on_unknown_message
 
@@ -661,27 +700,29 @@ class AMQPBroker(Broker):
             else:
                 payload = message.body
         except Exception as exc:  # pylint: disable=broad-except
-            return self.on_decode_error(message, exc)
+            return self.on_decode_error(message, exc, no_ack=no_ack)
 
         try:
             if on_message is not None:
-                on_message(message=message, payload=payload, no_ack=False)
+                on_message(message=message, payload=payload, no_ack=no_ack)
             else:
-                logger.warning(f"Message acked but with no handlers: {dump_body(message, message.body)}")
-                message.ack()
+                logger.warning(f"Message consumed but with no handlers: {dump_body(message, message.body)}")
+                if not no_ack:
+                    message.ack()
         except Exception as e:
-            on_unknown_message(payload, message, e)
+            on_unknown_message(payload, message, e, no_ack=no_ack)
 
-    def on_unknown_message(self, body, message, error):
+    def on_unknown_message(self, body, message, error, no_ack=False):
         logger.warning(UNKNOWN_FORMAT, error, self._message_report(body, message))
-        message.reject_log_error(logger, self.connection_errors)
+        if not no_ack:
+            message.reject_log_error(logger, self.connection_errors)
         signals.message_rejected.send(sender=self, message=message, exc=None)
 
-    def on_decode_error(self, message, exc):
+    def on_decode_error(self, message, exc, no_ack=False):
         """Callback called if an error occurs while decoding a message.
 
-        Simply logs the error and acknowledges the message, so it
-        doesn't enter a loop.
+        Simply logs the error and acknowledges the message when required,
+        so it doesn't enter a loop.
 
         Arguments:
             message: The message received.
@@ -693,7 +734,8 @@ class AMQPBroker(Broker):
             safe_repr(message.headers), dump_body(message, message.body),
         )
 
-        message.ack()
+        if not no_ack:
+            message.ack()
 
     def _restore_messages(self, consumer):
         chan = consumer.channel
@@ -770,19 +812,37 @@ class AMQPBroker(Broker):
                     logger.critical('Could not restore message: %r', M, exc_info=True)
             return restored, skipped, failed
 
+        def scan_unacked_batch(client, count):
+            """Read at most one restore batch without materializing the hash."""
+            cursor = 0
+            items = {}
+            while len(items) < count:
+                cursor, data = client.hscan(
+                    chan.unacked_key,
+                    cursor=cursor,
+                    count=count - len(items),
+                )
+                for tag, payload in data.items():
+                    items.setdefault(tag, payload)
+                    if len(items) >= count:
+                        break
+                if cursor == 0:
+                    break
+            return list(items.items())
+
         def restore_transaction_batch(c):
             last_watch_error = None
             for attempt in range(1, RESTORE_TRANSACTION_MAX_RETRIES + 1):
                 with c.pipeline() as pipe:
                     try:
                         pipe.watch(chan.unacked_key)
-                        data = pipe.hgetall(chan.unacked_key)
-                        batch = list(data.items())[:RESTORE_TRANSACTION_BATCH_SIZE]
+                        total = pipe.hlen(chan.unacked_key)
+                        batch = scan_unacked_batch(pipe, RESTORE_TRANSACTION_BATCH_SIZE)
                         pipe.multi()
                         restored, skipped, failed = restore_items(pipe, batch)
                         pipe.execute()
                         return {
-                            'total': len(data),
+                            'total': total,
                             'selected': len(batch),
                             'restored': restored,
                             'skipped': skipped,
@@ -799,27 +859,39 @@ class AMQPBroker(Broker):
             raise last_watch_error
 
         def force_restore(c):
-            data = c.hgetall(chan.unacked_key)
-            items = list(data.items())
-            total = len(items)
+            total = c.hlen(chan.unacked_key)
             restored = skipped = failed = 0
             logger.warning(
                 'Force restoring %s message(s) from %s without WATCH; '
                 'duplicates are possible under active competition',
                 total, chan.unacked_key,
             )
-            for offset in range(0, total, RESTORE_PROGRESS_EVERY):
-                batch = items[offset:offset + RESTORE_PROGRESS_EVERY]
+            processed = 0
+            remaining = total
+            while remaining:
+                batch = scan_unacked_batch(c, RESTORE_PROGRESS_EVERY)
+                if not batch:
+                    break
                 r, s, f = restore_items(c, batch, force=True)
                 restored += r
                 skipped += s
                 failed += f
+                processed += len(batch)
+                next_remaining = c.hlen(chan.unacked_key)
                 logger.info(
                     'Force restore progress for %s: %s/%s restored '
                     '(skipped=%s failed=%s)',
-                    chan.unacked_key, min(offset + len(batch), total), total,
+                    chan.unacked_key, min(processed, total), total,
                     skipped, failed,
                 )
+                if next_remaining >= remaining:
+                    logger.warning(
+                        'Force restore made no progress for %s; leaving %s '
+                        'message(s) in the unacked hash',
+                        chan.unacked_key, next_remaining,
+                    )
+                    break
+                remaining = next_remaining
             logger.info(
                 'Force restored %s/%s message(s) from %s '
                 '(skipped=%s failed=%s)',
@@ -862,8 +934,9 @@ class AMQPBroker(Broker):
                 force_restore(client)
 
     def consume(self, queues=None, on_message=None, on_message_consumed=None):
-        on_decode_error = self.on_decode_error
-        on_message = partial(self.on_message_received, on_message=on_message)
+        no_ack = self.crawler.settings.getbool('BROKER_NO_ACK')
+        on_decode_error = partial(self.on_decode_error, no_ack=no_ack)
+        on_message = partial(self.on_message_received, on_message=on_message, no_ack=no_ack)
 
         if isinstance(queues, Queues):
             queues = list(queues.consume_from.values())
@@ -879,7 +952,8 @@ class AMQPBroker(Broker):
         }
         connection = self.connect(transport_options=transport_options)
         consumer = self.MessageConsumer(channel=connection, queues=queues,
-                                        accept=None, on_decode_error=on_decode_error)
+                                        accept=None, on_decode_error=on_decode_error,
+                                        no_ack=no_ack)
         consumer.on_message = on_message
         consumer.consume()
         # restore unacked messages from memory on startup.
@@ -932,7 +1006,8 @@ class AMQPBroker(Broker):
 
                     connection = self.connect(transport_options=transport_options)  # change settings if needed.
                     consumer = self.MessageConsumer(channel=connection, queues=queues,
-                                                    accept=None, on_decode_error=on_decode_error)
+                                                    accept=None, on_decode_error=on_decode_error,
+                                                    no_ack=no_ack)
                     consumer.on_message = on_message
                     consumer.consume()
                     on_message_consumed and on_message_consumed()

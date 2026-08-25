@@ -166,7 +166,7 @@ class FilesBroker(Broker):
                 file = BytesIO(content)
             else:
                 raise ValueError("Unsupported data source.")
-            if ext == 'json':
+            if ext in ('json', 'jsonl'):
                 self._consume_json(file, on_message, on_message_consumed)
             elif ext == 'xlsx':
                 self._consume_xlsx(file, on_message, on_message_consumed)

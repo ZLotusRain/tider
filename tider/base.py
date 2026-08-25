@@ -259,6 +259,9 @@ class Tider:
         """
         transport_options = dict(transport_options or {})
         transport_options.setdefault('wait_time_seconds', 0.1)  # don't wait too long in C-level.
+        # Control messages do not use queue priorities.  Keep the Redis
+        # reply consumer on a single key so BRPOP remains cluster-safe.
+        transport_options.setdefault('priority_steps', [0])
         url = url or self.conf.get('CONTROL_URL')
         if not url:
             return MockConnection()
