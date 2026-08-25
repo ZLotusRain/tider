@@ -10,3 +10,11 @@ def maybe_shutdown():
         raise SpiderTerminate(should_terminate)
     elif should_stop is not None and should_stop is not False:
         raise SpiderShutdown(should_stop)
+
+
+def stop_requested():
+    return should_stop is not None and should_stop is not False
+
+
+def terminate_requested():
+    return should_terminate is not None and should_terminate is not False

@@ -8,6 +8,7 @@ from enum import Enum
 from typing import Iterator
 
 from tider.network import Request
+from tider.exceptions import ProxyError
 from tider.utils.functional import iter_generator, evaluate_callable
 
 __all__ = ('is_unresolved', 'is_pending', 'is_scheduled',
@@ -93,9 +94,12 @@ class PromiseNode:
 
     @property
     def size(self):
-        size = len(self.children)
-        for child in self.children:
-            size += child.size
+        size = 0
+        stack = list(self.children)
+        while stack:
+            node = stack.pop()
+            size += 1
+            stack.extend(node.children)
         return size
 
     @property
@@ -157,13 +161,22 @@ class PromiseNode:
                     if not isinstance(output, Request):
                         node = output
                     else:
+                        output_node = output.meta.get('promise_node')
+                        already_scheduled = output_node is not None and is_scheduled(output_node.state)
                         if 'promise_order' not in output.meta:
                             output.meta['promise_order'] = order
                         order += 1
                         # the address of reqs can't be the same,
                         # otherwise the node will be ignored.
                         self.add_child(output)
-                        node = output.meta.get('promise_node')  # already SCHEDULED
+                        if already_scheduled:
+                            # Requests yielded from a child promise are already
+                            # scheduling copies.  Yield the request itself so a
+                            # parent promise does not copy the original node a
+                            # second time and steal/fail its proxy lease.
+                            node = output
+                        else:
+                            node = output.meta.get('promise_node')  # already SCHEDULED
                     if not node:
                         continue
                     # unresolved children only be evaluated once
@@ -307,7 +320,15 @@ class Promise:
             elif is_rejected(node.state):
                 logger.warning(f"{node} is rejected, reason: {node.rejected_reason}")
             else:
-                request = node.request.copy()  # copy when node is set
+                # Keep copy semantics while moving any pending proxy lease to
+                # the scheduled copy.
+                source_request = node.request
+                request = source_request.copy(bind_proxy=False)
+                try:
+                    if source_request.selected_proxy:
+                        request.inherit_proxy(source_request, proxies_explicit=source_request.proxies_explicit)
+                except ProxyError:
+                    pass
                 if not request.meta.get("promise_node"):
                     # avoid parent promise overwrites child promise.
                     request.meta["promise_node"] = node

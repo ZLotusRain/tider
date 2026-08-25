@@ -1,6 +1,6 @@
 import time
 import socket
-from threading import Event
+from threading import Event, Lock
 
 from tider import signals, Request, Item
 from tider.crawler import state
@@ -275,17 +275,21 @@ class HeartEngine:
 
     def _overload(self):
         limit = self.crawler.concurrency * 2
-        return len(self.explorer.queue) + len(self.parser.queue) >= limit
+        inflight = (
+            len(self.explorer.queue)
+            + len(self.explorer.transferring)
+            + len(self.parser.queue)
+            + len(self.parser.parsing)
+        )
+        return inflight >= limit
 
     def schedule_request(self, request):
         if isinstance(request, Item):
             request = _blank_item_request(item=request)
-        if request.meta.get('immediate_download', False):
-            response = self.explorer.explore(request)
-            self.explorer.on_response(response)
-        elif not self.scheduler.enqueue_request(request):
+        if not self.scheduler.enqueue_request(request):
             logger.error(f"Request dropped: {request}")
             self.crawler.stats.inc_value("request/dropped")
+            request.close()
 
     def create_response_handler(self):
         async_parse = self.crawler.settings.getbool('PARSER_ASYNC_START')
@@ -298,37 +302,53 @@ class HeartEngine:
             parse = self.parser.enqueue_parser
         else:
             parse = immediate_parse
-        transports = self.explorer.transports
+        overload_drain_lock = Lock()
+
+        def close_result(result):
+            if isinstance(result, Request):
+                request = result
+            else:
+                request = result.request
+                result.close()
+            if request is not None:
+                request.close()
+
+        def shutdown_requested():
+            return (
+                (self._is_shutdown.is_set() and self._spider_closed.is_set())
+                or state.stop_requested()
+                or state.terminate_requested()
+            )
 
         def on_response(result):
             if not isinstance(result, (Request, Response)):
                 raise TypeError(f"Incorrect type: expected Request, Response or Failure, "
                                 f"got {type(result)}: {result!r}")
-            if self._is_shutdown.is_set() and self._spider_closed.is_set():
-                if isinstance(result, Request):
-                    request = result
-                else:
-                    request = result.request
-                    result.close()
-                if request is not None:
-                    request.close()
-                return
-            transport_id = result.meta.get('transport_id')
             immediate_download = result.meta.get('immediate_download')
-            while overload():
-                if immediate_download or transport_id in transports[:1]:
-                    # shrink to single concurrency if overloaded.
-                    break
-                self.crawler.sleep(0.01)
-            if isinstance(result, Request):
-                # if processed in explorer,
-                # the frame may be stuck for limited queue size.
-                schedule_request(result)
-            else:
-                if not result.request.meta.get('immediate_parse'):
-                    parse(result)
+            drain_acquired = False
+            try:
+                while not immediate_download and overload():
+                    if shutdown_requested():
+                        close_result(result)
+                        return
+                    drain_acquired = overload_drain_lock.acquire(blocking=False)
+                    if drain_acquired:
+                        # Let any completed response drain overload without
+                        # waiting for the oldest transport to finish.
+                        break
+                    self.crawler.sleep(0.01)
+                if isinstance(result, Request):
+                    # if processed in explorer,
+                    # the frame may be stuck for limited queue size.
+                    schedule_request(result)
                 else:
-                    immediate_parse(result)
+                    if not result.request.meta.get('immediate_parse'):
+                        parse(result)
+                    else:
+                        immediate_parse(result)
+            finally:
+                if drain_acquired:
+                    overload_drain_lock.release()
 
         return on_response
 

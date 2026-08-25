@@ -2,6 +2,7 @@
 
 import re
 import time
+from logging import getLevelName
 from queue import Full
 from uuid import uuid4
 from operator import itemgetter
@@ -14,14 +15,12 @@ from tider import Request
 from tider.network import Session, ProxyPoolManager, Response
 from tider.exceptions import (
     _InvalidMiddlewareOutput,
-    ConnectionError,
     DownloadError,
     HTTPError,
     ProxyError,
     InvalidProxy,
     InvalidSelectedProxy,
     ExclusiveProxy,
-    Timeout,
     SpiderShutdown,
     SpiderTerminate,
 )
@@ -39,22 +38,13 @@ def _dummy_handler(response):
     logger.info(f"Got transport's output: {response}")
 
 
-class LimitsAllowed:
-
-    def __init__(self, allowed, backtracks=None):
-        self.allowed = allowed
-        self.backtracks = backtracks or []
-
-    def __bool__(self):
-        return bool(self.allowed)
-
-
 class ConcurrencyLimits:
-    """Thread-safe concurrency limiter using Semaphore."""
+    """Thread-safe request concurrency limiter."""
 
     def __init__(self, limits=None, domain_concurrency=None):
         self._limits = {'url': {}, 'downloader': {}}
-        self._lock = Lock()  # protects _limits dict modification
+        self._domain_active_counts = {}
+        self._lock = Lock()  # protects transient domain state and limit registration
 
         limits = dict(limits or {})
         for limit_type in limits:
@@ -87,19 +77,39 @@ class ConcurrencyLimits:
                     'semaphore': Semaphore(int(limit)),
                 }
 
-    def _register_domain(self, domain):
-        """Lazily register a per-domain URL limit on first encounter."""
-        pattern = self._domain_url_pattern(domain)
-        self._add_limit('url', pattern, self._domain_concurrency)
+    def _acquire_domain(self, pattern):
+        """Acquire a transient per-domain slot."""
+        with self._lock:
+            actives = self._domain_active_counts.get(pattern, 0)
+            if actives >= self._domain_concurrency:
+                return False
+            self._domain_active_counts[pattern] = actives + 1
+            return True
 
-    def allow(self, request):
+    def _release_domain(self, pattern):
+        with self._lock:
+            actives = self._domain_active_counts.get(pattern, 0)
+            if actives <= 0:
+                return
+            if actives == 1:
+                self._domain_active_counts.pop(pattern, None)
+            else:
+                self._domain_active_counts[pattern] = actives - 1
+
+    def acquire(self, request):
         """Try to acquire slots for the request. Thread-safe."""
+        acquired = []  # [(limit_type, pattern)]
         if self._domain_concurrency:
             domain = parse_url_host(request.url)
             if domain:
-                self._register_domain(domain)
+                pattern = self._domain_url_pattern(domain)
+                # A user-defined limit with the same pattern already covers the
+                # domain and preserves the previous precedence behavior.
+                if pattern not in self._limits['url']:
+                    if not self._acquire_domain(pattern):
+                        return None
+                    acquired.append(('domain', pattern))
 
-        backtracks = []  # [(limit_type, pattern, request)], maybe processed in `on_response`
         for limit_type in self._limits:
             limits = self._limits[limit_type]
             attr = getattr(request, limit_type)
@@ -108,20 +118,31 @@ class ConcurrencyLimits:
             for pattern in limits:
                 if limits[pattern]['pattern'].match(attr):
                     if limits[pattern]['semaphore'].acquire(blocking=False):
-                        backtracks.append((limit_type, pattern))
+                        acquired.append((limit_type, pattern))
                     else:
-                        self.backtrack(backtracks)
-                        return LimitsAllowed(False)
-        return LimitsAllowed(allowed=True, backtracks=backtracks)
+                        self.release(acquired)
+                        return None
+        return acquired
 
-    def backtrack(self, backtracks):
+    def release(self, acquired):
         """Release acquired slots. Thread-safe."""
-        for limit_type, pattern in backtracks:
-            self._limits[limit_type][pattern]['semaphore'].release()
+        for limit_type, pattern in acquired:
+            if limit_type == 'domain':
+                self._release_domain(pattern)
+            else:
+                self._limits[limit_type][pattern]['semaphore'].release()
 
     def match(self, request):
         """Return all limits that match the request (without acquiring)."""
         matched = []  # [(limit, limit_type, pattern)]
+        if self._domain_concurrency:
+            domain = parse_url_host(request.url)
+            if domain:
+                pattern = self._domain_url_pattern(domain)
+                if pattern not in self._limits['url']:
+                    # Keep the existing URL slot format used by
+                    # ExplorerAwarePriorityQueue without retaining idle domains.
+                    matched.append((self._domain_concurrency, 'url', pattern))
         for limit_type in self._limits:
             limits = self._limits[limit_type]
             attr = getattr(request, limit_type)
@@ -135,7 +156,14 @@ class ConcurrencyLimits:
     def qsize(self, limit_type, pattern):
         """Return available slots count."""
         # Semaphore._value is CPython implementation detail but stable
-        return self._limits[limit_type][pattern]['semaphore']._value
+        limit = self._limits[limit_type].get(pattern)
+        if limit is not None:
+            return limit['semaphore']._value
+        if limit_type == 'url' and self._domain_concurrency:
+            with self._lock:
+                actives = self._domain_active_counts.get(pattern, 0)
+            return max(0, self._domain_concurrency - actives)
+        raise KeyError(pattern)
 
 
 class MiddlewareManager:
@@ -164,12 +192,27 @@ class MiddlewareManager:
     def _add_middleware(self, mw) -> None:
         if hasattr(mw, "process_request"):
             self.methods["process_request"].append(mw.process_request)
+        if hasattr(mw, "before_download"):
+            self.methods["before_download"].append(mw.before_download)
         if hasattr(mw, "process_response"):
             self.methods["process_response"].appendleft(mw.process_response)
 
     def process_request(self, request) -> Union[Response, Request]:
         """process explorer Request-like input."""
         for method in self.methods["process_request"]:
+            result = method(request=request)
+            if result is not None and not isinstance(result, (Response, Request)):
+                raise _InvalidMiddlewareOutput(
+                    f"Middleware {method.__qualname__} must return None, Response or "
+                    f"Request, got {result.__class__.__name__}"
+                )
+            if isinstance(result, Response):
+                return result
+        return request
+
+    def before_download(self, request) -> Union[Response, Request]:
+        """process Request after proxy is selected and before download."""
+        for method in self.methods["before_download"]:
             result = method(request=request)
             if result is not None and not isinstance(result, (Response, Request)):
                 raise _InvalidMiddlewareOutput(
@@ -202,8 +245,15 @@ class MiddlewareManager:
 class Explorer:
 
     def __init__(self, crawler, concurrency=4, domain_concurrency=None, concurrency_limits=None,
-                 priority_adjust=0, retry_until_valid_proxy=True):
+                 priority_adjust=0, retry_until_valid_proxy=True, give_up_log_level="DEBUG"):
         self._crawler = crawler
+        if isinstance(give_up_log_level, str):
+            level = getLevelName(give_up_log_level)
+            if not isinstance(level, int):
+                raise ValueError(f"Invalid give-up log level: {give_up_log_level!r}")
+            give_up_log_level = level
+        self.give_up_log_level = give_up_log_level
+
         self.concurrency = concurrency
         self.pool = crawler.create_pool(limit=concurrency, thread_name_prefix="ExplorerWorker")
         self.climits = ConcurrencyLimits(concurrency_limits, domain_concurrency=domain_concurrency)
@@ -232,7 +282,8 @@ class Explorer:
             domain_concurrency=crawler.settings.get('CONCURRENT_REQUESTS_PER_DOMAIN'),
             concurrency_limits=crawler.settings.getdict('EXPLORER_CONCURRENCY_LIMITS'),
             priority_adjust=crawler.settings.getint('EXPLORER_RETRY_PRIORITY_ADJUST'),
-            retry_until_valid_proxy=crawler.settings.getint('EXPLORER_RETRY_UNTIL_VALID_PROXY', True)
+            retry_until_valid_proxy=crawler.settings.getint('EXPLORER_RETRY_UNTIL_VALID_PROXY', True),
+            give_up_log_level=crawler.settings['EXPLORER_RETRY_GIVE_UP_LOG_LEVEL'],
         )
 
     def active(self):
@@ -287,6 +338,7 @@ class Explorer:
         # even reached the concurrency limit, some pool is may not being used(related to connection pool key).
         if self.session is None:
             return
+        self.proxypool.close_expired_connections()
         self.session.close_expired_connections()
 
     def needs_backout(self):
@@ -318,7 +370,7 @@ class Explorer:
                 should_free = True
             except IndexError:
                 # avoid catching IndexError raised by output handler.
-                if not loop:
+                if not loop or state.stop_requested() or state.terminate_requested():
                     break
                 continue
             transferring.add(request)  # thread switch.
@@ -366,6 +418,8 @@ class Explorer:
             raise exc
 
     def build_request_proxy(self, request: Request):
+        if request.proxies_explicit:
+            return
         try:
             if request.selected_proxy:
                 return
@@ -377,7 +431,7 @@ class Explorer:
             disposable=request.meta.get('disposable_proxy', False),
             request=request,
         )
-        request.update_proxy(proxy)
+        request.bind_proxy(proxy)
 
     def async_explore(self, on_response=None):
         if self.running:
@@ -404,50 +458,71 @@ class Explorer:
                 kwargs={'transport_id': transport_id, 'transferring': transferring, 'loop': self.loop},
             )
 
-    def try_explore(self, method, url, params=None, data=None, headers=None, cookies=None,
-                    files=None, auth=None, timeout=None, allow_redirects=True, proxies=None,
-                    stream=None, verify=None, cert=None, json=None, raise_for_status=False,
-                    proxy_schema=0, proxy_params=None, delay=0, max_retries=0, encoding=None,
-                    ignored_status_codes=(400, 412, 521), http2=False, downloader=None, impersonate=None, **kwargs):
+    def try_explore(
+        self, method=None, url=None, params=None, headers=None, data=None, json=None, auth=None, cookies=None,
+        files=None, timeout=None, proxies=None, allow_redirects=True, stream=None, verify=None, cert=None,
+        raise_for_status=False, proxy_schema=0, proxy_params=None, delay=0, max_retries=0, encoding=None, http2=False,
+        ignored_status_codes=(400, 412, 521), downloader=None, impersonate=None, request=None, check_error=True,
+        release_proxy=True, **kwargs
+    ):
         """Simple request api."""
         kwargs.pop('dup_check', None)
-        request = Request(url=url, method=method, params=params, data=data, json=json, headers=headers,
-                          cookies=cookies, files=files, auth=auth, timeout=timeout, allow_redirects=allow_redirects,
-                          proxies=proxies, proxy_schema=proxy_schema, proxy_params=proxy_params,
-                          stream=stream, verify=verify, cert=cert, raise_for_status=raise_for_status, encoding=encoding,
-                          ignored_status_codes=ignored_status_codes, http2=http2, downloader=downloader,
-                          impersonate=impersonate, max_retries=max_retries, dup_check=False, **kwargs)
+        if request is None:
+            request = Request(
+                url=url, method=method, params=params, headers=headers, data=data, json=json, auth=auth, cookies=cookies,
+                files=files, timeout=timeout, proxies=proxies, allow_redirects=allow_redirects, stream=stream, verify=verify,
+                cert=cert, raise_for_status=raise_for_status, proxy_schema=proxy_schema, proxy_params=proxy_params,
+                encoding=encoding, ignored_status_codes=ignored_status_codes, http2=http2, downloader=downloader,
+                impersonate=impersonate, max_retries=max_retries, dup_check=False, **kwargs
+            )
         response = self._explore(request)
         while isinstance(response, Request):
-            retry_times = request.meta.get('retry_times', 0) + 1
-            request.meta['retry_times'] = retry_times
-            if delay > 0:
+            state.maybe_shutdown()
+            if response is not request:
+                request.close()
+            request = response
+            explore_after = request.meta.get('explore_after')
+            if explore_after:
+                wait = explore_after - time.monotonic()
+                if wait > 0:
+                    self._crawler.sleep(wait)
+            elif delay > 0:
                 self._crawler.sleep(delay)
+            else:
+                # Keep immediate retries inline, but let another worker run
+                # when middleware returns a retry without a delay.
+                self._crawler.sleep(0)
             response = self._explore(request)
+
+        if release_proxy:
+            def unbind_proxy(response):
+                response.request.unbind_proxy()
+
+            if response._content_consumed:
+                response.on_consumed = None
+                unbind_proxy(response)
+            else:
+                response.on_consumed = unbind_proxy
         try:
-            response.check_error()
-            return response
+            if check_error:
+                response.check_error()
         except DownloadError:
-            response.close()
+            try:
+                response.close()
+            finally:
+                request.close()
             raise
 
-    def explore(self, request):
-        allowed = self.climits.allow(request)
-        if not allowed:
-            return request
-        response = self._explore(request)
-        if isinstance(response, Response):
-            try:
-                response.check_error()
-            except Exception as e:
-                retry_times = request.meta.get('retry_times', 0)
-                logger.error(
-                    "Gave up retrying %(request)s (failed %(retry_times)d times): "
-                    "%(reason)s",
-                    {'request': request, 'retry_times': retry_times, 'reason': e}
-                )
-        self.climits.backtrack(allowed.backtracks)
         return response
+
+    def explore(self, request):
+        acquired = self.climits.acquire(request)
+        if acquired is None:
+            return request
+        try:
+            return self._explore(request)
+        finally:
+            self.climits.release(acquired)
 
     def _explore(self, request):
         self._crawler.stats.inc_value("request/count")
@@ -461,8 +536,16 @@ class Explorer:
             elif request.url.startswith('data:'):
                 response = Response.dummy(request=request, content=parse_data_uri(request.url).data)
             else:
-                self.build_request_proxy(request)
-                response = self.session.download_request(request)
+                try:
+                    self.build_request_proxy(request)
+                    result = self.middleware.before_download(request)
+                    if isinstance(result, Response):
+                        response = result
+                    else:
+                        response = self.session.download_request(request)
+                except ExclusiveProxy as e:
+                    response = Response(request)
+                    response.fail(e)
             result = self.middleware.process_response(request=request, response=response)
         if isinstance(result, Request):
             if response is not None:
@@ -478,13 +561,13 @@ class Explorer:
         except HTTPError as e:
             ignored_status_code = request.ignored_status_codes
             status_code = response.status_code
-            if str(status_code).startswith("4"):
-                request.invalidate_proxy()
             if status_code not in ignored_status_code:
+                if status_code == 407:
+                    request.invalidate_proxy()
                 response = self.get_retry_request(request, response, status_code=status_code, exc=e)
         except (DownloadError, TypeError) as e:
             # TypeError for no status_code.
-            if isinstance(e, (ConnectionError, InvalidProxy, Timeout)):
+            if isinstance(e, InvalidProxy):
                 request.invalidate_proxy()
             response = self.get_retry_request(request, response, exc=e)
         return response
@@ -507,12 +590,21 @@ class Explorer:
                 request.meta['explore_after'] = time.monotonic() + (request.delay or 2)
             request.dup_check = False
             request.meta['retry_times'] = retry_times
-            request.priority += self.priority_adjust
+            request.priority = priority
             if response is not None:
                 response.close()
-            self._crawler.stats.inc_value("request/count/retry")
+            if isinstance(exc, ExclusiveProxy):
+                request.meta['explore_after'] = time.monotonic() + (request.delay or 0.1)
+                self._crawler.stats.inc_value("request/count/wait")
+            else:
+                self._crawler.stats.inc_value("request/count/retry")
             return request
 
+        logger.log(
+            self.give_up_log_level,
+            "Gave up retrying %(request)s (failed %(retry_times)d times): %(reason)s",
+            {'request': request, 'retry_times': retry_times, 'reason': exc}
+        )
         if response is None:
             response = Response(request)
         if not response.failed:

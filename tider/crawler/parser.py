@@ -14,7 +14,8 @@ from tider.utils.log import get_logger
 from tider.utils.functional import iter_generator
 from tider.utils.imports import symbol_by_name
 from tider.utils.misc import build_from_crawler
-from tider.exceptions import DownloadError, SpiderShutdown, SpiderTerminate
+from tider.network.proxy import Proxy
+from tider.exceptions import DownloadError, ProxyError, SpiderShutdown, SpiderTerminate
 
 __all__ = ('Parser', )
 
@@ -26,10 +27,6 @@ def _maybe_close(obj):
         obj.close()
     elif hasattr(obj, 'clear'):
         obj.clear()
-
-
-def _terminate_requested():
-    return state.should_terminate is not None and state.should_terminate is not False
 
 
 def _close_in_background(func, name):
@@ -44,7 +41,7 @@ def _close_in_background(func, name):
     thread = threading.Thread(target=_close, name=name, daemon=True)
     thread.start()
     while thread.is_alive():
-        if _terminate_requested():
+        if state.terminate_requested():
             return False
         thread.join(timeout=1)
     if error:
@@ -93,7 +90,7 @@ class Parser:
         self.crawler = crawler
         # https://github.com/gevent/gevent/issues/1437
         # https://greenlet.readthedocs.io/en/stable/python_threads.html
-        self.concurrency = crawler.concurrency // 2 + 1
+        self.concurrency = crawler.concurrency // 3 + 1
         itemproc_cls = crawler.settings.get('ITEM_PROCESSOR')
         self.itemproc = build_from_crawler(symbol_by_name(itemproc_cls), self.crawler)
         self.max_items = crawler.settings.getint('ITEM_PROCESSOR_MAX_ITEMS', 1)
@@ -148,12 +145,18 @@ class Parser:
         while self.running:
             try:
                 response = queue.popleft()
-                parse_func(response)
-                del response  # to reduce peak memory usage
             except IndexError:
-                if not self.loop:
+                if not self.loop or state.stop_requested() or state.terminate_requested():
                     self.free_slots.append(None)
                     break
+                time.sleep(0.01)
+                continue
+
+            request = response.request
+            self.parsing.add(request)
+            try:
+                parse_func(response)
+                del response  # to reduce peak memory usage
             except (SpiderTerminate, SpiderShutdown):
                 self.running = False
                 break
@@ -162,6 +165,7 @@ class Parser:
                 state.should_terminate = EX_FAILURE
                 raise
             finally:
+                self.parsing.discard(request)
                 # sleep to switch thread
                 time.sleep(0.01)
 
@@ -187,17 +191,39 @@ class Parser:
         if self.max_items > 1:
             self.pool.apply_async(self.itemproc.process_queue)
 
+    def _process_immediate_request(self, request):
+        engine = self.crawler.engine
+        # Keep retries in the current parse flow so immediate ordering is preserved.
+        # Parser owns the request until parse() transfers or releases its proxy lease.
+        response = engine.explorer.try_explore(request=request, check_error=False, release_proxy=False)
+        if response.meta.get('immediate_parse', False):
+            self.parse(response)
+        else:
+            engine.explorer.on_response(response)
+
+    def _process_promise_outputs(self, outputs, request):
+        for output in iter_generator(outputs, sleep=self.crawler.sleep):
+            # maybe iter node.then() directly.
+            state.maybe_shutdown()
+            if isinstance(output, Request):
+                try:
+                    selected_proxy = output.selected_proxy
+                except ProxyError:
+                    selected_proxy = None
+                if not selected_proxy:
+                    self._inherit_request_proxy(output, request)
+            self._process_spider_output(output, request)
+
     def parse(self, response):
         request = response.request
-        self.parsing.add(request)
-
-        errback = request.errback
         callback = request.callback or self.crawler.spider.parse
+        errback = request.errback
         cb_kwargs = request.cb_kwargs
         node = request.meta.pop("promise_node", None)
 
-        spider_outputs = None
+        spider_outputs_done = False
         try:
+            spider_outputs = None
             if response.failed:
                 if errback:
                     spider_outputs = _get_spider_outputs(errback, response, cb_kwargs=cb_kwargs)
@@ -222,6 +248,8 @@ class Parser:
                 # maybe iter spider outputs directly.
                 state.maybe_shutdown()
                 if self._spider_output_filter(output, response):
+                    if isinstance(output, Request):
+                        self._inherit_request_proxy(output, request)
                     if node and isinstance(output, Request):
                         if not output.meta.get('promise_order'):
                             output.meta['promise_order'] = order
@@ -231,38 +259,68 @@ class Parser:
                             self._process_spider_output(output, request)
                     else:
                         self._process_spider_output(output, request)
+            # No Exceptions raised when processed by callback/errback
+            spider_outputs_done = True
+            _success = True  # reserved, merged with spider_outputs_done in the future.
+            if node:
+                node.state = NodeState.EXECUTED if _success else NodeState.REJECTED
+                self._process_promise_outputs(node.then(), request)
         except (SpiderTerminate, SpiderShutdown):
             raise
         except Exception as e:
-            logger.exception(f"Parser bug processing {request}")
-            error = {
-                "request": request.to_dict(spider=self.crawler.spider, encode_body=True),
-                "time": int(time.time() * 1000),
-                "type": e.__class__.__name__,
-                "traceback": traceback.format_exc()
-            }
-            self.crawler.spider.meta['errors'].append(error)
-            self.crawler.stats.inc_value(f"parser/{e.__class__.__name__}/count")
-        finally:
-            del callback, errback
-
-        _success = True  # reserved
-        if node:
-            node.state = NodeState.EXECUTED if _success else NodeState.REJECTED
-            try:
-                for output in iter_generator(node.then(), sleep=self.crawler.sleep):
-                    # maybe iter node.then() directly.
-                    state.maybe_shutdown()
-                    self._process_spider_output(output, request)
-            except (SpiderTerminate, SpiderShutdown):
-                raise
-            except Exception as e:
+            if not spider_outputs_done:
+                logger.exception(f"Parser bug processing {request}")
+                error = {
+                    "request": request.to_dict(spider=self.crawler.spider, encode_body=True),
+                    "time": int(time.time() * 1000),
+                    "type": e.__class__.__name__,
+                    "traceback": traceback.format_exc()
+                }
+                self.crawler.spider.meta['errors'].append(error)
+                self.crawler.stats.inc_value(f"parser/{e.__class__.__name__}/count")
+            else:
                 logger.exception(f"Promise bug processing {request}")
                 self.crawler.stats.inc_value(f"promise/{e.__class__.__name__}/count")
+        finally:
+            try:
+                del callback, errback
+            finally:
+                try:
+                    response.close()
+                finally:
+                    request.close()
 
-        response.close()
-        request.close()
-        self.parsing.remove(request)
+    def _proxy_key(self, request):
+        proxypool = self.crawler.engine.explorer.proxypool
+        return proxypool.get_proxy_key(request.proxy_schema, request.proxy_params)
+
+    def _inherit_request_proxy(self, output, request):
+        # Inherit only inside the same proxy schema and user-defined proxy key.
+        same_context = output.proxy_schema == request.proxy_schema
+        if same_context:
+            try:
+                same_context = self._proxy_key(output) == self._proxy_key(request)
+            except (AttributeError, KeyError):
+                same_context = False
+        # Drop an already inherited proxy when the child asks for a different proxy context.
+        if (
+            output.meta.get('reset_proxy')
+            or output.meta.get('disposable_proxy')
+            # Copied parent proxies still need lease transfer; child explicit proxies win.
+            or (output.proxies_explicit and output.proxy is not request.proxy)
+            or not same_context
+        ):
+            if output.proxy is request.proxy:
+                output.bind_proxy(Proxy())
+            return
+        try:
+            # Transfer the parent lease for empty or already copied parent proxy.
+            if request.selected_proxy and (output.proxy is request.proxy or not output.selected_proxy):
+                output.inherit_proxy(request, proxies_explicit=request.proxies_explicit)
+        except ProxyError:
+            if output.proxy is request.proxy:
+                output.bind_proxy(Proxy())
+            pass
 
     def _spider_output_filter(self, request, response):
         if isinstance(request, Request):
@@ -283,6 +341,7 @@ class Parser:
                     "time": int(time.time() * 1000)
                 }
                 self.crawler.spider.meta['failures'].append(failure)
+                request.close()
                 return False
 
             if 'parse_times' not in request.meta:
@@ -300,13 +359,17 @@ class Parser:
                     "time": int(time.time() * 1000)
                 }
                 self.crawler.spider.meta['failures'].append(failure)
+                request.close()
                 return False
 
         return True
 
     def _process_spider_output(self, output, request):
         if isinstance(output, Request):
-            self.crawler.engine.schedule_request(output)
+            if output.meta.get('immediate_download', False):
+                self._process_immediate_request(output)
+            else:
+                self.crawler.engine.schedule_request(output)
         elif isinstance(output, (Item, dict)):
             self.crawler.stats.inc_value(f"item/count")
             self.crawler.stats.inc_value(f"item/count/{output.__class__.__name__}")
