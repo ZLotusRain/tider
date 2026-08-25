@@ -401,7 +401,7 @@ class HTTP2Response:
         return False
 
     def release_conn(self):
-        pass
+        self.close()
 
     def drain_conn(self):
         """
@@ -411,6 +411,8 @@ class HTTP2Response:
             self.read()
         except (HTTPError, OSError):
             pass
+        finally:
+            self.release_conn()
 
     @property
     def data(self) -> bytes:

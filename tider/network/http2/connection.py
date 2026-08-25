@@ -26,7 +26,7 @@ import h2.settings
 from urllib3.util import Timeout
 from urllib3.exceptions import ProtocolError, ConnectTimeoutError, ProxyError, HTTPError
 
-from .stream import SOCKET_OPTION, Stream, create_stream
+from .stream import SOCKET_OPTION, Stream, create_stream, create_socks_stream
 from .models import (Origin, URL, enforce_bytes,
                      enforce_headers, enforce_stream, Lock, Semaphore)
 from tider.network.compat import ExpirableHTTPSConnection
@@ -35,7 +35,10 @@ _Default = Timeout(connect=5.0, read=5.0)
 
 RETRIES_BACKOFF_FACTOR = 0.5  # 0s, 0.5s, 1s, 2s, 4s, etc.
 
-__all__ = ("HTTP2Connection", "TunnelHTTPConnection", "ConnectionNotAvailable")
+__all__ = (
+    "HTTP2Connection", "SOCKSHTTP2Connection", "TunnelHTTPConnection",
+    "ConnectionNotAvailable",
+)
 
 
 def exponential_backoff(factor: float) -> Iterator[float]:
@@ -49,6 +52,21 @@ def exponential_backoff(factor: float) -> Iterator[float]:
     yield 0
     for n in itertools.count():
         yield factor * 2 ** n
+
+
+def _start_tls_h2(stream: Stream, ssl_context, server_hostname, timeout) -> Stream:
+    """Upgrade *stream* to TLS and require HTTP/2 ALPN negotiation."""
+    ssl_context.set_alpn_protocols(["h2"])
+    stream = stream.start_tls(
+        ssl_context=ssl_context,
+        server_hostname=server_hostname,
+        timeout=timeout,
+    )
+    ssl_object = stream.get_extra_info("ssl_object")
+    if ssl_object is None or ssl_object.selected_alpn_protocol() != "h2":
+        stream.close()
+        raise ProtocolError("HTTP/2 was not negotiated during TLS handshake")
+    return stream
 
 
 def default_ssl_context() -> ssl.SSLContext:
@@ -699,9 +717,7 @@ class H2ConnectionByteStream:
 
     def read(self, amt=None) -> bytes:
         if self._stream_consumed:
-            raise RuntimeError(
-                "The stream has already been consumed."
-            )
+            return b""
         self._read = True
         if amt is not None:
             while len(self._buffer) < amt:
@@ -713,6 +729,8 @@ class H2ConnectionByteStream:
                 except StreamEnded:
                     self._stream_consumed = True
                     break
+            if not self._buffer:
+                return b""
             return self._buffer.get(amt)
         else:
             while True:
@@ -733,9 +751,7 @@ class H2ConnectionByteStream:
         to the underlying IO object.
         """
         if self._stream_consumed:
-            raise RuntimeError(
-                "The stream has already been consumed."
-            )
+            return b""
         self._read = True
         if len(self._buffer) > 0:
             if amt is None:
@@ -766,7 +782,7 @@ class HTTP2Connection:
             ssl_context: Optional[ssl.SSLContext] = None,
             retries: int = 0,
             keepalive_expiry: Optional[float] = None,
-            local_address: Optional[str] = None,
+            local_address=None,
             socket_options: Optional[Iterable[SOCKET_OPTION]] = None,
     ):
         self._origin = origin
@@ -807,13 +823,7 @@ class HTTP2Connection:
 
         while True:
             try:
-                kwargs = {
-                    "host": self._origin.host.decode("ascii"),
-                    "port": self._origin.port,
-                    "timeout": timeout,
-                    "socket_options": self._socket_options,
-                }
-                stream = create_stream(**kwargs)
+                stream = self._connect_tcp_stream(timeout)
 
                 if self._origin.scheme in (b"https", b"wss"):
                     ssl_context = (
@@ -821,16 +831,12 @@ class HTTP2Connection:
                         if self._ssl_context is None
                         else self._ssl_context
                     )
-                    alpn_protocols = ["http/1.1", "h2"]
-                    ssl_context.set_alpn_protocols(alpn_protocols)
-
-                    kwargs = {
-                        "ssl_context": ssl_context,
-                        "server_hostname": sni_hostname
-                                           or self._origin.host.decode("ascii"),
-                        "timeout": timeout,
-                    }
-                    stream = stream.start_tls(**kwargs)
+                    stream = _start_tls_h2(
+                        stream=stream,
+                        ssl_context=ssl_context,
+                        server_hostname=sni_hostname or self._origin.host.decode("ascii"),
+                        timeout=timeout,
+                    )
                 return stream
             except (ConnectionNotAvailable, ConnectTimeoutError):
                 if retries_left <= 0:
@@ -838,6 +844,15 @@ class HTTP2Connection:
                 retries_left -= 1
                 delay = next(delays)
                 time.sleep(delay)
+
+    def _connect_tcp_stream(self, timeout=None) -> Stream:
+        return create_stream(
+            host=self._origin.host.decode("ascii"),
+            port=self._origin.port,
+            timeout=timeout,
+            local_address=self._local_address,
+            socket_options=self._socket_options,
+        )
 
     def can_handle_request(self, origin: Origin) -> bool:
         return origin == self._origin
@@ -887,6 +902,24 @@ class HTTP2Connection:
         self.close()
 
 
+class SOCKSHTTP2Connection(HTTP2Connection):
+    """An HTTP/2 connection whose TCP transport is established via SOCKS."""
+
+    def __init__(self, *args, socks_options, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._socks_options = socks_options
+
+    def _connect_tcp_stream(self, timeout=None) -> Stream:
+        return create_socks_stream(
+            host=self._origin.host.decode("ascii"),
+            port=self._origin.port,
+            socks_options=self._socks_options,
+            timeout=timeout,
+            local_address=self._local_address,
+            socket_options=self._socket_options,
+        )
+
+
 def merge_headers(
         default_headers: Optional[Sequence[Tuple[bytes, bytes]]] = None,
         override_headers: Optional[Sequence[Tuple[bytes, bytes]]] = None,
@@ -915,6 +948,7 @@ class TunnelHTTPConnection:
         proxy_ssl_context: Optional[ssl.SSLContext] = None,
         proxy_headers: Optional[Sequence[Tuple[bytes, bytes]]] = None,
         keepalive_expiry: Optional[float] = None,
+        local_address=None,
         socket_options: Optional[Iterable[SOCKET_OPTION]] = None,
     ):
         self._connection = ExpirableHTTPSConnection(
@@ -928,6 +962,7 @@ class TunnelHTTPConnection:
         self._ssl_context = ssl_context
         self._proxy_ssl_context = proxy_ssl_context
         self._proxy_headers = enforce_headers(proxy_headers, name="proxy_headers")
+        self._local_address = local_address
         self._socket_options = socket_options
 
         self._keepalive_expiry = keepalive_expiry
@@ -946,13 +981,14 @@ class TunnelHTTPConnection:
         proxy_headers.update({k.decode('ascii'): v.decode('ascii') for k, v in self._proxy_headers})
         conn.set_tunnel(self._remote_origin.host.decode('ascii'), self._remote_origin.port, proxy_headers)
 
-        if self._proxy_origin.scheme == "https":
+        if self._proxy_origin.scheme == b"https":
             conn.tls_in_tls_required = True
 
         kwargs = {
             "host": self._proxy_origin.host.decode("ascii"),
             "port": self._proxy_origin.port,
             "timeout": timeout,
+            "local_address": self._local_address,
             "socket_options": self._socket_options,
         }
         stream = create_stream(**kwargs)
@@ -963,8 +999,7 @@ class TunnelHTTPConnection:
                 if self._proxy_ssl_context is None
                 else self._proxy_ssl_context
             )
-            alpn_protocols = ["http/1.1", "h2"]
-            ssl_context.set_alpn_protocols(alpn_protocols)
+            ssl_context.set_alpn_protocols(["http/1.1"])
 
             kwargs = {
                 "ssl_context": ssl_context,
@@ -996,16 +1031,12 @@ class TunnelHTTPConnection:
                     if self._ssl_context is None
                     else self._ssl_context
                 )
-                alpn_protocols = ["http/1.1", "h2"]
-                ssl_context.set_alpn_protocols(alpn_protocols)
-
-                kwargs = {
-                    "ssl_context": ssl_context,
-                    "server_hostname": self._remote_origin.host.decode("ascii"),
-                    "timeout": connect_timeout,
-                }
-
-                stream = stream.start_tls(**kwargs)
+                stream = _start_tls_h2(
+                    stream=stream,
+                    ssl_context=ssl_context,
+                    server_hostname=self._remote_origin.host.decode("ascii"),
+                    timeout=connect_timeout,
+                )
 
                 self._connection = H2Connection(
                     origin=self._remote_origin,

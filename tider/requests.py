@@ -41,7 +41,7 @@ class Session:
 
     @inthread(name="ClearThread")
     def _clear_idle_conns(self):
-        while not self._stopped.is_set():
+        while not self._stopped.wait(1):
             self.explorer.clear_idle_conns()
 
     def __enter__(self):

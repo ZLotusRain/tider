@@ -5,7 +5,7 @@ import socket
 import select
 from functools import partial
 
-from urllib3.exceptions import ConnectionError, ConnectTimeoutError, HTTPError
+from urllib3.exceptions import ConnectionError, ConnectTimeoutError, HTTPError, ProxyError
 
 from tider.exceptions import map_exceptions
 
@@ -31,6 +31,16 @@ SOCKET_OPTION = typing.Union[
     typing.Tuple[int, int, typing.Union[bytes, bytearray]],
     typing.Tuple[int, int, None, int],
 ]
+
+SOURCE_ADDRESS = typing.Optional[
+    typing.Union[str, typing.Tuple[typing.Any, ...]]
+]
+
+
+def _source_address(local_address: SOURCE_ADDRESS):
+    if local_address is None or isinstance(local_address, tuple):
+        return local_address
+    return local_address, 0
 
 
 def is_socket_readable(sock: typing.Optional[socket.socket]) -> bool:
@@ -215,7 +225,7 @@ def create_stream(
     host: str,
     port: int,
     timeout: typing.Optional[float] = None,
-    local_address: typing.Optional[str] = None,
+    local_address: SOURCE_ADDRESS = None,
     socket_options: typing.Optional[typing.Iterable[SOCKET_OPTION]] = None
 ) -> Stream:
     # Note that we automatically include `TCP_NODELAY`
@@ -223,7 +233,7 @@ def create_stream(
     if socket_options is None:
         socket_options = []  # pragma: no cover
     address = (host, port)
-    source_address = None if local_address is None else (local_address, 0)
+    source_address = _source_address(local_address)
     exc_map = {socket.timeout: ConnectTimeoutError, OSError: ConnectionError}
 
     with map_exceptions(exc_map):
@@ -235,4 +245,45 @@ def create_stream(
         for option in socket_options:
             sock.setsockopt(*option)  # pragma: no cover
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    return Stream(sock)
+
+
+def create_socks_stream(
+    host: str,
+    port: int,
+    socks_options,
+    timeout: typing.Optional[float] = None,
+    local_address: SOURCE_ADDRESS = None,
+    socket_options: typing.Optional[typing.Iterable[SOCKET_OPTION]] = None,
+) -> Stream:
+    """Create a TCP stream to *host* through a PySocks proxy."""
+    try:
+        import socks
+    except ImportError as exc:  # pragma: no cover - checked by SOCKSProxyManager
+        raise ProxyError("PySocks is required for SOCKS proxies", error=exc) from exc
+
+    source_address = _source_address(local_address)
+    options = list(socket_options or ())
+    options.append((socket.IPPROTO_TCP, socket.TCP_NODELAY, 1))
+
+    try:
+        sock = socks.create_connection(
+            (host, port),
+            timeout=timeout,
+            source_address=source_address,
+            proxy_type=socks_options["socks_version"],
+            proxy_addr=socks_options["proxy_host"],
+            proxy_port=socks_options["proxy_port"],
+            proxy_rdns=socks_options["rdns"],
+            proxy_username=socks_options["username"],
+            proxy_password=socks_options["password"],
+            socket_options=options,
+        )
+    except socket.timeout as exc:
+        raise ConnectTimeoutError(None, "SOCKS connection timed out") from exc
+    except socks.ProxyError as exc:
+        raise ProxyError("Cannot connect through SOCKS proxy", error=exc) from exc
+    except OSError as exc:
+        raise ConnectionError("Cannot connect through SOCKS proxy") from exc
+
     return Stream(sock)

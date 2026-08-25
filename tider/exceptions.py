@@ -143,7 +143,7 @@ class InvalidHeader(DownloadError):
     pass
 
 
-class InvalidProxyURL(DownloadError):
+class InvalidProxyURL(InvalidProxy):
     pass
 
 

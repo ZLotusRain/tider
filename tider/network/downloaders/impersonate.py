@@ -1,8 +1,13 @@
-import queue
+import _queue
+import ctypes
+import os
 import threading
+import time
 import weakref
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
+from io import BytesIO
 
 try:
     from curl_cffi import Curl
@@ -22,6 +27,242 @@ logger = get_logger(__name__)
 
 
 _STREAM_END = object()
+_STREAM_QUEUE_MAXSIZE = 16
+# Do not preallocate from an unbounded server-provided Content-Length.
+_BODY_BUFFER_PREALLOC_MAXSIZE = 256 * 1024 * 1024
+
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+# Retained for manual diagnostics; the downloader never invokes it.
+class _GlibcMemoryReclaimer:
+    """Optionally return unused native heap pages in long-lived workers."""
+
+    def __init__(self):
+        self.rss_threshold = max(
+            0, _env_int("TIDER_IMPERSONATE_MALLOC_TRIM_RSS_THRESHOLD", 0),
+        )
+        self.interval = max(
+            0, _env_int("TIDER_IMPERSONATE_MALLOC_TRIM_INTERVAL", 300),
+        )
+        self._lock = threading.Lock()
+        self._next_check = 0.0
+        self._malloc_trim = self._load_malloc_trim() if self.rss_threshold else None
+
+    @staticmethod
+    def _load_malloc_trim():
+        try:
+            malloc_trim = ctypes.CDLL(None).malloc_trim
+        except (AttributeError, OSError):
+            return None
+        malloc_trim.argtypes = [ctypes.c_size_t]
+        malloc_trim.restype = ctypes.c_int
+        return malloc_trim
+
+    @staticmethod
+    def _rss_bytes():
+        try:
+            with open("/proc/self/statm", encoding="ascii") as f:
+                resident_pages = int(f.read().split()[1])
+            return resident_pages * os.sysconf("SC_PAGE_SIZE")
+        except (OSError, ValueError, IndexError):
+            return 0
+
+    def maybe_trim(self):
+        if self._malloc_trim is None:
+            return None
+
+        now = preferred_clock()
+        if now < self._next_check or not self._lock.acquire(blocking=False):
+            return None
+        try:
+            if now < self._next_check:
+                return None
+            self._next_check = now + self.interval
+            before_rss = self._rss_bytes()
+            if before_rss < self.rss_threshold:
+                return None
+
+            started = time.perf_counter()
+            trimmed = bool(self._malloc_trim(0))
+            elapsed = (time.perf_counter() - started) * 1000
+            after_rss = self._rss_bytes()
+            return {
+                "trimmed": trimmed,
+                "before": before_rss,
+                "after": after_rss,
+                "released": max(0, before_rss - after_rss),
+                "elapsed": elapsed,
+            }
+        finally:
+            self._lock.release()
+
+
+class _BodyBuffer:
+    """Collect response chunks without incrementally growing a large buffer."""
+
+    def __init__(self, prealloc_maxsize=_BODY_BUFFER_PREALLOC_MAXSIZE):
+        self._prealloc_maxsize = prealloc_maxsize
+        self._header_buffer = None
+        self._buffer = None
+        self._chunks = []
+        self._size = 0
+        self._initialized = False
+
+    def bind_headers(self, header_buffer):
+        self._header_buffer = header_buffer
+
+    def _content_length(self):
+        if self._header_buffer is None:
+            return None
+
+        content_length = None
+        content_encoded = False
+        transfer_encoded = False
+        # CONNECT and redirects may leave multiple response header blocks.
+        for header_line in self._header_buffer.getvalue().splitlines():
+            if header_line.startswith(b"HTTP/"):
+                content_length = None
+                content_encoded = False
+                transfer_encoded = False
+                continue
+            name, separator, value = header_line.partition(b":")
+            if not separator:
+                continue
+            name = name.strip().lower()
+            value = value.strip().lower()
+            if name == b"content-length":
+                if not value.isdigit():
+                    return None
+                parsed_length = int(value)
+                if content_length is not None and content_length != parsed_length:
+                    return None
+                content_length = parsed_length
+            elif name == b"content-encoding":
+                content_encoded = content_encoded or value not in (b"", b"identity")
+            elif name == b"transfer-encoding":
+                transfer_encoded = transfer_encoded or value not in (b"", b"identity")
+
+        if content_encoded or transfer_encoded:
+            # libcurl may decode the body before invoking the callback.
+            return None
+        if content_length is None or not 0 <= content_length <= self._prealloc_maxsize:
+            return None
+        return content_length
+
+    def _initialize(self):
+        self._initialized = True
+        content_length = self._content_length()
+        if not content_length:
+            return
+        # Allocate once instead of growing BytesIO repeatedly for large bodies.
+        self._buffer = BytesIO()
+        self._buffer.seek(content_length - 1)
+        self._buffer.write(b"\0")
+        self._buffer.seek(0)
+
+    def write(self, chunk):
+        if not self._initialized:
+            self._initialize()
+        chunk_size = len(chunk)
+        if self._buffer is not None:
+            self._buffer.write(chunk)
+        else:
+            self._chunks.append(chunk)
+        self._size += chunk_size
+        return chunk_size
+
+    def getvalue(self):
+        if self._buffer is not None:
+            self._buffer.truncate(self._size)
+            return self._buffer.getvalue()
+        return b"".join(self._chunks)
+
+    def close(self):
+        self._chunks.clear()
+        if self._buffer is not None:
+            self._buffer.close()
+            self._buffer = None
+        self._header_buffer = None
+        self._size = 0
+
+
+def _drain_stream_queue(queue_):
+    if queue_ is None:
+        return
+    while True:
+        try:
+            queue_.get_nowait()
+        except _queue.Empty:
+            return
+
+
+class _StreamQueue:
+    """Thread-safe bounded queue that is not affected by monkey patching."""
+
+    def __init__(self):
+        self._queue = _queue.SimpleQueue()
+        self._slots = _queue.SimpleQueue()
+        for _ in range(_STREAM_QUEUE_MAXSIZE):
+            self._slots.put(None)
+        self.quit_now = None
+
+    def put_nowait(self, item):
+        while self.quit_now is None or not self.quit_now.is_set():
+            try:
+                self._slots.get(timeout=0.1)
+            except _queue.Empty:
+                continue
+            if self.quit_now is not None and self.quit_now.is_set():
+                self._slots.put(None)
+                return
+            self._queue.put(item)
+            return
+
+    def get(self):
+        item = self._queue.get()
+        self._slots.put(None)
+        return item
+
+    def get_nowait(self):
+        item = self._queue.get_nowait()
+        self._slots.put(None)
+        return item
+
+    def qsize(self):
+        return self._queue.qsize()
+
+
+class _ThreadEvent:
+    """Cross-thread event that does not depend on patched threading locks."""
+
+    def __init__(self):
+        self._is_set = False
+        self._signal = _queue.SimpleQueue()
+
+    def is_set(self):
+        return self._is_set
+
+    def set(self):
+        if not self._is_set:
+            self._is_set = True
+            self._signal.put(None)
+
+    def wait(self, timeout=None):
+        if self._is_set:
+            return True
+        try:
+            self._signal.get(timeout=timeout)
+        except _queue.Empty:
+            return self._is_set
+        self._signal.put(None)
+        return True
+
 
 _HTTP_VERSION_NAMES = {
     0: "HTTP/?",
@@ -67,19 +308,181 @@ def _curl_error_code(error):
         return None
 
 
+def _set_curl_option(curl, name, value):
+    if CurlOpt is None:
+        return
+    opt = getattr(CurlOpt, name, None)
+    if opt is not None:
+        with suppress(Exception):
+            curl.setopt(opt, value)
+
+
+if Headers is not None:
+    class CurlHeaders(Headers):
+        """Headers adapter that keeps duplicate response headers for cookies."""
+
+        def items(self):
+            return self.multi_items()
+else:
+    CurlHeaders = None
+
+
+class CurlPool:
+    """Small bounded idle pool for curl_cffi Curl handles.
+
+    A Curl handle keeps libcurl's connection cache across ``reset()``, so
+    successful direct requests can reuse handles without adding another active
+    concurrency limit beside Tider's explorer pipeline.
+    """
+
+    def __init__(
+        self, maxsize=10, idle_ttl=60, max_lifetime=None, max_connects=None,
+        curl_cls=None,
+    ):
+        self.maxsize = max(1, int(maxsize or 10))
+        self.idle_ttl = float(idle_ttl) if idle_ttl is not None else None
+        self.max_lifetime = float(max_lifetime) if max_lifetime is not None else None
+        self.max_connects = max_connects
+        self.curl_cls = curl_cls or Curl
+
+        self._idle = deque()
+        self._closed = False
+        self._lock = threading.RLock()
+
+    def new_curl(self):
+        curl = self.curl_cls()
+        self._configure_curl(curl)
+        return curl
+
+    def _configure_curl(self, curl):
+        if CurlOpt is None:
+            return
+        if self.max_connects:
+            _set_curl_option(curl, "MAXCONNECTS", int(self.max_connects))
+        if self.idle_ttl:
+            _set_curl_option(curl, "MAXAGE_CONN", int(self.idle_ttl))
+            _set_curl_option(curl, "DNS_CACHE_TIMEOUT", int(self.idle_ttl))
+        if self.max_lifetime:
+            _set_curl_option(curl, "MAXLIFETIME_CONN", int(self.max_lifetime))
+
+    def _discard_expired_locked(self, now=None):
+        if not self.idle_ttl and not self.max_lifetime:
+            return []
+        now = preferred_clock() if now is None else now
+        kept = deque()
+        expired = []
+        while self._idle:
+            last_used, created_at, curl = self._idle.popleft()
+            idle_expired = self.idle_ttl and now - last_used >= self.idle_ttl
+            lifetime_expired = self.max_lifetime and now - created_at >= self.max_lifetime
+            if idle_expired or lifetime_expired:
+                expired.append(curl)
+            else:
+                kept.append((last_used, created_at, curl))
+        self._idle = kept
+        return expired
+
+    @staticmethod
+    def _close_curls(curls):
+        for curl in curls:
+            with suppress(Exception):
+                curl.close()
+
+    def acquire(self):
+        """Return an idle Curl handle or create a new one."""
+        expired = []
+        curl = None
+        created_at = None
+        now = preferred_clock()
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("CurlPool is closed")
+            while self._idle:
+                last_used, created_at, curl = self._idle.pop()
+                idle_expired = self.idle_ttl and now - last_used >= self.idle_ttl
+                lifetime_expired = self.max_lifetime and now - created_at >= self.max_lifetime
+                if not (idle_expired or lifetime_expired):
+                    break
+                expired.append(curl)
+                curl = None
+
+        self._close_curls(expired)
+        if curl is None:
+            curl = self.new_curl()
+            created_at = preferred_clock()
+        return _CurlHandle(self, curl, created_at=created_at)
+
+    def release(self, curl, created_at, reusable=True):
+        if curl is None:
+            return
+
+        now = preferred_clock()
+        if reusable and self.max_lifetime and now - created_at >= self.max_lifetime:
+            reusable = False
+        if reusable:
+            try:
+                # perform() clears callback handles before the Curl is pooled.
+                curl.reset()
+                # curl_easy_reset drops options but retains native caches.
+                self._configure_curl(curl)
+            except Exception:
+                reusable = False
+
+        close_curl = True
+        with self._lock:
+            if reusable and not self._closed and len(self._idle) < self.maxsize:
+                self._idle.append((now, created_at, curl))
+                close_curl = False
+
+        if close_curl:
+            with suppress(Exception):
+                curl.close()
+
+    def close_expired_connections(self):
+        with self._lock:
+            expired = self._discard_expired_locked()
+        self._close_curls(expired)
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+            idle = [curl for _, _, curl in self._idle]
+            self._idle.clear()
+        self._close_curls(idle)
+
+
+class _CurlHandle:
+    __slots__ = ("pool", "curl", "created_at", "_released")
+
+    def __init__(self, pool, curl, created_at):
+        self.pool = pool
+        self.curl = curl
+        self.created_at = created_at
+        self._released = False
+
+    def release(self, reusable=True):
+        if self._released:
+            return
+        self._released = True
+        curl, self.curl = self.curl, None
+        self.pool.release(curl, created_at=self.created_at, reusable=reusable)
+
+    def discard(self):
+        self.release(reusable=False)
+
+
 class CurlResponse:
     """Small response adapter for tider.Response.from_origin_resp.
 
-    This adapter intentionally keeps only the data required by Tider after a
-    completed Curl transfer.  The Curl handle can be closed immediately after
-    parsing, so the downloader does not keep a Session or a long-lived Curl
-    object across Tider thread/greenlet workers.
+    This adapter intentionally keeps only the metadata required by Tider after
+    a Curl transfer.  Non-stream response bytes are attached directly to
+    ``Response._content`` so the raw adapter does not duplicate the body.
     """
 
-    def __init__(self, curl, body_buffer, header_buffer):
+    def __init__(self, curl, header_buffer):
         self.curl = curl
         self.url = _decode_info(curl.getinfo(CurlInfo.EFFECTIVE_URL)) or ""
-        self.content = body_buffer.getvalue() if body_buffer is not None else b""
+        self.content = None
         self.status_code = int(curl.getinfo(CurlInfo.RESPONSE_CODE))
         self.status = self.status_code
         self.http_version = int(curl.getinfo(CurlInfo.HTTP_VERSION))
@@ -109,10 +512,12 @@ class CurlResponse:
                 continue
             header_list.append(header_line)
 
-        return Headers(header_list), reason
+        return CurlHeaders(header_list), reason
 
     def stream(self, chunk_size=None, **_):
         """Iterate buffered response content as bytes."""
+        if self.content is None:
+            return
         if chunk_size is not None and chunk_size <= 0:
             chunk_size = None
         if not chunk_size:
@@ -122,22 +527,26 @@ class CurlResponse:
             yield self.content[start:start + chunk_size]
 
     def close(self):
-        curl, self.curl = self.curl, None
-        if curl is not None:
-            with suppress(Exception):
-                curl.close()
+        self.curl = None
+        self.content = None
 
 
 class StreamingCurlResponse(CurlResponse):
     """CurlResponse variant backed by curl_cffi's streaming write callback."""
 
-    def __init__(self, curl, header_buffer, queue_, task, quit_now, wait_task, queue_get):
-        super().__init__(curl, body_buffer=None, header_buffer=header_buffer)
+    def __init__(
+        self, curl, header_buffer, queue_, task, quit_now, wait_task, queue_get,
+        on_complete=None, on_error=None,
+    ):
+        super().__init__(curl, header_buffer=header_buffer)
+        self.header_buffer = header_buffer
         self.queue = queue_
         self.task = task
         self.quit_now = quit_now
         self._wait_task = wait_task
         self._queue_get = queue_get
+        self._on_complete = on_complete
+        self._on_error = on_error
         self._closed = False
 
     def stream(self, chunk_size=None, **_):
@@ -149,9 +558,15 @@ class StreamingCurlResponse(CurlResponse):
         while True:
             chunk = self._queue_get(self.queue)
             if chunk is _STREAM_END:
+                if self._on_complete is not None:
+                    with suppress(Exception):
+                        self._on_complete()
                 self.close()
                 return
             if isinstance(chunk, Exception):
+                if self._on_error is not None:
+                    with suppress(Exception):
+                        self._on_error(chunk)
                 self.close()
                 raise chunk
             yield chunk
@@ -163,10 +578,26 @@ class StreamingCurlResponse(CurlResponse):
         if self.quit_now is not None:
             with suppress(Exception):
                 self.quit_now.set()
+        _drain_stream_queue(self.queue)
         if self.task is not None:
             with suppress(Exception):
                 self._wait_task(self.task)
             self.task = None
+        curl, self.curl = self.curl, None
+        if curl is not None:
+            with suppress(Exception):
+                curl.close()
+        _drain_stream_queue(self.queue)
+        if self.header_buffer is not None:
+            with suppress(Exception):
+                self.header_buffer.close()
+        self.header_buffer = None
+        self.queue = None
+        self.quit_now = None
+        self._wait_task = None
+        self._queue_get = None
+        self._on_complete = None
+        self._on_error = None
         super().close()
 
 
@@ -178,8 +609,16 @@ class ImpersonateDownloader:
     def __init__(self, concurrency=None):
         self._thread = None
         self._concurrency = concurrency
+        self._pool_maxsize = max(1, int(concurrency or 10))
+        self._idle_ttl = 60
+        self._curl_max_lifetime = 600
+        self._max_connects = 1
+        self._gevent_worker_max_lifetime = 600
         self._executor = None
         self._gevent_threadpool = None
+        self._gevent_threadpool_created_at = None
+        self._retired_gevent_threadpools = []
+        self._gevent_threadpool_lock = threading.RLock()
         self._proxy_failures = weakref.WeakKeyDictionary()
         self._proxy_failures_lock = threading.RLock()
         try:
@@ -193,6 +632,14 @@ class ImpersonateDownloader:
                     self._thread = "eventlet"
             except ImportError:
                 pass
+        self.curl_pool = CurlPool(
+            maxsize=self._pool_maxsize,
+            idle_ttl=self._idle_ttl,
+            max_lifetime=self._curl_max_lifetime,
+            max_connects=self._max_connects,
+        )
+        if self._thread is None:
+            self._executor = ThreadPoolExecutor(max_workers=self._threadpool_size)
         if self._thread:
             logger.warning(
                 "Using greenlet with ImpersonateDownloader will run Curl.perform "
@@ -206,31 +653,64 @@ class ImpersonateDownloader:
         return cls(crawler.concurrency)
 
     def close_expired_connections(self):
-        pass
+        if self.curl_pool is not None:
+            self.curl_pool.close_expired_connections()
+        self._reap_retired_gevent_threadpools()
 
     @property
     def _threadpool_size(self):
         return max(1, int(self._concurrency or 10))
 
-    @property
-    def executor(self):
-        if self._executor is None:
-            self._executor = ThreadPoolExecutor(max_workers=self._threadpool_size)
-        return self._executor
+    def _new_gevent_threadpool(self):
+        import gevent
+        from gevent.threadpool import ThreadPool
+        return ThreadPool(
+            self._threadpool_size,
+            hub=gevent.get_hub(),
+            idle_task_timeout=self._idle_ttl,
+        )
 
-    @property
-    def gevent_threadpool(self):
-        if self._gevent_threadpool is None:
-            import gevent
-            from gevent.threadpool import ThreadPool
-            self._gevent_threadpool = ThreadPool(self._threadpool_size, hub=gevent.get_hub())
-        return self._gevent_threadpool
+    def _spawn_gevent(self, func):
+        now = preferred_clock()
+        with self._gevent_threadpool_lock:
+            pool = self._gevent_threadpool
+            if pool is None:
+                pool = self._gevent_threadpool = self._new_gevent_threadpool()
+                self._gevent_threadpool_created_at = now
+            elif (
+                self._gevent_worker_max_lifetime
+                and not self._retired_gevent_threadpools
+                and now - self._gevent_threadpool_created_at
+                >= self._gevent_worker_max_lifetime
+            ):
+                # Stop assigning work to this generation. Existing native
+                # tasks drain before the maintenance path kills its workers.
+                self._retired_gevent_threadpools.append(pool)
+                pool = self._gevent_threadpool = self._new_gevent_threadpool()
+                self._gevent_threadpool_created_at = now
+            return pool.spawn(func)
+
+    def _reap_retired_gevent_threadpools(self):
+        pools_to_kill = []
+        with self._gevent_threadpool_lock:
+            retained = []
+            for pool in self._retired_gevent_threadpools:
+                if len(pool):
+                    retained.append(pool)
+                else:
+                    pools_to_kill.append(pool)
+            self._retired_gevent_threadpools = retained
+        for pool in pools_to_kill:
+            with suppress(Exception):
+                pool.kill()
 
     @staticmethod
     def _safe_perform(curl):
         try:
             return curl.perform()
         except BaseException as e:
+            # Do not retain native worker frames through a failed Response.
+            e.__traceback__ = None
             return e
 
     @staticmethod
@@ -244,7 +724,7 @@ class ImpersonateDownloader:
             import eventlet.tpool
             result = eventlet.tpool.execute(self._safe_perform, curl)
         elif self._thread == "gevent":
-            result = self.gevent_threadpool.spawn(self._safe_perform, curl).get()
+            result = self._spawn_gevent(lambda: self._safe_perform(curl)).get()
         else:
             result = self._safe_perform(curl)
         return self._raise_if_failed(result)
@@ -255,8 +735,8 @@ class ImpersonateDownloader:
             import eventlet.tpool
             return eventlet.spawn(lambda: eventlet.tpool.execute(func))
         if self._thread == "gevent":
-            return self.gevent_threadpool.spawn(func)
-        return self.executor.submit(func)
+            return self._spawn_gevent(func)
+        return self._executor.submit(func)
 
     def _wait_stream_task(self, task):
         if self._thread == "eventlet":
@@ -284,14 +764,14 @@ class ImpersonateDownloader:
             while True:
                 try:
                     return queue_.get_nowait()
-                except queue.Empty:
+                except _queue.Empty:
                     eventlet.sleep(0.001)
         if self._thread == "gevent":
             import gevent
             while True:
                 try:
                     return queue_.get_nowait()
-                except queue.Empty:
+                except _queue.Empty:
                     gevent.sleep(0.001)
         return queue_.get()
 
@@ -303,8 +783,11 @@ class ImpersonateDownloader:
             return
         with self._proxy_failures_lock:
             failures = self._proxy_failures.get(proxy)
-            if failures:
-                failures.pop(selected_proxy, None)
+            if failures is None:
+                return
+            failures.pop(selected_proxy, None)
+            if not failures:
+                self._proxy_failures.pop(proxy, None)
 
     def _record_soft_proxy_failure(self, request, selected_proxy):
         proxy = getattr(request, "proxy", None)
@@ -329,15 +812,10 @@ class ImpersonateDownloader:
             return failures >= 3
         return False
 
-    @staticmethod
-    def _peek_queue(queue_, default=None):
-        with getattr(queue_, "mutex", suppress()):
-            try:
-                return queue_.queue[0]
-            except (AttributeError, IndexError):
-                return default
-
-    def _build_response(self, request, curl, body_buffer, header_buffer, queue_=None, task=None, quit_now=None):
+    def _build_response(
+        self, request, curl, body_buffer, header_buffer, queue_=None, task=None,
+        quit_now=None, on_complete=None, on_error=None,
+    ):
         if request.stream:
             raw = StreamingCurlResponse(
                 curl=curl,
@@ -347,14 +825,32 @@ class ImpersonateDownloader:
                 quit_now=quit_now,
                 wait_task=self._wait_stream_task,
                 queue_get=self._stream_queue_get,
+                on_complete=on_complete,
+                on_error=on_error,
             )
+            response = Response.from_origin_resp(resp=raw, request=request)
         else:
-            raw = CurlResponse(curl, body_buffer, header_buffer)
+            raw = CurlResponse(curl, header_buffer)
+            if header_buffer is not None:
+                with suppress(Exception):
+                    header_buffer.close()
+            response = Response.from_origin_resp(resp=raw, request=request)
+            response._content = body_buffer.getvalue() if body_buffer is not None else b""
+            response._content_consumed = True
+            if body_buffer is not None:
+                with suppress(Exception):
+                    body_buffer.close()
             raw.close()
 
-        response = Response.from_origin_resp(resp=raw, request=request)
-        if not request.stream:
-            response.read()
+        response.url = raw.url or response.url
+        return response
+
+    @staticmethod
+    def _failed_response(request, error, start):
+        error.__traceback__ = None
+        response = Response(request)
+        response.fail(error=error)
+        response.elapsed = preferred_clock() - start
         return response
 
     def download_request(self, request: Request, trust_env=True):
@@ -363,21 +859,34 @@ class ImpersonateDownloader:
                 "You need to install the curl_cffi library to use impersonate downloader."
             )
 
-        curl = None
+        curl = curl_handle = None
+        body_buffer = header_buffer = None
+        queue_ = quit_now = task = None
         selected_proxy = None
+        start = preferred_clock()
         try:
-            curl = Curl()
             http_version = CurlHttpVersion.NONE if not request.http2 else CurlHttpVersion.V2_0
             impersonate = request.impersonate if isinstance(request.impersonate, str) else "chrome"
 
             headers = request.prepared.headers.copy()
             headers.pop("Content-Length", None)
+            headers.pop("Cookie", None)
+            headers.pop("Accept-Encoding", None)
+            # Let curl_cffi manage hop-by-hop headers for the impersonated protocol.
+            headers.pop("Connection", None)
 
             selected_proxy = request.selected_proxy
+            reuse_curl = not request.stream and not selected_proxy
+            if reuse_curl:
+                curl_handle = self.curl_pool.acquire()
+                curl = curl_handle.curl
+            else:
+                curl = self.curl_pool.new_curl()
             body = b"" if request.body is None else request.body
+            if not request.stream:
+                body_buffer = _BodyBuffer()
 
-            start = preferred_clock()
-            _, body_buffer, header_buffer, queue_, header_recved, quit_now = set_curl_options(
+            _, _, header_buffer, queue_, header_recved, quit_now = set_curl_options(
                 curl,
                 method=request.method,
                 url=request.url,
@@ -402,11 +911,16 @@ class ImpersonateDownloader:
                 interface=request.meta.get("impersonate_interface"),
                 cert=request.cert,
                 stream=request.stream,
+                content_callback=body_buffer.write if body_buffer is not None else None,
                 max_recv_speed=request.meta.get("impersonate_max_recv_speed", 0),
                 curl_options=request.meta.get("impersonate_curl_options"),
-                queue_class=queue.Queue,
-                event_class=threading.Event,
+                queue_class=_StreamQueue,
+                event_class=_ThreadEvent,
             )
+            if body_buffer is not None:
+                body_buffer.bind_headers(header_buffer)
+            if queue_ is not None:
+                queue_.quit_now = quit_now
 
             # Tider has already resolved/merged environment proxies before
             # entering the downloader.  Force libcurl not to discover env
@@ -415,34 +929,35 @@ class ImpersonateDownloader:
                 curl.setopt(CurlOpt.PROXY, "")
 
             if request.stream:
-                def perform():
+                stream_errors = []
+
+                def perform(curl=curl, queue_=queue_, header_recved=header_recved):
                     try:
                         curl.perform()
                     except Exception as e:
+                        e.__traceback__ = None
+                        stream_errors.append(e)
                         queue_.put_nowait(e)
                     finally:
                         if not header_recved.is_set():
                             header_recved.set()
-                        queue_.put(_STREAM_END)
+                        queue_.put_nowait(_STREAM_END)
 
                 task = self._spawn_stream_perform(perform)
                 self._wait_stream_event(header_recved)
 
-                first_element = self._peek_queue(queue_)
-                if isinstance(first_element, Exception):
-                    if quit_now is not None:
-                        with suppress(Exception):
-                            quit_now.set()
-                    with suppress(Exception):
-                        self._wait_stream_task(task)
-                    curl.close()
-                    curl = None
-                    response = Response(request)
-                    if self._should_invalidate_proxy(request, selected_proxy, first_element):
+                first_error = stream_errors[0] if stream_errors else None
+                if first_error is not None:
+                    if self._should_invalidate_proxy(request, selected_proxy, first_error):
                         request.invalidate_proxy()
-                    response.fail(error=first_element)
-                    response.elapsed = preferred_clock() - start
-                    return response
+                    return self._failed_response(request, first_error, start)
+
+                def on_complete(request=request, selected_proxy=selected_proxy):
+                    self._reset_proxy_failures(request, selected_proxy)
+
+                def on_error(error, request=request, selected_proxy=selected_proxy):
+                    if self._should_invalidate_proxy(request, selected_proxy, error):
+                        request.invalidate_proxy()
 
                 response = self._build_response(
                     request=request,
@@ -452,31 +967,61 @@ class ImpersonateDownloader:
                     queue_=queue_,
                     task=task,
                     quit_now=quit_now,
+                    on_complete=on_complete,
+                    on_error=on_error,
                 )
+                curl = header_buffer = queue_ = quit_now = task = None
             else:
                 self._perform(curl)
                 response = self._build_response(request, curl, body_buffer, header_buffer)
+                body_buffer = header_buffer = None
+                if curl_handle is not None:
+                    curl_handle.release()
+                    curl_handle = None
+                else:
+                    curl.close()
+                curl = None
             response.elapsed = preferred_clock() - start
-            self._reset_proxy_failures(request, selected_proxy)
-            curl = None
+            if not request.stream:
+                self._reset_proxy_failures(request, selected_proxy)
             return response
-        except (CurlError, ProxyError) as e:
+        except Exception as e:
             if self._should_invalidate_proxy(request, selected_proxy, e):
                 request.invalidate_proxy()
-            response = Response(request)
-            if not response.failed:
-                response.fail(error=e)
-            return response
+            return self._failed_response(request, e, start)
         finally:
-            if curl is not None:
+            if task is not None:
+                if quit_now is not None:
+                    with suppress(Exception):
+                        quit_now.set()
+                _drain_stream_queue(queue_)
+                with suppress(Exception):
+                    self._wait_stream_task(task)
+                _drain_stream_queue(queue_)
+            if curl_handle is not None:
+                curl_handle.discard()
+            elif curl is not None:
                 with suppress(Exception):
                     curl.close()
+            for buffer in (body_buffer, header_buffer):
+                if buffer is not None:
+                    with suppress(Exception):
+                        buffer.close()
 
     def close(self):
+        if self.curl_pool is not None:
+            self.curl_pool.close()
+            self.curl_pool = None
         if self._executor is not None:
             self._executor.shutdown(wait=False, cancel_futures=True)
             self._executor = None
-        if self._gevent_threadpool is not None:
-            with suppress(Exception):
-                self._gevent_threadpool.kill()
+        with self._gevent_threadpool_lock:
+            gevent_threadpools = list(self._retired_gevent_threadpools)
+            self._retired_gevent_threadpools.clear()
+            if self._gevent_threadpool is not None:
+                gevent_threadpools.append(self._gevent_threadpool)
             self._gevent_threadpool = None
+            self._gevent_threadpool_created_at = None
+        for pool in gevent_threadpools:
+            with suppress(Exception):
+                pool.kill()

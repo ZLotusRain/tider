@@ -143,9 +143,6 @@ def _get_engine_info(state):
         'len(crawler.engine.explorer.transferring)': len(state.crawler.engine.explorer.transferring),
         'len(crawler.engine.parser.parsing)': len(state.crawler.engine.parser.parsing),
     }
-    if state.crawler.engine.explorer.session._downloaders.get('default'):
-        proxy_manager = state.crawler.engine.explorer.session._downloaders["default"].proxy_manager
-        result.update({'len(crawler.engine.explorer.session._downloaders["default"].proxy_manager)': len(proxy_manager)})
     return result
 
 

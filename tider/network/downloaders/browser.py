@@ -26,6 +26,17 @@ __all__ = ('PlaywrightDownloader',)
 
 logger = get_logger(__name__)
 
+
+def _call_playwright_cleanup(callback, *args, **kwargs):
+    """Run one best-effort Playwright cleanup operation."""
+    try:
+        callback(*args, **kwargs)
+    except PlaywrightError:
+        # A closed page/browser is expected after navigation or a crashed
+        # browser process. Never let it prevent cleanup of later owners.
+        pass
+
+
 HACKED_CREATE_ELEMENT = """
     // window.elementsCreatedByVue = [];
     window.elementsCreatedByDOM = [];
@@ -247,11 +258,12 @@ class BrowserResponse:
 
     def __init__(self, encoding: str = 'utf-8', http_version: str = 'HTTP/1.1',
                  status_code=None, headers=None, cookies=None, reason=None, async_contents=None,
-                 pending_requests=None, browser=None, context=None, page=None):
+                 pending_requests=None, browser=None, context=None, page=None, playwright_context=None):
         self._encoding = encoding
         self.page = page
         self.context = context
         self.browser = browser
+        self.playwright_context = playwright_context
         self.reason = reason
         self.status_code = status_code
         self.http_version = http_version
@@ -309,6 +321,8 @@ class BrowserResponse:
 
     @property
     def content(self):
+        if self.page is None:
+            return self._content
         try:
             return self._get_page_content()
         except PlaywrightError:
@@ -323,13 +337,21 @@ class BrowserResponse:
         yield self.content.encode(encoding=self._encoding)
 
     def close(self):
-        try:
-            if self.page is not None:
-                self.page.unroute_all(behavior='ignoreErrors')
-            if self.browser is not None:
-                self.browser.close()
-        except PlaywrightError:
-            pass
+        # Detach first so close() is idempotent and does not retain browser
+        # process objects after their owning Tider Response has been closed.
+        page, self.page = self.page, None
+        context, self.context = self.context, None
+        browser, self.browser = self.browser, None
+        playwright_context, self.playwright_context = self.playwright_context, None
+
+        if page is not None:
+            _call_playwright_cleanup(page.unroute_all, behavior='ignoreErrors')
+        if context is not None:
+            _call_playwright_cleanup(context.close)
+        if browser is not None:
+            _call_playwright_cleanup(browser.close)
+        if playwright_context is not None:
+            _call_playwright_cleanup(playwright_context.__exit__)
 
 
 class BrowserDownloader:
@@ -549,7 +571,8 @@ class PlaywrightDownloader(BrowserDownloader):
         banned_routes = request.meta.get('browser_banned_routes', ['media'])
         keep_alive = request.meta.get('browser_keep_alive', False)
 
-        playwright_context = browser = page = None
+        playwright_context = browser = context = page = None
+        selected_proxy = None
         hooked = defaultdict(list)
         async_contents = []
         pending_requests = []
@@ -560,8 +583,9 @@ class PlaywrightDownloader(BrowserDownloader):
                 playwright = playwright_context.start()
 
             context_config = {'ignore_https_errors': True}
-            if request.selected_proxy:
-                context_config.update(proxy={'server': request.selected_proxy})
+            selected_proxy = request.selected_proxy
+            if selected_proxy:
+                context_config.update(proxy={'server': selected_proxy})
             if request.headers.get('User-Agent'):
                 context_config.update(user_agent=request.headers['User-Agent'])
             if device:
@@ -661,7 +685,8 @@ class PlaywrightDownloader(BrowserDownloader):
             cookies = {cookie['name']: cookie['value'] for cookie in context_cookies}
             resp = BrowserResponse(
                 headers=response_headers, status_code=status_code, cookies=cookies, reason=reason,
-                async_contents=async_contents, pending_requests=pending_requests, browser=browser, context=context, page=page
+                async_contents=async_contents, pending_requests=pending_requests,
+                browser=browser, context=context, page=page, playwright_context=playwright_context if keep_alive else None,
             )
             screenshot_path = request.meta.get('browser_screenshot_path')
             if screenshot_path:
@@ -682,9 +707,12 @@ class PlaywrightDownloader(BrowserDownloader):
             return response
         except Exception as e:
             keep_alive = False
-            if 'ERR_TUNNEL_CONNECTION_FAILED' in str(e):
-                request.invalidate_proxy()
-            if 'ERR_INVALID_AUTH_CREDENTIALS' in str(e):
+            error = str(e)
+            if selected_proxy and (
+                'ERR_PROXY_' in error
+                or 'ERR_TUNNEL_CONNECTION_FAILED' in error
+                or 'ERR_INVALID_AUTH_CREDENTIALS' in error
+            ):
                 request.invalidate_proxy()
             response = Response(request)
             if not response.failed:  # maybe already failed in response.read().
@@ -692,16 +720,18 @@ class PlaywrightDownloader(BrowserDownloader):
             return response
         finally:
             if not keep_alive:
-                try:
-                    if page is not None:
-                        page.unroute_all(behavior='ignoreErrors')
-                except PlaywrightError:
-                    pass
-                browser and browser.close()
-                playwright_context and playwright_context.__exit__()
+                if page is not None:
+                    _call_playwright_cleanup(page.unroute_all, behavior='ignoreErrors')
+                if context is not None:
+                    _call_playwright_cleanup(context.close)
+                if browser is not None:
+                    _call_playwright_cleanup(browser.close)
+                if playwright_context is not None:
+                    _call_playwright_cleanup(playwright_context.__exit__)
             hooked.clear()  # release frames.
 
     def close(self):
-        if self._playwright_context:
-            self._playwright_context.__exit__()
-
+        playwright_context, self._playwright_context = self._playwright_context, None
+        self._playwright = None
+        if playwright_context is not None:
+            _call_playwright_cleanup(playwright_context.__exit__)

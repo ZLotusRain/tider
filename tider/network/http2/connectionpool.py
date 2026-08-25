@@ -18,9 +18,14 @@ from .models import (
 )
 from .stream import SOCKET_OPTION
 from .context import create_ssl_context
-from .connection import HTTP2Connection, TunnelHTTPConnection, ConnectionNotAvailable
+from .connection import (
+    HTTP2Connection,
+    SOCKSHTTP2Connection,
+    TunnelHTTPConnection,
+    ConnectionNotAvailable,
+)
 
-__all__ = ("HTTP2ConnectionPool", "HTTPProxy", "is_same_host")
+__all__ = ("HTTP2ConnectionPool", "SOCKSHTTP2ConnectionPool", "HTTPProxy", "is_same_host")
 
 _Default = Timeout(connect=5.0, read=5.0)
 
@@ -122,6 +127,7 @@ class HTTP2ConnectionPool:
         max_keepalive_connections: Optional[int] = None,
         keepalive_expiry: Optional[float] = None,
         retries: int = 0,
+        source_address=None,
         socket_options: Optional[Iterable[SOCKET_OPTION]] = None,
         **_,
     ) -> None:
@@ -138,6 +144,8 @@ class HTTP2ConnectionPool:
                 may be maintained for before being expired from the pool.
             retries: The maximum number of retries when trying to establish a
                 connection.
+            source_address: Local address used for TCP connections. May be a
+                hostname or a ``(host, port)`` tuple.
             socket_options: Socket options that have to be included
              in the TCP socket when the connection was established.
         """
@@ -159,6 +167,7 @@ class HTTP2ConnectionPool:
         self._keepalive_expiry = keepalive_expiry
         self.retries = retries
 
+        self._source_address = source_address
         self._socket_options = socket_options
 
         # The mutable state on a connection pool is the queue of incoming requests,
@@ -177,6 +186,7 @@ class HTTP2ConnectionPool:
             ssl_context=self._ssl_context,
             keepalive_expiry=self._keepalive_expiry,
             retries=self.retries,
+            local_address=self._source_address,
             socket_options=self._socket_options,
         )
 
@@ -241,16 +251,25 @@ class HTTP2ConnectionPool:
 
         # Return the response. Note that in this case we still have to manage
         # the point at which the response is closed.
-        return HTTP2Response(
-            status=response.status,
-            headers=response.headers,
-            body=PoolByteStream(stream=response.stream, pool_request=pool_request, pool=self),
-            version="HTTP/2",
-            request_url=url.url,
-            request_method=method,
-            preload_content=preload_content,
-            **response_kw
-        )
+        # HTTP2Response may consume its body during construction when
+        # ``preload_content`` is enabled.  If that read fails, make sure the
+        # request is removed from the pool just as it would be for a response
+        # returned to the caller and then closed.
+        response_stream = PoolByteStream(stream=response.stream, pool_request=pool_request, pool=self)
+        try:
+            return HTTP2Response(
+                status=response.status,
+                headers=response.headers,
+                body=response_stream,
+                version="HTTP/2",
+                request_url=url.url,
+                request_method=method,
+                preload_content=preload_content,
+                **response_kw
+            )
+        except BaseException:
+            response_stream.close()
+            raise
 
     def _assign_requests_to_connections(self):
         """
@@ -276,7 +295,7 @@ class HTTP2ConnectionPool:
                 closing_connections.append(connection)
             elif (
                 connection.is_idle()
-                and len([connection.is_idle() for connection in self._connections])
+                and sum(connection.is_idle() for connection in self._connections)
                 > self._max_keepalive_connections
             ):
                 # log: "closing idle connection"
@@ -328,6 +347,16 @@ class HTTP2ConnectionPool:
         for connection in closing:
             connection.close()
 
+    def close_expired_connections(self) -> None:
+        with self._optional_thread_lock:
+            closing = []
+            for connection in list(self._connections):
+                if connection.is_closed() or connection.has_expired():
+                    self._connections.remove(connection)
+                    if not connection.is_closed():
+                        closing.append(connection)
+        self._close_connections(closing)
+
     def close(self) -> None:
         # Explicitly close the connection pool.
         # Clears all existing requests and connections.
@@ -370,6 +399,27 @@ class HTTP2ConnectionPool:
         return f"<{class_name} [{requests_info} | {connection_info}]>"
 
 
+class SOCKSHTTP2ConnectionPool(HTTP2ConnectionPool):
+    """An HTTP/2 connection pool that establishes each TCP connection via SOCKS."""
+
+    def __init__(self, *args, _socks_options=None, **kwargs):
+        if _socks_options is None:
+            raise ValueError("SOCKSHTTP2ConnectionPool requires _socks_options")
+        self._socks_options = _socks_options
+        super().__init__(*args, **kwargs)
+
+    def create_connection(self, origin: Origin):
+        return SOCKSHTTP2Connection(
+            origin=origin,
+            socks_options=self._socks_options,
+            ssl_context=self._ssl_context,
+            keepalive_expiry=self._keepalive_expiry,
+            retries=self.retries,
+            local_address=self._source_address,
+            socket_options=self._socket_options,
+        )
+
+
 class PoolByteStream:
     def __init__(
         self,
@@ -391,10 +441,24 @@ class PoolByteStream:
             raise exc from None
 
     def read(self, amt=None):
-        return self._stream.read(amt)
+        try:
+            data = self._stream.read(amt)
+        except BaseException:
+            self.close()
+            raise
+        if getattr(self._stream, "_stream_consumed", False):
+            self.close()
+        return data
 
     def read1(self, amt=None):
-        return self._stream.read1(amt)
+        try:
+            data = self._stream.read1(amt)
+        except BaseException:
+            self.close()
+            raise
+        if getattr(self._stream, "_stream_consumed", False):
+            self.close()
+        return data
 
     def close(self) -> None:
         if not self._closed:
@@ -436,6 +500,7 @@ class HTTPProxy(HTTP2ConnectionPool):
         max_keepalive_connections: Optional[int] = None,
         keepalive_expiry: Optional[float] = None,
         retries: int = 0,
+        source_address=None,
         socket_options: Optional[Iterable[SOCKET_OPTION]] = None,
         **_,
     ) -> None:
@@ -459,6 +524,8 @@ class HTTPProxy(HTTP2ConnectionPool):
                 may be maintained for before being expired from the pool.
             retries: The maximum number of retries when trying to establish
                 a connection.
+            source_address: Local address used for TCP connections. May be a
+                hostname or a ``(host, port)`` tuple.
         """
         super().__init__(
             verify=verify,
@@ -468,6 +535,7 @@ class HTTPProxy(HTTP2ConnectionPool):
             max_keepalive_connections=max_keepalive_connections,
             keepalive_expiry=keepalive_expiry,
             retries=retries,
+            source_address=source_address,
             socket_options=socket_options,
         )
 
@@ -499,4 +567,6 @@ class HTTPProxy(HTTP2ConnectionPool):
             ssl_context=self._ssl_context,
             proxy_ssl_context=self._proxy_ssl_context,
             keepalive_expiry=self._keepalive_expiry,
+            local_address=self._source_address,
+            socket_options=self._socket_options,
         )

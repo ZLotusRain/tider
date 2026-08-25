@@ -4,8 +4,9 @@ import logging
 import urllib3
 import weakref
 from base64 import b64encode
+from threading import RLock
 from typing import Dict, Any
-from urllib.parse import ParseResult, urlparse, urljoin
+from urllib.parse import ParseResult, urlparse
 
 from urllib3.exceptions import ClosedPoolError, ConnectTimeoutError
 from urllib3.exceptions import HTTPError as _HTTPError
@@ -27,7 +28,6 @@ from requests.utils import (
     extract_zipped_paths,
     get_environ_proxies,
     get_netrc_auth,
-    requote_uri,
     rewind_body,
     should_bypass_proxies,
     urldefragauth,
@@ -35,6 +35,7 @@ from requests.utils import (
 from requests.cookies import merge_cookies
 
 from tider import Request
+from tider.local import try_import
 from tider.network import Response, Proxy
 from tider.network.request import PreparedRequest
 from tider.network.poolmanager import PoolManager, SOCKSProxyManager, proxy_from_url
@@ -53,9 +54,8 @@ from tider.exceptions import (
     TooManyRedirects,
 )
 from tider.utils.time import preferred_clock
-from tider.utils.text import enforce_str
-from tider.utils.network import copy_cookie_jar, extract_cookies_to_jar
-from tider.utils.url import get_auth_from_url
+from tider.utils.cookies import copy_cookie_jar, extract_cookies_to_jar
+from tider.utils.url import get_auth_from_url, resolve_redirect_url
 
 urllib3.disable_warnings()
 logging.getLogger('urllib3').setLevel(logging.ERROR)
@@ -68,7 +68,9 @@ DEFAULT_POOLSIZE = 10
 DEFAULT_RETRIES = 0
 DEFAULT_POOL_TIMEOUT = None
 
-URLLIB3_SUPPORTS_HTTPS = tuple(urllib3.__version__.split('.')) > ('1', '26')
+_socks = try_import('socks')
+
+URLLIB3_SUPPORTS_HTTPS = tuple(map(int, urllib3.__version__.split('.')[:2])) >= (1, 26)
 
 try:
     import ssl
@@ -107,6 +109,14 @@ def _is_https_redirect(url: ParseResult, location: ParseResult):
         and location.scheme == "https"
         and _port_or_default(location) == 443
     )
+
+
+def _is_socks_proxy_endpoint_error(error):
+    if _socks is None:
+        return False
+    # Only endpoint connect/auth failures prove the SOCKS proxy is unusable.
+    cause = error.__cause__ or error.__context__
+    return isinstance(cause, (_socks.ProxyConnectionError, _socks.SOCKS5AuthError))
 
 
 def _basic_auth_str(username, password):
@@ -179,39 +189,7 @@ class RedirectMixin:
         return method
 
     def _redirect_url(self, url, location, http2=False):
-        if not http2:
-            # Currently the underlying http module on py3 decode headers
-            # in latin1, but empirical evidence suggests that latin1 is very
-            # rarely used with non-ASCII characters in HTTP headers.
-            # It is more likely to get UTF8 header rather than latin1.
-            # This causes incorrect handling of UTF8 encoded location headers.
-            # To solve this, we re-encode the location in latin1.
-            location = location.encode("latin1").decode('utf8')
-
-        # Handle redirection without scheme (see: RFC 1808 Section 4)
-        parsed_old_url = urlparse(url)
-        if location.startswith("//"):
-            location = ":".join([enforce_str(parsed_old_url.scheme), location])
-
-        previous_fragment = parsed_old_url.fragment
-        parsed_location = urlparse(location)
-        if parsed_location.fragment == "" and previous_fragment:
-            parsed_location = parsed_location._replace(fragment=previous_fragment)
-        if parsed_location.scheme and not parsed_location.hostname:
-            # https://github.com/encode/httpx/issues/771
-            parsed_location = parsed_location._replace(netloc=parsed_old_url.hostname + parsed_location.netloc)
-
-        location = parsed_location.geturl()
-
-        # Facilitate relative 'location' headers, as allowed by RFC 7231.
-        # (e.g. '/path/to/resource' instead of 'http://domain.tld/path/to/resource')
-        # Compliant with RFC3986, we percent encode the url.
-        if not parsed_location.netloc:
-            location = urljoin(url, requote_uri(location))
-        else:
-            location = requote_uri(location)
-
-        return enforce_str(location)
+        return resolve_redirect_url(url, location, http2=http2)
 
     def _redirect_headers_and_body(self, prepared, location, new_method, status):
         headers = prepared.headers.copy()
@@ -342,6 +320,48 @@ class RedirectMixin:
         return raw
 
 
+class _ProxyManagerOwners:
+
+    def __init__(self, manager):
+        self.manager = manager
+        self.refs = set()
+        self.closed = False
+        self.lock = RLock()
+
+    def add(self, proxy_ref):
+        with self.lock:
+            if self.closed:
+                return None
+            if proxy_ref in self.refs:
+                return False
+            self.refs.add(proxy_ref)
+            return True
+
+    def discard(self, proxy_ref):
+        with self.lock:
+            if self.closed:
+                return None
+            self.refs.discard(proxy_ref)
+            if self.refs:
+                return None
+            self.closed = True
+            manager, self.manager = self.manager, None
+            return manager
+
+    def snapshot(self):
+        with self.lock:
+            return tuple(self.refs)
+
+    def close(self):
+        with self.lock:
+            if self.closed:
+                return None
+            self.closed = True
+            self.refs.clear()
+            manager, self.manager = self.manager, None
+            return manager
+
+
 class HTTPDownloader(RedirectMixin):
 
     lazy = True
@@ -362,7 +382,13 @@ class HTTPDownloader(RedirectMixin):
             self.max_retries = Retry(0, read=False)
         else:
             self.max_retries = Retry.from_int(max_retries)
-        self.proxy_manager = {}
+        # A urllib3 manager is shared by every Proxy that resolves to the same
+        # proxy URL. `_proxy_managers` maps that URL to its manager, while
+        # `_proxy_owners` tracks the live Proxy owners so a manager is cleared
+        # only after its last owner is collected.
+        self._proxy_managers = {}
+        self._proxy_owners = {}
+        self._proxy_manager_lock = RLock()
 
         self._pool_connections = pool_connections
         self._pool_maxsize = pool_maxsize
@@ -391,16 +417,36 @@ class HTTPDownloader(RedirectMixin):
         :returns: ProxyManager
         :rtype: urllib3.ProxyManager
         """
-        if URLLIB3_SUPPORTS_HTTPS and selected_proxy.startswith('http'):
-            selected_proxy = selected_proxy.replace('https', 'http')
-        for key in self.proxy_manager:
-            if selected_proxy == key[1]:
-                manager = self.proxy_manager[key]
-                return manager
+        # urllib3 releases before 1.26 cannot establish TLS to an HTTPS
+        # proxy. Keep an explicit HTTPS proxy intact on supported releases.
+        if not URLLIB3_SUPPORTS_HTTPS and selected_proxy.lower().startswith('https://'):
+            selected_proxy = 'http://' + selected_proxy[len('https://'):]
 
+        with self._proxy_manager_lock:
+            manager = self._proxy_managers.get(selected_proxy)
+            owners = self._proxy_owners.get(selected_proxy)
+            proxy_ref = proxy.weak()
+            owner_added = owners.add(proxy_ref) if owners is not None else None
+            if manager is None or owner_added is None:
+                manager = self._build_proxy_manager(selected_proxy, **proxy_kwargs)
+                self._proxy_managers[selected_proxy] = manager
+                owners = _ProxyManagerOwners(manager)
+                self._proxy_owners[selected_proxy] = owners
+                owner_added = owners.add(proxy_ref)
+
+            # Track each Proxy as an owner of the shared manager so it survives
+            # until its last owner is collected. A fresh weakref compares equal
+            # to an existing one while the Proxy is alive, so re-registration is
+            # skipped and the finalizer fires exactly once per Proxy.
+            if owner_added:
+                weakref.finalize(proxy, self._on_proxy_collected, owners, proxy_ref)
+
+        return manager
+
+    def _build_proxy_manager(self, selected_proxy, **proxy_kwargs):
         username, password = get_auth_from_url(selected_proxy)
         if selected_proxy.lower().startswith("socks"):
-            manager = SOCKSProxyManager(
+            return SOCKSProxyManager(
                 selected_proxy,
                 username=username,
                 password=password,
@@ -409,29 +455,22 @@ class HTTPDownloader(RedirectMixin):
                 block=self._pool_block,
                 **proxy_kwargs,
             )
-        else:
-            # clear proxymanager once the proxy is finalized.
-            proxy_headers = {}
-            if username:
-                proxy_headers["Proxy-Authorization"] = _basic_auth_str(username, password)
-            manager = proxy_from_url(
-                selected_proxy,
-                proxy_headers=proxy_headers,
-                num_pools=self._pool_connections,
-                maxsize=self._pool_maxsize,
-                block=self._pool_block,
-                **proxy_kwargs,
-            )
-        proxy_key = (proxy.weak(), selected_proxy)
-        self.proxy_manager[proxy_key] = manager
-        weakref.finalize(proxy, self._on_proxy_collected, proxy_key=proxy_key)
-
-        return manager
+        proxy_headers = {}
+        if username:
+            proxy_headers["Proxy-Authorization"] = _basic_auth_str(username, password)
+        return proxy_from_url(
+            selected_proxy,
+            proxy_headers=proxy_headers,
+            num_pools=self._pool_connections,
+            maxsize=self._pool_maxsize,
+            block=self._pool_block,
+            **proxy_kwargs,
+        )
 
     def get_connection(self, url, proxy=None, http2=False, verify=False, cert=None):
         """Returns a urllib3 connection pool for the given URL."""
-        http2_pool_kwargs = {'http2': http2, 'verify': verify, 'cert': cert}
         selected_proxy = proxy.select_proxy(url)
+        http2_pool_kwargs = {'http2': http2, 'verify': verify, 'cert': cert}
         if selected_proxy:
             proxy_url = parse_url(selected_proxy)
             if not proxy_url.host:
@@ -460,27 +499,63 @@ class HTTPDownloader(RedirectMixin):
         which closes any pooled connections.
         """
         self.poolmanager.clear()
-        for proxy in self.proxy_manager.values():
-            proxy.clear()
+        with self._proxy_manager_lock:
+            owners = list(self._proxy_owners.values())
+            self._proxy_managers.clear()
+            self._proxy_owners.clear()
+        for owner_set in owners:
+            manager = owner_set.close()
+            if manager is not None:
+                manager.clear()
 
-    def _on_proxy_collected(self, proxy_key):
-        for key in list(iter(self.proxy_manager.keys())):
-            if key[1] == proxy_key[1]:
-                manager = self.proxy_manager.pop(key, None)
-                manager and manager.clear()
+    @staticmethod
+    def _on_proxy_collected(owners, proxy_ref):
+        # Do not acquire the downloader lock from a finalizer. The owner set
+        # selects the last owner, then manager.clear() runs outside both locks.
+        manager = owners.discard(proxy_ref)
+        if manager is not None:
+            manager.clear()
 
     def _clear_invalid_proxy(self):
-        proxy_keys = list(iter(self.proxy_manager.keys()))
-        for proxy_key in proxy_keys:
-            proxy_ref, proxy_str = proxy_key
-            proxy = proxy_ref()
-            if not proxy or not proxy.valid:
-                # maybe timeout.
-                manager = self.proxy_manager.pop(proxy_key, None)
-                manager and manager.clear()
-            else:
-                manager = self.proxy_manager.get(proxy_key)
-                manager and manager.close_expired_connections()
+        with self._proxy_manager_lock:
+            owner_snapshots = [
+                (selected_proxy, owners, owners.snapshot())
+                for selected_proxy, owners in self._proxy_owners.items()
+            ]
+
+        # Proxy.valid takes the Proxy lock. Do not nest it under either proxy
+        # manager lock; another native thread may be releasing the same owner.
+        invalid_owners = [
+            (selected_proxy, owners, tuple(ref for ref in owner_refs if not self._owner_is_valid(ref)))
+            for selected_proxy, owners, owner_refs in owner_snapshots
+        ]
+
+        managers_to_clear = []
+        for _, owners, invalid_refs in invalid_owners:
+            for proxy_ref in invalid_refs:
+                manager = owners.discard(proxy_ref)
+                if manager is not None:
+                    managers_to_clear.append(manager)
+
+        with self._proxy_manager_lock:
+            for selected_proxy, owners, _ in invalid_owners:
+                if owners.closed and self._proxy_owners.get(selected_proxy) is owners:
+                    self._proxy_owners.pop(selected_proxy, None)
+                    self._proxy_managers.pop(selected_proxy, None)
+            active_managers = [
+                self._proxy_managers[selected_proxy]
+                for selected_proxy, owners in self._proxy_owners.items()
+                if not owners.closed
+            ]
+        for manager in managers_to_clear:
+            manager.clear()
+        for manager in active_managers:
+            manager.close_expired_connections()
+
+    @staticmethod
+    def _owner_is_valid(proxy_ref):
+        proxy = proxy_ref()
+        return proxy is not None and not proxy.can_discard()
 
     def close_expired_connections(self):
         self._clear_invalid_proxy()
@@ -529,16 +604,18 @@ class HTTPDownloader(RedirectMixin):
         else:
             timeout = TimeoutSauce(connect=timeout, read=timeout)
 
-        response = None
+        resp = response = None
         try:
             # Start time (approximately) of the request
             start = preferred_clock()
-            resp = self.resolve_redirects(request.prepared,
-                                          allow_redirects=request.allow_redirects,
-                                          max_redirects=max_redirects,
-                                          http2=request.http2,
-                                          timeout=timeout, proxy=request.proxy,
-                                          verify=request.verify, cert=request.cert, trust_env=trust_env)
+            resp = self.resolve_redirects(
+                request.prepared,
+                allow_redirects=request.allow_redirects,
+                max_redirects=max_redirects,
+                http2=request.http2,
+                timeout=timeout, proxy=request.proxy,
+                verify=request.verify, cert=request.cert, trust_env=trust_env
+            )
             # Total elapsed time of the request (approximately)
             elapsed = preferred_clock() - start
 
@@ -550,6 +627,12 @@ class HTTPDownloader(RedirectMixin):
         except Exception as e:
             # DownloadError, RuntimeError, TypeError...
             if response is None:
+                if resp is not None:
+                    # Response construction failed before taking ownership of raw.
+                    try:
+                        resp.close()
+                    finally:
+                        resp.release_conn()
                 response = Response(request)
             if not response.failed:  # maybe already failed in response.read().
                 response.fail(error=e)
@@ -591,10 +674,19 @@ class HTTPDownloader(RedirectMixin):
             raise ProtocolError(err)
 
         except MaxRetryError as e:
-            if isinstance(e.reason, ConnectTimeoutError):
-                if not isinstance(e.reason, NewConnectionError):
+            if isinstance(e.reason, NewConnectionError):
+                selected_proxy = proxy.select_proxy(request.url)
+                proxy_scheme = urlparse(selected_proxy).scheme.lower() if selected_proxy else None
+                invalid_proxy = proxy_scheme in ("http", "https")
+                if proxy_scheme and proxy_scheme.startswith("socks"):
+                    invalid_proxy = _is_socks_proxy_endpoint_error(e.reason)
+                if invalid_proxy:
                     proxy.invalidate()
-                    raise ConnectTimeout(e)
+                    raise InvalidProxy(e)
+                raise ConnectionError(e)
+
+            if isinstance(e.reason, ConnectTimeoutError):
+                raise ConnectTimeout(e)
 
             if isinstance(e.reason, ResponseError):
                 raise RetryError(e)
@@ -605,7 +697,6 @@ class HTTPDownloader(RedirectMixin):
 
             if isinstance(e.reason, _SSLError):
                 # This branch is for urllib3 v1.22 and later.
-                proxy.invalidate()
                 raise SSLError(e)
 
             raise ConnectionError(e)
@@ -620,7 +711,6 @@ class HTTPDownloader(RedirectMixin):
         except (_SSLError, _HTTPError) as e:
             if isinstance(e, _SSLError):
                 # This branch is for urllib3 versions earlier than v1.22
-                proxy.invalidate()
                 raise SSLError(e)
             elif isinstance(e, ReadTimeoutError):
                 raise ReadTimeout(e)
