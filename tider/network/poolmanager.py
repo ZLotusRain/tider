@@ -2,10 +2,20 @@ from __future__ import absolute_import
 
 import collections
 import functools
-from urllib.parse import urljoin, urlparse
+import inspect
+from urllib.parse import urlparse
 
 from urllib3._collections import HTTPHeaderDict
-from urllib3.poolmanager import SSL_KEYWORDS, PoolManager as UPoolManager
+from urllib3.poolmanager import (
+    ProxyConfig,
+    SSL_KEYWORDS,
+    PoolKey as UPoolKey,
+    PoolManager as UPoolManager,
+)
+try:
+    from urllib3.poolmanager import HttpVersion
+except ImportError:
+    HttpVersion = None
 from urllib3.exceptions import MaxRetryError, ProxySchemeUnknown
 
 from urllib3.util.retry import Retry
@@ -24,6 +34,7 @@ from tider.network.http2.connectionpool import is_same_host
 from tider.exceptions import InvalidSchema
 from tider.local import try_import
 from tider.utils.log import get_logger
+from tider.utils.url import resolve_redirect_url
 
 __all__ = ["PoolManager", "ProxyManager", "SOCKSProxyManager", "proxy_from_url"]
 
@@ -38,7 +49,7 @@ port_by_scheme = {"http": 80, "https": 443}
 
 # All known keyword arguments that could be provided to the pool manager, its
 # pools, or the underlying connections. This is used to construct a pool key.
-_key_fields = (
+_tider_key_fields = (
     "key_scheme",  # str
     "key_host",  # str
     "key_port",  # int
@@ -80,14 +91,17 @@ _key_fields = (
     'key_keepalive_expiry',
 )
 
+# Keep urllib3's current key fields intact and append Tider's own fields.  In
+# urllib3.future these include Happy Eyeballs and pool monitor settings; losing
+# one here either raises while constructing the key or aliases incompatible
+# pools.  On classic urllib3 the same expression naturally keeps its smaller
+# field set.
+_key_fields = tuple(dict.fromkeys(UPoolKey._fields + _tider_key_fields))
+
 
 #: The namedtuple class used to construct keys for the connection pool.
 #: All custom key schemes should include the fields in this key at a minimum.
 PoolKey = collections.namedtuple("PoolKey", _key_fields)
-
-_proxy_config_fields = ("ssl_context", "use_forwarding_for_https")
-ProxyConfig = collections.namedtuple("ProxyConfig", _proxy_config_fields)
-
 
 def _default_key_normalizer(key_class, request_context):
     """
@@ -107,6 +121,9 @@ def _default_key_normalizer(key_class, request_context):
     for key in ("headers", "_proxy_headers", "_socks_options"):
         if key in context and context[key] is not None:
             context[key] = frozenset(context[key].items())
+
+    if "disabled_svn" in context:
+        context["disabled_svn"] = frozenset(context["disabled_svn"])
 
     # The socket_options key may be a list and needs to be transformed into a
     # tuple.
@@ -139,15 +156,45 @@ key_fn_by_scheme = {
 pool_classes_by_scheme = {"http": HTTPConnectionPool, "https": HTTPSConnectionPool}
 
 
+@functools.lru_cache(maxsize=None)
+def _pool_init_parameters(pool_cls):
+    return inspect.signature(pool_cls.__init__).parameters
+
+
+def _clean_connectionpool(connectionpool):
+    """Run the periodic cleanup hook implemented by the pool type."""
+    cleanup = getattr(connectionpool, "close_expired_connections", None)
+    if cleanup is not None:
+        cleanup()
+    else:
+        close_expired_connections(connectionpool)
+
+
 class PoolManager(UPoolManager):
 
     def __init__(self, num_pools=10, headers=None, **connection_pool_kw):
         super().__init__(num_pools, headers, **dict(connection_pool_kw))
         self.pools.clear()
         self.pools = RecentlyUsedContainer(maxsize=num_pools, dispose_func=lambda v: v.close(),
-                                           clean_func=close_expired_connections)
+                                           clean_func=_clean_connectionpool)
         self.pool_classes_by_scheme = pool_classes_by_scheme
         self.key_fn_by_scheme = key_fn_by_scheme.copy()
+
+    def connection_from_pool_key(self, pool_key, request_context):
+        """Return a pool from Tider's outer LRU pool registry."""
+        with self.pools.lock:
+            pool = self.pools.get(pool_key)
+            if pool is not None:
+                return pool
+
+            pool = self._new_pool(
+                request_context['scheme'],
+                request_context['host'],
+                request_context['port'],
+                request_context=request_context,
+            )
+            self.pools[pool_key] = pool
+        return pool
 
     def close_expired_connections(self):
         self.pools.clean_up()
@@ -171,8 +218,12 @@ class PoolManager(UPoolManager):
             request_context["blocksize"] = _DEFAULT_BLOCKSIZE
 
         if request_context.pop('http2', False):
-            from tider.network.http2.connectionpool import HTTP2ConnectionPool
-            pool_cls = HTTP2ConnectionPool
+            if request_context.get("_socks_options") is not None:
+                from tider.network.http2.connectionpool import SOCKSHTTP2ConnectionPool
+                pool_cls = SOCKSHTTP2ConnectionPool
+            else:
+                from tider.network.http2.connectionpool import HTTP2ConnectionPool
+                pool_cls = HTTP2ConnectionPool
         else:
             request_context.pop('verify', None)
             request_context.pop('cert', None)
@@ -189,6 +240,15 @@ class PoolManager(UPoolManager):
         if scheme == "http":
             for kw in SSL_KEYWORDS:
                 request_context.pop(kw, None)
+
+        pool_parameters = _pool_init_parameters(pool_cls)
+        if 'background_watch_delay' in pool_parameters:
+            request_context.setdefault('background_watch_delay', None)
+        if 'resolver' in pool_parameters:
+            resolver = self._resolver
+            if not resolver.is_available():
+                resolver = self._resolver = resolver.recycle()
+            request_context['resolver'] = resolver
         return pool_cls(host=host, port=port, **request_context)
 
     def urlopen(self, method, url, redirect=True, http2=False, **kw):
@@ -218,8 +278,7 @@ class PoolManager(UPoolManager):
         if not redirect_location:
             return response
 
-        # Support relative URLs for redirecting.
-        redirect_location = urljoin(url, redirect_location)
+        redirect_location = resolve_redirect_url(url, redirect_location, http2=http2)
 
         if response.status == 303:
             # Change the method according to RFC 9110, Section 15.4.4.
@@ -298,6 +357,8 @@ class ProxyManager(PoolManager):
         proxy_headers=None,
         proxy_ssl_context=None,
         use_forwarding_for_https=False,
+        proxy_assert_hostname=None,
+        proxy_assert_fingerprint=None,
         **connection_pool_kw
     ):
 
@@ -319,7 +380,21 @@ class ProxyManager(PoolManager):
             self.proxy_auth = None
         self.proxy_headers = proxy_headers or {}
         self.proxy_ssl_context = proxy_ssl_context
-        self.proxy_config = ProxyConfig(proxy_ssl_context, use_forwarding_for_https)
+        proxy_config = {field: None for field in ProxyConfig._fields}
+        proxy_config.update(
+            ssl_context=proxy_ssl_context,
+            use_forwarding_for_https=use_forwarding_for_https,
+        )
+        if 'assert_hostname' in proxy_config:
+            proxy_config['assert_hostname'] = proxy_assert_hostname
+        if 'assert_fingerprint' in proxy_config:
+            proxy_config['assert_fingerprint'] = proxy_assert_fingerprint
+        self.proxy_config = ProxyConfig(**proxy_config)
+
+        if HttpVersion is not None:
+            disabled_svn = set(connection_pool_kw.get('disabled_svn') or ())
+            disabled_svn.add(HttpVersion.h3)
+            connection_pool_kw['disabled_svn'] = disabled_svn
 
         connection_pool_kw["_proxy"] = self.proxy
         connection_pool_kw["_proxy_headers"] = self.proxy_headers
@@ -355,6 +430,11 @@ class ProxyManager(PoolManager):
         if scheme == "https":
             return super().connection_from_host(
                 host, port, scheme, pool_kwargs=pool_kwargs
+            )
+
+        if pool_kwargs and pool_kwargs.get("http2"):
+            raise InvalidSchema(
+                "HTTP/2 through an HTTP proxy is only supported for HTTPS targets."
             )
 
         return super().connection_from_host(

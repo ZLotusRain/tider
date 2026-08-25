@@ -16,10 +16,10 @@ from requests.cookies import (
 from requests.structures import CaseInsensitiveDict
 
 from tider import Request, Response
-from tider.network.proxy import Proxy
+from tider.network.proxy import Proxy, NO_PROXY_FIELDS
 from tider.network.user_agent import default_user_agent
 from tider.utils.log import get_logger
-from tider.utils.network import cookiejar_from_str, extract_cookies_to_jar
+from tider.utils.cookies import cookiejar_from_str, extract_cookies_to_jar
 from tider.utils.imports import symbol_by_name
 from tider.utils.misc import build_from_crawler
 from tider.exceptions import ProxyError
@@ -201,7 +201,7 @@ class Session:
         """
         # Gather clues from the surrounding environment.
         if self.trust_env:
-            if request.proxy_schema not in ('no_proxy', 'dummy', 0):
+            if not request.meta.get('ignore_download_proxy') and request.proxy_schema not in NO_PROXY_FIELDS:
                 new_proxies = dict(request.proxies or {})
                 # Set environment's proxies.
                 # use no_proxy to avoid using proxy for specific domain.
@@ -215,7 +215,7 @@ class Session:
                 if new_proxy.select_proxy(request.url) != request.selected_proxy:
                     # replace with environment proxies.
                     # if the proxy has already been discarded, a ProxyError will be raised.
-                    request.update_proxy(new_proxy)
+                    request.bind_proxy(new_proxy)
 
             # Look for requests environment configuration
             # and be compatible with cURL.
@@ -258,16 +258,27 @@ class Session:
         try:
             # raise ProxyError if proxy is invalid
             self.merge_environment_settings(request)
-            request.proxy.connect()
+            # Verify the proxy lease belongs to this request before transport.
+            request.proxy.connect(bound_to=request)
         except ProxyError as e:
             response = Response(request)
             response.fail(e)
         else:
-            response = downloader.download_request(request, trust_env=self.trust_env)
-            if request.method.upper() == 'HEAD':
-                # avoid using stream and HEAD together
-                response.read()
-            request.proxy.disconnect()
+            proxy = request.proxy
+            ignore_download_proxy = request.meta.get('ignore_download_proxy')
+            try:
+                if ignore_download_proxy:
+                    # Keep the leased proxy bound to request, but let downloaders
+                    # see an empty proxy for this transfer.
+                    request._proxy = Proxy()
+                response = downloader.download_request(request, trust_env=self.trust_env)
+                if request.method.upper() == 'HEAD':
+                    # avoid using stream and HEAD together
+                    response.read()
+            finally:
+                if ignore_download_proxy:
+                    request._proxy = proxy
+                proxy.disconnect()
         if response.raw:
             extract_cookies_to_jar(request.session_cookies, request.prepared, response.raw)
         return response

@@ -2,9 +2,20 @@ from typing import cast
 from collections.abc import Mapping
 from typing import NamedTuple
 from urllib3.util.url import parse_url as urllib3_parse_url
-from urllib.parse import parse_qsl, urlparse, urlunparse, unquote, ParseResult
+from urllib.parse import (
+    ParseResult,
+    parse_qsl,
+    quote_from_bytes,
+    unquote,
+    urljoin,
+    urlparse,
+    urlunparse,
+)
+
+from requests.utils import requote_uri
 
 from tider.utils.log import get_logger
+from tider.utils.text import enforce_str
 
 logger = get_logger(__name__)
 
@@ -42,6 +53,46 @@ def url_to_parts(url):
 
 
 _parse_url = url_to_parts
+
+
+def resolve_redirect_url(url, location, http2=False):
+    """Resolve a redirect location against its request URL."""
+    if not http2:
+        # Python's HTTP stack decodes headers as latin1, while non-ASCII
+        # Location values are commonly UTF-8. Preserve other encodings as
+        # their original percent-encoded bytes.
+        try:
+            location_bytes = location.encode("latin1")
+        except UnicodeEncodeError:
+            pass
+        else:
+            try:
+                location = location_bytes.decode("utf8")
+            except UnicodeDecodeError:
+                location = quote_from_bytes(
+                    location_bytes, safe="!#$%&'()*+,/:;=?@[]~"
+                )
+
+    parsed_url = urlparse(url)
+    if location.startswith("//"):
+        location = ":".join([enforce_str(parsed_url.scheme), location])
+
+    previous_fragment = parsed_url.fragment
+    parsed_location = urlparse(location)
+    if parsed_location.fragment == "" and previous_fragment:
+        parsed_location = parsed_location._replace(fragment=previous_fragment)
+    if parsed_location.scheme and not parsed_location.hostname:
+        # https://github.com/encode/httpx/issues/771
+        parsed_location = parsed_location._replace(
+            netloc=parsed_url.hostname + parsed_location.netloc
+        )
+
+    location = parsed_location.geturl()
+    if not parsed_location.netloc:
+        location = urljoin(url, requote_uri(location))
+    else:
+        location = requote_uri(location)
+    return enforce_str(location)
 
 
 def parse_url(url, encoding=None) -> ParseResult:

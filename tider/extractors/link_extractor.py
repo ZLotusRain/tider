@@ -118,7 +118,7 @@ class FileExtExtractor:
         'com', 'org', 'net', 'int', 'edu', 'gov', 'mil',
         'arpa', 'cn', 'xyz', 'info', 'icu', 'top', 'cc',
         'de', 'app', 'pub', 'do', 'action', 'sg',
-        'htm', 'html', 'jhtml', 'shtml', 'asp', 'aspx', 'jsp', 'jspx', 'php', 'css', 'js',
+        'htm', 'html', 'jhtml', 'shtml', 'shtm', 'asp', 'aspx', 'jsp', 'jspx', 'php', 'css', 'js',
     }
 
     def __init__(self, ignored_types=(FiletypeCategory.PossiblyDangerousFiles, ), guess=True, includes=(), excludes=()):

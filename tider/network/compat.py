@@ -10,7 +10,6 @@ import sys
 import time
 import queue
 import http.client
-import email.message
 from typing import Union
 
 try:
@@ -20,9 +19,6 @@ try:
         import brotli  # type: ignore[import-not-found]
 except ImportError:
     brotli = None
-
-from urllib.parse import urlparse, urlunparse
-from requests.utils import to_native_string
 
 from http.client import HTTPException as HTTPException
 from urllib3.response import HTTPResponse as _HTTPResponse
@@ -47,96 +43,20 @@ from urllib3.exceptions import (
 )
 from urllib3.util.response import is_fp_closed
 from urllib3.util.connection import is_connection_dropped
+try:
+    from urllib3.util.traffic_police import TrafficPolice
+except ImportError:
+    TrafficPolice = None
 
 from tider.utils.log import get_logger
 
-__all__ = ('CookieCompatRequest', 'CookieCompatResponse', 'RecentlyUsedContainer',
-           'HTTPConnectionPool', 'HTTPSConnectionPool', 'SOCKSHTTPConnectionPool', 'SOCKSHTTPSConnectionPool',
-           'ExpirableHTTPSConnection', 'ExpirableHTTPConnection', 'close_expired_connections')
+__all__ = (
+    'RecentlyUsedContainer', 'HTTPConnectionPool', 'HTTPSConnectionPool',
+    'SOCKSHTTPConnectionPool', 'SOCKSHTTPSConnectionPool',
+    'ExpirableHTTPSConnection', 'ExpirableHTTPConnection', 'close_expired_connections'
+)
 
 urllib3_log = get_logger('urllib3.connectionpool')
-
-
-class CookieCompatRequest:
-    """
-    Wraps a `Request` instance up in a compatibility interface suitable
-    for use with `CookieJar` operations.
-
-    The original request object is read-only.
-    """
-
-    def __init__(self, request):
-        self._r = request
-        self._new_headers = {}
-
-    def get_host(self):
-        return urlparse(self._r.url).netloc
-
-    def get_origin_req_host(self):
-        return self.get_host()
-
-    def get_full_url(self):
-        # Only return the response's URL if the user hadn't set the Host
-        # header(host of url may differ from host in headers,
-        # (e.g https://www.bing.com/  Host: cn.bing.com))
-        if not self._r.headers.get("Host"):
-            return self._r.url
-        # If they did set it, retrieve it and reconstruct the expected domain
-        host = to_native_string(self._r.headers["Host"], encoding="utf-8")
-        parsed = urlparse(self._r.url)
-        # Reconstruct the URL as we expect it
-        return urlunparse(
-            [
-                parsed.scheme,
-                host,
-                parsed.path,
-                parsed.params,
-                parsed.query,
-                parsed.fragment,
-            ]
-        )
-
-    def is_unverifiable(self):
-        return True
-
-    def has_header(self, name):
-        return name in self._r.headers or name in self._new_headers
-
-    def get_header(self, name, default=None):
-        return self._r.headers.get(name, self._new_headers.get(name, default))
-
-    def add_unredirected_header(self, name, value):
-        self._new_headers[name] = value
-
-    def get_new_headers(self):
-        return self._new_headers
-
-    @property
-    def unverifiable(self):
-        return self.is_unverifiable()
-
-    @property
-    def origin_req_host(self):
-        return self.get_origin_req_host()
-
-
-class CookieCompatResponse:
-    """
-    Wraps a `Response` instance up in a compatibility interface suitable
-    for use with `CookieJar` operations.
-    """
-
-    def __init__(self, response):
-        self._headers = response.headers
-
-    def info(self) -> email.message.Message:
-        info = email.message.Message()
-        for key, value in self._headers.items():
-            # Note that setting `info[key]` here is an "append" operation,
-            # not a "replace" operation.
-            # https://docs.python.org/3/library/email.compat32-message.html#email.message.Message.__setitem__
-            info[key] = value
-        return info
 
 
 class RecentlyUsedContainer(_RecentlyUsedContainer):
@@ -149,18 +69,17 @@ class RecentlyUsedContainer(_RecentlyUsedContainer):
         # Re-insert the item if item has not expired, moving it to the end of the eviction line.
         with self.lock:
             item = self._container.pop(key)
-            if hasattr(item, 'has_expired') and item.has_expired():
-                if self.dispose_func:
-                    self.dispose_func(item)
-                raise KeyError(key)
-            self._container[key] = item
-            return item
+            if not hasattr(item, 'has_expired') or not item.has_expired():
+                self._container[key] = item
+                return item
+        if self.dispose_func:
+            self.dispose_func(item)
+        raise KeyError(key)
 
     def clean_up(self):
         if not self.clean_func:
             return
-        # don't use lock here to avoid stuck.
-        for key in list(self._container.keys()):
+        for key in self.keys():
             item = self.get(key)
             if item is None:
                 continue
@@ -180,6 +99,8 @@ class ExpirableConnection:
 
     def deactivate(self):
         if not self._keepalive_expiry or self._keepalive_expiry < 0:
+            return
+        if hasattr(self, 'is_idle') and not self.is_idle:
             return
         if self._expire_at is not None:
             return
@@ -1044,6 +965,34 @@ class FullPoolError(PoolError):
     """Raised when we try to add a connection to a full pool in blocking mode."""
 
 
+def _connection_is_stale(conn):
+    if conn is None:
+        return False
+    try:
+        has_expired = getattr(conn, "has_expired", None)
+        return (
+            has_expired is not None and has_expired()
+        ) or is_connection_dropped(conn)
+    except (AttributeError, OSError, ValueError):
+        # A connection whose health cannot be checked must not be reused.
+        return True
+
+
+def _discard_connection(conn):
+    if conn is None:
+        return
+    try:
+        conn.close()
+    except OSError:
+        # Closing only fails at the socket layer; log and move on so a single
+        # bad socket never breaks pool cleanup.
+        urllib3_log.debug("Failed to close discarded connection", exc_info=True)
+
+
+def _uses_traffic_police(pool):
+    return TrafficPolice is not None and isinstance(pool, TrafficPolice)
+
+
 class ConnectionPool:
 
     _expire_at = None
@@ -1072,7 +1021,7 @@ class ConnectionPool:
         keepalive_expired = self._expire_at is not None and now > self._expire_at
         return keepalive_expired
 
-    def _get_conn(self, timeout=None):
+    def _get_conn(self, timeout=None, **connection_kwargs):
         """
         Get a connection. Will return a pooled connection if one is available.
 
@@ -1084,39 +1033,47 @@ class ConnectionPool:
             :class:`urllib3.exceptions.EmptyPoolError` if the pool is empty and
             :prop:`.block` is ``True``.
         """
-        conn = None
-
         if self.pool is None:
             raise ClosedPoolError(self, "Pool is closed.")
 
-        try:
-            conn = self.pool.get(block=self.block, timeout=timeout)
-            if conn and conn.has_expired():
-                conn.close()  # connection won't be dropped even closed.
-        except AttributeError:  # self.pool is None
-            raise ClosedPoolError(self, "Pool is closed.") from None  # Defensive:
+        uses_traffic_police = _uses_traffic_police(self.pool)
+        get_kwargs = {'block': True, 'timeout': timeout}
+        if uses_traffic_police:
+            get_kwargs['non_saturated_only'] = True
+        else:
+            get_kwargs['block'] = self.block
 
-        except queue.Empty:
-            if self.block:
-                raise EmptyPoolError(
-                    self,
-                    "Pool reached maximum size and no more connections are allowed.",
-                )
-            pass  # Oh well, we'll create a new connection then
+        while True:
+            conn = None
+            try:
+                conn = self.pool.get(**get_kwargs)
+            except AttributeError:  # self.pool is None
+                raise ClosedPoolError(self, "Pool is closed.") from None
+            except queue.Empty:
+                if self.block:
+                    raise EmptyPoolError(
+                        self,
+                        "Pool is empty and a new connection can't be opened "
+                        "due to blocking mode.",
+                    ) from None
 
-        # If this is a persistent connection, check if it got disconnected
-        if conn and is_connection_dropped(conn):
-            urllib3_log.debug("Resetting dropped connection: %s", self.host)
-            conn.close()
-            if getattr(conn, "auto_open", 1) == 0:
-                # This is a proxied connection that has been mutated by
-                # http.client._tunnel() and cannot be reused (since it would
-                # attempt to bypass the proxy)
-                conn = None
+            if not _connection_is_stale(conn):
+                break
+
+            urllib3_log.debug("Discarding stale connection: %s", self.host)
+            if uses_traffic_police:
+                # kill_cursor() removes the held connection from every
+                # registry and wakes a waiter before trying another one.
+                self.pool.kill_cursor()
+                continue
+            _discard_connection(conn)
+            conn = None
+            break
 
         self.activate()
-        conn and conn.activate()
-        return conn or self._new_conn()
+        conn = conn or self._new_conn(**connection_kwargs)
+        conn.activate()
+        return conn
 
     def _put_conn(self, conn):
         """
@@ -1132,19 +1089,41 @@ class ConnectionPool:
 
         If the pool is closed, then the connection will be closed and discarded.
         """
-        conn and conn.deactivate()
+        pool = self.pool
+        uses_traffic_police = _uses_traffic_police(pool)
+        if conn:
+            conn.deactivate()
 
-        if self.pool is not None:
+        if uses_traffic_police:
+            if conn is None or _connection_is_stale(conn):
+                if conn is None or pool.is_held(conn):
+                    pool.kill_cursor()
+                else:
+                    _discard_connection(conn)
+                if pool.bag_only_idle:
+                    self.deactivate()
+                return
+        elif _connection_is_stale(conn):
+            _discard_connection(conn)
+            conn = None
+
+        if pool is not None:
             try:
-                self.pool.put(conn, block=False)
-                if self.pool.full():
+                pool.put(conn, block=uses_traffic_police)
+                if pool is not self.pool:
+                    _discard_connection(conn)
+                    self.deactivate()
+                    return
+                pool_is_idle = (
+                    pool.bag_only_idle if uses_traffic_police else pool.full()
+                )
+                if pool_is_idle:
                     # maybe not retrieved again.
                     self.deactivate()
                 return  # Everything is dandy, done.
-            except AttributeError:
-                # self.pool is None.
-                self.deactivate()
             except queue.Full:
+                if uses_traffic_police:
+                    raise
                 # Connection never got put back into the pool, close it.
                 if conn:
                     conn.close()
@@ -1160,7 +1139,7 @@ class ConnectionPool:
                 urllib3_log.warning(
                     "Connection pool is full, discarding connection: %s. Connection pool size: %s",
                     self.host,
-                    self.pool.qsize(),
+                    pool.qsize(),
                 )
 
         # Connection never got put back into the pool, close it.
@@ -1186,16 +1165,56 @@ class SOCKSHTTPSConnectionPool(HTTPSConnectionPool):
     ConnectionCls = ExpirableSOCKSHTTPSConnection
 
 
-def close_expired_connections(
-    connectionpool: Union[HTTPConnectionPool, HTTPSConnectionPool]
-):
-    # the connection pool(LIFO) will not be used before cleaned up if with container lock.
+def close_expired_connections(connectionpool: Union[HTTPConnectionPool, HTTPSConnectionPool]):
+    pool = getattr(connectionpool, "pool", None)
+    if pool is None:
+        return
+
+    # urllib3.future uses TrafficPolice instead of a queue. Its public idle
+    # iterator owns the cursor required by kill_cursor(), so never reach into
+    # its registry or lock directly.
+    if _uses_traffic_police(pool):
+        for conn in pool.iter_idle():
+            if _connection_is_stale(conn):
+                pool.kill_cursor()
+        return
+
+    # stdlib queues expose a mutex, while gevent queues deliberately do not.
+    # The latter are cooperatively scheduled, so deque snapshots and updates
+    # are atomic as long as this path does not switch greenlets in between.
     try:
-        # avoid deque mutated during iteration
-        for idx in range(len(connectionpool.pool.queue)):
-            conn = connectionpool.pool.queue[idx]
-            if conn and conn.has_expired():
-                conn.close()  # no need to remove from pool.
-    except (AttributeError, IndexError):
-        # pool is None:
-        pass
+        container = pool.queue
+    except AttributeError:
+        return
+
+    mutex = getattr(pool, "mutex", None)
+    if mutex is None:
+        candidates = tuple(conn for conn in container if conn is not None)
+    else:
+        with mutex:
+            candidates = tuple(conn for conn in container if conn is not None)
+
+    stale_candidate_ids = {
+        id(conn) for conn in candidates if _connection_is_stale(conn)
+    }
+    if not stale_candidate_ids:
+        return
+
+    # Keep a None token for every discarded connection. Removing it would make
+    # a blocking urllib3 pool look exhausted even though it can open a new one.
+    def discard_stale_entries():
+        discarded_entries = {}
+        for idx, entry in enumerate(container):
+            if entry is not None and id(entry) in stale_candidate_ids:
+                container[idx] = None
+                discarded_entries[id(entry)] = entry
+        return discarded_entries.values()
+
+    if mutex is None:
+        connections_to_discard = tuple(discard_stale_entries())
+    else:
+        with mutex:
+            connections_to_discard = tuple(discard_stale_entries())
+
+    for stale_connection in connections_to_discard:
+        _discard_connection(stale_connection)

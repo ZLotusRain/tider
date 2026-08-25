@@ -1,14 +1,10 @@
 import os
-import copy
 import socket
 import struct
 import contextlib
 from urllib.parse import urlparse
 
-from requests.cookies import cookiejar_from_dict
 from requests.utils import proxy_bypass, get_environ_proxies
-
-from tider.network.compat import CookieCompatRequest, CookieCompatResponse
 
 
 def _parse_content_type_header(header):
@@ -55,46 +51,6 @@ def guess_encoding_from_headers(headers):
     if "application/json" in content_type:
         # Assume UTF-8 based on RFC 4627: https://www.ietf.org/rfc/rfc4627.txt since the charset was unset
         return "utf-8"
-
-
-def cookiejar_from_str(s: str):
-    if not s:
-        return None
-    d = {}
-    for each in s.split(';'):
-        each = each.strip()
-        if '=' not in each:
-            continue
-        k, v = each.split('=', maxsplit=1)
-        d[k] = v
-    return cookiejar_from_dict(d)
-
-
-def copy_cookie_jar(jar):
-    if jar is None:
-        return None
-
-    if hasattr(jar, "copy"):
-        # We're dealing with an instance of RequestsCookieJar
-        return jar.copy()
-    # We're dealing with a generic CookieJar instance
-    new_jar = copy.copy(jar)
-    new_jar.clear()
-    for cookie in jar:
-        new_jar.set_cookie(copy.copy(cookie))
-    return new_jar
-
-
-def extract_cookies_to_jar(jar, request, response):
-    """Extract the cookies from the response into a CookieJar.
-
-    :param jar: cookielib.CookieJar (not necessarily a RequestsCookieJar)
-    :param request: prepared request
-    :param response: urllib3.HTTPResponse-like object
-    """
-    req = CookieCompatRequest(request)
-    res = CookieCompatResponse(response)
-    jar.extract_cookies(res, req)
 
 
 def is_ipv4_address(string_ip):

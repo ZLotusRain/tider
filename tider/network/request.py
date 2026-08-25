@@ -15,11 +15,11 @@ from requests.exceptions import (
 from requests.structures import CaseInsensitiveDict
 from requests.cookies import RequestsCookieJar, cookiejar_from_dict, merge_cookies
 
-from tider.network.proxy import Proxy
+from tider.network.proxy import NO_PROXY_FIELDS, Proxy
 from tider.exceptions import InvalidRequest
 from tider.utils.log import get_logger
 from tider.utils.serialize import pickle_loads
-from tider.utils.network import copy_cookie_jar
+from tider.utils.cookies import copy_cookie_jar
 from tider.utils.curl import curl_to_request_kwargs
 from tider.utils.imports import symbol_by_name
 from tider.utils.misc import to_bytes
@@ -30,6 +30,8 @@ REQUEST_PREPARE_ERRORS = (InvalidJSONError, InvalidURL, MissingSchema, ValueErro
 
 
 _fingerprint_cache = WeakKeyDictionary()
+# Sentinel for omitted proxy arguments. ``None`` means "do not override" in replace().
+_UNSET = object()
 
 
 def request_from_dict(d, spider=None):
@@ -169,8 +171,8 @@ class Request:
     def __init__(self, url, callback=None, cb_kwargs=None, errback=None, encoding=None, priority=0,
                  meta=None, dup_check=False, allow_redirects=True, timeout=None, raise_for_status=True,
                  ignored_status_codes=(400, 412, 521), stream=None, verify=None, cert=None, http2=False,
-                 proxies=None, proxy_schema=0, proxy_params=None, max_retries=5, max_parse_times=1, delay=0,
-                 downloader=None, impersonate=None, prepared=None, session_cookies=None, **request_kwargs):
+                 proxies=_UNSET, proxy_schema=_UNSET, proxy_params=_UNSET, max_retries=5, max_parse_times=1,
+                 delay=0, downloader=None, impersonate=None, prepared=None, session_cookies=None, **request_kwargs):
 
         self._encoding = encoding
         url = url.strip()
@@ -204,6 +206,11 @@ class Request:
         self.cert = cert
         self.http2 = http2
 
+        # Keep explicit empty proxies distinguishable from omitted proxies.
+        self._proxies_explicit = proxies is not _UNSET and proxies is not None
+        proxies = None if proxies is _UNSET else proxies
+        proxy_schema = 0 if proxy_schema is _UNSET or proxy_schema is None else proxy_schema
+        proxy_params = None if proxy_params is _UNSET else proxy_params
         self._proxy = Proxy(proxies)
         self.proxy_schema = proxy_schema
         self.proxy_params = dict(proxy_params) if proxy_params else {}
@@ -301,18 +308,46 @@ class Request:
             return {}
 
     @property
+    def proxies_explicit(self) -> bool:
+        return self._proxies_explicit
+
+    @property
     def selected_proxy(self) -> str:
         return self.proxy.select_proxy(self.url)
 
-    def update_proxy(self, proxy: Proxy):
-        # discard disposable proxy when switching to a new proxy.
-        self._proxy and self._proxy.unbind(self)
+    def _update_proxy(self, proxy: Proxy, proxies_explicit=None):
+        old_proxy = self._proxy
+        if old_proxy is not None and old_proxy is not proxy:
+            old_proxy.unbind(self)
         self._proxy = proxy
+        if proxies_explicit is not None:
+            self._proxies_explicit = proxies_explicit
 
-    def invalidate_proxy(self):
+    def bind_proxy(self, proxy: Proxy, proxies_explicit=None):
+        # discard disposable proxy when switching to a new proxy.
+        proxy.bind(self)
+        self._update_proxy(proxy, proxies_explicit=proxies_explicit)
+
+    def inherit_proxy(self, request, proxies_explicit=None):
+        # Inherit proxy by moving the reserved lease from parent request.
+        proxy = request.proxy
+        proxy.transfer_lease(request, self)
+        # transfer_lease() already binds this request.
+        self._update_proxy(proxy, proxies_explicit=proxies_explicit)
+
+    def invalidate_proxy(self, force=False):
         # invalidate a fulfill proxy.
-        if self.proxies:
-            self.proxy.invalidate()
+        if not self.proxies:
+            return
+        # Force is used by user-requested proxy reset.
+        # Explicit proxies can fallback to proxy pool only when a valid schema exists.
+        fallback_to_pool = self.proxy_schema not in NO_PROXY_FIELDS
+        if self.proxies_explicit and not (force or fallback_to_pool):
+            return
+        self.proxy.invalidate()
+        if self.proxies_explicit and fallback_to_pool:
+            # Let the next build_request_proxy() select one from proxy pool.
+            self._proxies_explicit = False
 
     @classmethod
     def blank(cls, callback=None, cb_kwargs=None, priority=0, meta=None):
@@ -356,15 +391,16 @@ class Request:
             return self.priority < other.priority
         return NotImplemented("Can't compare `Request` with other type")
 
-    def copy(self):
+    def copy(self, bind_proxy=True):
         # the source request may not be collected by system
         # because the callback kwargs mustn't use deep copy,
         # and will be passed between requests,
         # otherwise the promise value will be changed.
-        return self.replace()
+        return self.replace(bind_proxy=bind_proxy)
 
     def replace(self, *args, **kwargs):
         """Create a new Request with the same attributes except for those given new values"""
+        bind_proxy = kwargs.pop('bind_proxy', True)
         proxy_keys = ('proxies', 'proxy_schema', 'proxy_params')
         proxy_overridden = any(kwargs.get(x) is not None for x in proxy_keys)
         for x in proxy_keys:
@@ -385,8 +421,9 @@ class Request:
         kwargs['url'] = prepared.url
         cls = kwargs.pop('cls', self.__class__)
         request = cls(*args, **kwargs)
-        if not proxy_overridden:
-            request.update_proxy(self.proxy)
+        if bind_proxy and not proxy_overridden:
+            # Keep manual proxy fallback behavior when inheriting the proxy lease.
+            request.bind_proxy(self.proxy, proxies_explicit=self.proxies_explicit)
         return request
 
     def fingerprint(self, include_headers=None, keep_fragments=False):
@@ -433,15 +470,19 @@ class Request:
             d["_class"] = self.__module__ + '.' + self.__class__.__name__
         return d
 
+    def unbind_proxy(self):
+        proxy, self._proxy = self._proxy, None
+        if proxy is not None:
+            proxy.unbind(self)
+
     def close(self):
-        if self._proxy is not None:
-            self._proxy.unbind(self)
-            self._proxy = None
-        # don't use clear to avoid destroy cb_kwargs in promise
-        self._cb_kwargs = {}
+        self.unbind_proxy()
         self._meta = {}
         self._prepared = None
-        del self.callback, self.errback, self._cb_kwargs
+        # Drop references without mutating callback kwargs shared with promises.
+        self.__dict__.pop('callback', None)
+        self.__dict__.pop('errback', None)
+        self.__dict__.pop('_cb_kwargs', None)
 
 
 def _find_method(obj, func):

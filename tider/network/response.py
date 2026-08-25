@@ -5,18 +5,19 @@ import mimetypes
 import charset_normalizer
 from bs4 import BeautifulSoup, Comment
 from html import unescape as html_unescape
-from urllib.parse import urljoin, unquote, urlparse
+from urllib.parse import urljoin, unquote
 from typing import Optional, Union, Callable
 
 from requests.models import REDIRECT_STATI
 from requests.structures import CaseInsensitiveDict
 from requests.cookies import cookiejar_from_dict, merge_cookies, RequestsCookieJar
-from requests.utils import guess_json_utf, requote_uri
+from requests.utils import guess_json_utf
 
 from tider import Request
 from tider.utils.log import get_logger
-from tider.utils.text import enforce_str
-from tider.utils.network import extract_cookies_to_jar, guess_encoding_from_headers
+from tider.utils.cookies import extract_cookies_to_jar
+from tider.utils.network import guess_encoding_from_headers
+from tider.utils.url import resolve_redirect_url
 from tider.exceptions import DownloadError, HTTPError, ResponseReadError, ResponseStreamConsumed
 
 logger = get_logger(__name__)
@@ -152,43 +153,9 @@ class Response:
         if not self.is_redirect or self.request is None:
             return None
         if not self._redirect_target:
-            location = self.headers["location"]
-            if not self.request.http2:
-                # Currently the underlying http module on py3 decode headers
-                # in latin1, but empirical evidence suggests that latin1 is very
-                # rarely used with non-ASCII characters in HTTP headers.
-                # It is more likely to get UTF8 header rather than latin1.
-                # This causes incorrect handling of UTF8 encoded location headers.
-                # To solve this, we re-encode the location in latin1.
-                try:
-                    location = location.encode("latin1").decode("utf8")
-                except UnicodeEncodeError:
-                    pass
             url = self.request.url
-            # Handle redirection without scheme (see: RFC 1808 Section 4)
-            parsed_old_url = urlparse(url)
-            if location.startswith("//"):
-                location = ":".join([enforce_str(parsed_old_url.scheme), location])
-
-            previous_fragment = parsed_old_url.fragment
-            parsed_location = urlparse(location)
-            if parsed_location.fragment == "" and previous_fragment:
-                parsed_location = parsed_location._replace(fragment=previous_fragment)
-            if parsed_location.scheme and not parsed_location.hostname:
-                # https://github.com/encode/httpx/issues/771
-                parsed_location = parsed_location._replace(netloc=parsed_old_url.hostname + parsed_location.netloc)
-
-            location = parsed_location.geturl()
-
-            # Facilitate relative 'location' headers, as allowed by RFC 7231.
-            # (e.g. '/path/to/resource' instead of 'http://domain.tld/path/to/resource')
-            # Compliant with RFC3986, we percent encode the url.
-            if not parsed_location.netloc:
-                location = urljoin(url, requote_uri(location))
-            else:
-                location = requote_uri(location)
-
-            self._redirect_target = enforce_str(location)
+            location = self.headers["location"]
+            self._redirect_target = resolve_redirect_url(url, location, http2=self.request.http2)
         return self._redirect_target
 
     def raise_for_status(self):
@@ -252,13 +219,13 @@ class Response:
 
     @property
     def ok(self):
-        """Returns True if :attr:`status_code` is less than 400, False if not.
+        """Returns True if the response completed without an HTTP or download error.
 
-        This attribute checks if the status code of the response is between
-        400 and 600 to see if there was a client error or a server error. If
-        the status code is between 200 and 400, this will return True. This
-        is **not** a check to see if the response code is ``200 OK``.
+        A response can have a successful HTTP status while still failing to
+        read its body, so download errors take precedence over ``status_code``.
         """
+        if self.failed:
+            return False
         try:
             self.raise_for_status()
         except (TypeError, HTTPError):
@@ -378,7 +345,12 @@ class Response:
                 self.fail(ResponseReadError(e))
                 self.check_error()
             finally:
-                self.maybe_on_consumed()
+                try:
+                    # Abort partial streams or release managed streams before callbacks.
+                    if not self._content_consumed or self.on_consumed is not None:
+                        self._close_raw()
+                finally:
+                    self.maybe_on_consumed()
 
         if self._content_consumed and isinstance(self._content, bool):
             raise ResponseStreamConsumed()
@@ -413,9 +385,9 @@ class Response:
         return self._content
 
     def maybe_on_consumed(self):
-        if hasattr(self, 'on_consumed') and self.on_consumed:
-            self.on_consumed(response=self)
-            del self.on_consumed
+        callback, self.on_consumed = self.on_consumed, None
+        if callback:
+            callback(response=self)
 
     @property
     def text(self):
@@ -540,7 +512,7 @@ class Response:
         # otherwise the callback maybe `Promise._then` which will
         # cause fatal error like recursion error.
         if reset_proxy:
-            self.request.invalidate_proxy()
+            self.request.invalidate_proxy(force=True)
 
         meta = dict(self.meta)
         meta.update(kwargs.pop('meta', {}))
@@ -610,26 +582,35 @@ class Response:
         self.headers = None
         self.cookies = None
 
-    def close(self):
-        # maybe not read when using stream or in some specific case.
-        self.maybe_on_consumed()
+    def _close_raw(self):
         raw, self.raw = self.raw, None
         if getattr(raw, "release_conn", None):
             # special for urllib3.
-            if not self._content_consumed or self.failed:
-                # also includes HEAD requests.
-                raw.close()  # close connection and http.client.HTTPResponse if exists.
-            # drain_conn will read and discard any remaining HTTP response data in the response connection,
-            # if connection pool is closed, the connection will be closed.
-            raw.release_conn()  # break refs
+            try:
+                if not self._content_consumed or self.failed:
+                    # also includes HEAD requests.
+                    raw.close()  # close connection and http.client.HTTPResponse if exists.
+            finally:
+                # drain_conn will read and discard any remaining HTTP response data in the response connection,
+                # if connection pool is closed, the connection will be closed.
+                raw.release_conn()  # break refs
         elif getattr(raw, "close", None):
             try:
                 raw.close()
             except AttributeError:
                 # using curl_cffi and Python version < 3.8
                 pass
-        self._clear_caches()
-        if self._error:
-            self._error.__traceback__ = None
-        self._error = None
-        self.request = None
+
+    def close(self):
+        try:
+            self._close_raw()
+            self._clear_caches()
+            if self._error:
+                self._error.__traceback__ = None
+            self._error = None
+        finally:
+            try:
+                # maybe not read when using stream or in some specific case.
+                self.maybe_on_consumed()
+            finally:
+                self.request = None
