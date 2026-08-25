@@ -393,7 +393,8 @@ class Page:
 
     def parse(self, response: Response):
         self.cookies.update(response.cookies)
-
+        if response.failed:
+            return
         if self.blocked_by_security(response):
             yield from self.handle_security_block(response)
             return

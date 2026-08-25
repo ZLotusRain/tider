@@ -40,7 +40,7 @@ class SpiderLoader:
 
     def _load_spiders(self, module, custom_settings=None, schema='default'):
         for spider_cls in iter_spider_classes(module):
-            spider_cls.name = spider_cls.name or spider_cls.__name__
+            spider_cls.name = spider_cls.__dict__.get('name') or spider_cls.__name__
             name = spider_cls.name
 
             custom_settings = dict(custom_settings or {})

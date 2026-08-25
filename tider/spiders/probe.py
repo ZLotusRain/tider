@@ -150,7 +150,7 @@ class HttpsToHttpMiddleware:
             not response.status_code or
             'WRONG_VERSION_NUMBER' in str(response._error) or
             'EOF occurred in violation of protocol' in str(response._error) or
-            '<h1>404 Not Found</h1>' in response.text
+            (not response.failed and '<h1>404 Not Found</h1>' in response.text)
         )
         if retry_with_http and https_errors:
             url = request.url.replace('https', 'http')
@@ -271,6 +271,26 @@ class ProbeSpider(Spider):
         probe_meta = response.cb_kwargs['probe_meta']
         accept_rules = response.cb_kwargs.get('accept_rules') or []
         source_link = response.cb_kwargs.get('source_link')
+        probe_rules = probe_meta['rules']
+
+        if response.failed:
+            if not self.response_allowed(response):
+                for rule in accept_rules:
+                    # link may be None if parsing start.
+                    yield from probe_rules[rule].on_processed(link=source_link, meta=probe_meta)
+                return
+
+            has_retried_on_failure = False
+            response.meta['depth'] = max(0, response.meta.get('depth', 0) - 1)
+            for request in iter_generator(self.retry_on_errors(response)):
+                request.cb_kwargs.setdefault('source_link', source_link)
+                yield request
+                has_retried_on_failure = True
+            if not has_retried_on_failure:
+                for rule in accept_rules:
+                    # link may be None if parsing start.
+                    yield from probe_rules[rule].on_processed(link=source_link, meta=probe_meta)
+            return
 
         text = response.text[:4096]
         text = text.replace('URL=', 'url=')
@@ -283,24 +303,10 @@ class ProbeSpider(Spider):
             yield response.retry(url=response.urljoin(refresh_url), meta={'depth': 0, 'parse_times': parse_times})
             return
 
-        probe_rules = probe_meta['rules']
         if not self.response_allowed(response):
             for rule in accept_rules:
                 # link may be None if parsing start.
                 yield from probe_rules[rule].on_processed(link=source_link, meta=probe_meta)
-            return
-
-        if response.failed:
-            has_retried_on_failure = False
-            response.meta['depth'] = max(0, response.meta.get('depth', 0) - 1)
-            for request in iter_generator(self.retry_on_errors(response)):
-                request.cb_kwargs.setdefault('source_link', source_link)
-                yield request
-                has_retried_on_failure = True
-            if not has_retried_on_failure:
-                for rule in accept_rules:
-                    # link may be None if parsing start.
-                    yield from probe_rules[rule].on_processed(link=source_link, meta=probe_meta)
             return
 
         if not source_link:
