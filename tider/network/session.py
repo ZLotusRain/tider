@@ -19,7 +19,7 @@ from tider import Request, Response
 from tider.network.proxy import Proxy, NO_PROXY_FIELDS
 from tider.network.user_agent import default_user_agent
 from tider.utils.log import get_logger
-from tider.utils.cookies import cookiejar_from_str, extract_cookies_to_jar
+from tider.utils.cookies import cookiejar_from_str
 from tider.utils.imports import symbol_by_name
 from tider.utils.misc import build_from_crawler
 from tider.exceptions import ProxyError
@@ -230,34 +230,33 @@ class Session:
         request.verify = merge_setting(request.verify, self.verify)
         request.cert = merge_setting(request.cert, self.cert)
 
+    def prepare_request(self, request: Request):
+        """Build the transport snapshot for a single download attempt."""
+        headers = merge_setting(request.headers, self.headers)
+        header_cookie = headers.get("Cookie")
+        cookies = request.cookies or cookiejar_from_str(header_cookie)
+        if request.meta.get('merge_cookies', True):
+            cookies = merge_cookies(merge_cookies(RequestsCookieJar(), self.cookies), cookies)
+
+        auth = request.auth
+        if self.trust_env and not auth and not self.auth:
+            auth = get_netrc_auth(request.url)
+        auth = merge_setting(auth, self.auth)
+        return request.prepare(headers=headers, cookies=cookies, auth=auth)
+
     def download_request(self, request: Request):
         downloader = request.downloader
         if request.impersonate and not downloader:
             downloader = 'impersonate'
-        downloader = self._get_downloader(downloader or 'default')
+        downloader_name = downloader or 'default'
+        downloader = self._get_downloader(downloader_name)
         if not downloader:
-            raise RuntimeError(f"Can't load downloader `{downloader}`")
-
-        request.prepared.prepare_headers(merge_setting(request.headers, self.headers))
-
-        h_cookie = request.headers.pop("Cookie", None)
-        cookies = request.cookies or cookiejar_from_str(h_cookie)
-        # Merge with session cookies
-        merged_cookies = merge_cookies(
-            merge_cookies(RequestsCookieJar(), self.cookies), cookies
-        )
-        request.prepared.prepare_cookies(merged_cookies)
-
-        auth = request.prepared.auth
-        if self.trust_env and not auth and not self.auth:
-            auth = get_netrc_auth(request.url)
-            auth = merge_setting(auth, self.auth)
-            request.prepared.auth = auth
-            request.prepared.prepare_auth(auth)
+            raise RuntimeError(f"Can't load downloader `{downloader_name}`")
 
         try:
             # raise ProxyError if proxy is invalid
             self.merge_environment_settings(request)
+            prepared = self.prepare_request(request)
             # Verify the proxy lease belongs to this request before transport.
             request.proxy.connect(bound_to=request)
         except ProxyError as e:
@@ -271,7 +270,11 @@ class Session:
                     # Keep the leased proxy bound to request, but let downloaders
                     # see an empty proxy for this transfer.
                     request._proxy = Proxy()
-                response = downloader.download_request(request, trust_env=self.trust_env)
+                response = downloader.download_request(
+                    request, prepared=prepared,
+                    trust_env=self.trust_env,
+                    max_redirects=self.max_redirects,
+                )
                 if request.method.upper() == 'HEAD':
                     # avoid using stream and HEAD together
                     response.read()
@@ -279,8 +282,16 @@ class Session:
                 if ignore_download_proxy:
                     request._proxy = proxy
                 proxy.disconnect()
-        if response.raw:
-            extract_cookies_to_jar(request.session_cookies, request.prepared, response.raw)
+                # Invalid proxies are no longer reusable.  Once the transport
+                # lease is disconnected, reclaim their downloader manager
+                # immediately instead of waiting for periodic cleanup or Proxy
+                # garbage collection.
+                if not proxy.valid and hasattr(downloader, 'close_expired_connections'):
+                    try:
+                        downloader.close_expired_connections()
+                    except Exception:
+                        logger.debug("Failed to reclaim invalid proxy resources", exc_info=True)
+        merge_cookies(request.session_cookies, response.cookies)
         return response
 
     def close(self):

@@ -111,7 +111,7 @@ class Response:
         return response
 
     @classmethod
-    def from_origin_resp(cls, resp, request):
+    def from_origin_resp(cls, resp, prepared, request=None):
         response = cls(request)
 
         # Fallback to None if there's no status_code, for whatever reason.
@@ -137,11 +137,10 @@ class Response:
             response.version = "HTTP/?"
         response.raw = resp
         response.reason = getattr(resp, 'reason', None)
-        response.url = request.url
+        response.url = prepared.url
 
         # Add new cookies from the server.
-        extract_cookies_to_jar(response.cookies, request.prepared, resp)
-        # response.downloader = downloader
+        extract_cookies_to_jar(response.cookies, prepared, resp)
         return response
 
     @property
@@ -153,7 +152,7 @@ class Response:
         if not self.is_redirect or self.request is None:
             return None
         if not self._redirect_target:
-            url = self.request.url
+            url = self.url or self.request.url
             location = self.headers["location"]
             self._redirect_target = resolve_redirect_url(url, location, http2=self.request.http2)
         return self._redirect_target
@@ -613,4 +612,6 @@ class Response:
                 # maybe not read when using stream or in some specific case.
                 self.maybe_on_consumed()
             finally:
+                if isinstance(self._content, bytes):
+                    self._content = None
                 self.request = None

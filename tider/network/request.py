@@ -1,21 +1,30 @@
-import base64
 import time
 import hashlib
 import inspect
+from http.cookiejar import CookieJar
+from urllib.parse import urlunparse
 from weakref import WeakKeyDictionary
 from w3lib.url import canonicalize_url
-from typing import Optional
 
-from requests import PreparedRequest as _PreparedRequest
 from requests.exceptions import (
-    InvalidJSONError,
     InvalidURL,
     MissingSchema,
 )
 from requests.structures import CaseInsensitiveDict
-from requests.cookies import RequestsCookieJar, cookiejar_from_dict, merge_cookies
+from requests.cookies import (
+    RequestsCookieJar,
+    cookiejar_from_dict,
+    merge_cookies,
+)
+from requests.utils import (
+    check_header_validity,
+    requote_uri,
+)
+from urllib3.exceptions import LocationParseError
+from urllib3.util import parse_url
 
 from tider.network.proxy import NO_PROXY_FIELDS, Proxy
+from tider.network.prepared import PreparedRequest
 from tider.exceptions import InvalidRequest
 from tider.utils.log import get_logger
 from tider.utils.serialize import pickle_loads
@@ -25,9 +34,6 @@ from tider.utils.imports import symbol_by_name
 from tider.utils.misc import to_bytes
 
 logger = get_logger(__name__)
-
-REQUEST_PREPARE_ERRORS = (InvalidJSONError, InvalidURL, MissingSchema, ValueError)
-
 
 _fingerprint_cache = WeakKeyDictionary()
 # Sentinel for omitted proxy arguments. ``None`` means "do not override" in replace().
@@ -49,137 +55,107 @@ def request_from_dict(d, spider=None):
     return request_cls(**d)
 
 
-class PreparedRequest(_PreparedRequest):
+def _normalize_method(method, has_payload=False):
+    if not method:
+        method = 'POST' if has_payload else 'GET'
+    if isinstance(method, bytes):
+        method = method.decode('ascii')
+    return str(method).upper()
 
-    def __init__(self, body=None, auth=None, body_position=None):
-        #: HTTP verb to send to the server.
-        self.method = None
-        #: HTTP URL to send the request to.
-        self.url = None
-        self.auth = auth
-        #: dictionary of HTTP headers.
-        self.headers: Optional[CaseInsensitiveDict] = None
-        # The `CookieJar` used to create the Cookie header will be stored here
-        # after prepare_cookies is called
-        self._cookies = None
-        #: request body to send to the server.
-        self.body = body
-        #: integer denoting starting position of a readable file-like body.
-        self._body_position = body_position
 
-    def prepare(
-        self,
-        method=None,
-        url=None,
-        headers=None,
-        files=None,
-        data=None,
-        params=None,
-        cookies=None,
-        json=None,
-        **_
-    ):
-        """Prepares the entire request with the given parameters."""
+def _normalize_url(url):
+    if isinstance(url, bytes):
+        url = url.decode('utf-8')
+    else:
+        url = str(url)
+    url = url.lstrip()
+
+    # Explorer consumes non-HTTP schemes without a network transport.
+    if ':' in url and not url.lower().startswith('http'):
+        return url
+
+    try:
+        scheme, auth, host, port, path, query, fragment = parse_url(url)
+    except LocationParseError as e:
+        raise InvalidURL(*e.args)
+    if not scheme:
+        raise MissingSchema(
+            f"Invalid URL {url!r}: No scheme supplied. "
+            f"Perhaps you meant https://{url}?"
+        )
+    if not host:
+        raise InvalidURL(f"Invalid URL {url!r}: No host supplied")
+
+    if not host.isascii():
         try:
-            if url == 'about:blank' or url.startswith("data:"):
-                self.url = url
-            else:
-                self.prepare_method(method)
-                self.prepare_url(url, params)
-                headers = headers or {}
-                # Remove keys that are set to None.
-                none_keys = [k for (k, v) in headers.items() if v is None]
-                for key in none_keys:
-                    del headers[key]
-                self.prepare_headers(headers)
-                self.prepare_cookies(cookies)
-                if self.body is None:
-                    self.prepare_body(data, files, json)
-                # Note that prepare_auth must be last to enable authentication schemes
-                # such as OAuth to work on a fully prepared request.
-                self.prepare_auth(self.auth, url)
-        except REQUEST_PREPARE_ERRORS as e:
-            raise InvalidRequest('Failed to prepare request.') from e
+            import idna
+            host = idna.encode(host, uts46=True).decode('utf-8')
+        except (UnicodeError, idna.IDNAError):
+            raise InvalidURL('URL has an invalid label.')
+    elif host.startswith(('*', '.')):
+        raise InvalidURL('URL has an invalid label.')
 
-    @property
-    def cookies(self):
-        return copy_cookie_jar(self._cookies)
+    netloc = auth or ''
+    if netloc:
+        netloc += '@'
+    netloc += host
+    if port:
+        netloc += f':{port}'
+    path = path or '/'
 
-    def copy_with(self, method=None, url=None, headers=None, files=None, data=None,
-                  params=None, auth=None, cookies=None, json=None, body=None, body_position=None):
-        body_position = None if body is None else body_position
-        p = PreparedRequest(auth=auth, body=body, body_position=body_position)
-        p.method = method.upper() if method is not None else self.method
+    return requote_uri(urlunparse((scheme, netloc, path, '', query, fragment)))
 
-        try:
-            if url is not None:
-                p.prepare_url(url, params)
-            else:
-                p.url = self.url
 
-            if headers is not None:
-                p.prepare_headers(headers)
-            else:
-                p.headers = self.headers.copy()
-
-            cookies = cookies if cookies is not None else self.cookies
-            if cookies is not None:
-                p.headers.pop('Cookie', None)  # avoid cookies can't be updated to empty.
-                p.prepare_cookies(cookies)
-
-            if p.body is None:
-                if data or files or json:
-                    p.prepare_body(data, files, json)
-                else:
-                    p.body = self.body
-            if auth is not None:
-                p.prepare_auth(auth, p.url)
-        except REQUEST_PREPARE_ERRORS as e:
-            raise InvalidRequest('Failed to copy request with specific arguments.') from e
-        return p
-
-    def copy(self):
-        p = PreparedRequest(body=self.body, auth=self.auth)
-        p.method = self.method
-        p.url = self.url
-        p.headers = self.headers.copy() if self.headers is not None else None
-        p._cookies = copy_cookie_jar(self._cookies)
-        p._body_position = self._body_position
-        return p
-
-    def to_dict(self):
-        cookies = self.cookies.get_dict() if isinstance(self.cookies, RequestsCookieJar) else self.cookies
-        return {
-            'method': self.method,
-            'url': self.url,
-            'auth': self.auth,
-            'headers': dict(self.headers),
-            'cookies': cookies,
-            'body': self.body,
-            'body_position': self._body_position,
-        }
+def _normalize_headers(headers):
+    normalized = CaseInsensitiveDict()
+    for name, value in dict(headers or {}).items():
+        if value is None:
+            continue
+        check_header_validity((name, value))
+        if isinstance(name, bytes):
+            name = name.decode('ascii')
+        normalized[str(name)] = value
+    return normalized
 
 
 class Request:
     """Represents an HTTP request."""
 
-    INTERNAL_ATTRIBUTES = ('encoding', 'meta', 'cb_kwargs',)
+    _REQUEST_PARAMS = (
+        "method", "params", "data", "json", "headers", "cookies",
+        "files", "auth", "timeout", "allow_redirects", "proxies", "stream", "verify", "cert"
+    )
 
-    _REQUEST_KWARGS = ("method", "url", "headers", "params", "body",
-                       "data", "json", "files", "cookies", "auth", "body_position")
+    INTERNAL_ATTRIBUTES = ('encoding', 'meta', 'cb_kwargs',)
 
     def __init__(self, url, callback=None, cb_kwargs=None, errback=None, encoding=None, priority=0,
                  meta=None, dup_check=False, allow_redirects=True, timeout=None, raise_for_status=True,
                  ignored_status_codes=(400, 412, 521), stream=None, verify=None, cert=None, http2=False,
                  proxies=_UNSET, proxy_schema=_UNSET, proxy_params=_UNSET, max_retries=5, max_parse_times=1,
-                 delay=0, downloader=None, impersonate=None, prepared=None, session_cookies=None, **request_kwargs):
+                 delay=0, downloader=None, impersonate=None, session_cookies=None, **request_kwargs):
+        try:
+            self.url = _normalize_url(url)
+            self.headers = _normalize_headers(request_kwargs.get('headers'))
+        except (InvalidURL, MissingSchema, ValueError) as e:
+            raise InvalidRequest('Failed to build request.') from e
 
-        self._encoding = encoding
-        url = url.strip()
-        if prepared is not None:
-            self._prepared = prepared.copy()
+        self.data = request_kwargs.get('data')
+        self.files = request_kwargs.get('files')
+        self.json = request_kwargs.get('json')
+        has_payload = bool(self.files or self.data or self.json)
+        self.method = _normalize_method(request_kwargs.get('method'), has_payload=has_payload)
+        self.params = request_kwargs.get('params')
+
+        auth = request_kwargs.get('auth')
+        if isinstance(auth, list) and len(auth) == 2:
+            auth = tuple(auth)
+        self.auth = auth
+
+        cookies = request_kwargs.get('cookies')
+        if isinstance(cookies, CookieJar):
+            self._cookies = copy_cookie_jar(cookies)
         else:
-            self._prepared = self._prepare(url=url, **request_kwargs)
+            self._cookies = cookiejar_from_dict(cookies)
 
         if not isinstance(session_cookies, RequestsCookieJar):
             session_cookies = cookiejar_from_dict(session_cookies)
@@ -199,12 +175,13 @@ class Request:
 
         self.allow_redirects = allow_redirects
         self.timeout = timeout if timeout is not None else 10
-        self.raise_for_status = raise_for_status
-        self.ignored_status_codes = ignored_status_codes or tuple()
         self.stream = stream
         self.verify = verify
         self.cert = cert
         self.http2 = http2
+        self.raise_for_status = raise_for_status
+        self.ignored_status_codes = ignored_status_codes or tuple()
+        self._encoding = encoding
 
         # Keep explicit empty proxies distinguishable from omitted proxies.
         self._proxies_explicit = proxies is not _UNSET and proxies is not None
@@ -229,8 +206,8 @@ class Request:
         return self._encoding
 
     @property
-    def prepared(self):
-        return self._prepared
+    def cookies(self):
+        return copy_cookie_jar(self._cookies)
 
     @property
     def meta(self):
@@ -244,57 +221,15 @@ class Request:
             self._cb_kwargs = {}
         return self._cb_kwargs
 
-    def _prepare(
-        self,
-        method=None,
-        url=None,
-        headers=None,
-        body=None,
-        files=None,
-        data=None,
-        params=None,
-        auth=None,
-        cookies=None,
-        json=None,
-        **_,
-    ):
-        if not method and not (files or data or json):
-            method = 'GET'
-        if not method and (files or data or json):
-            method = 'POST'
-        p = PreparedRequest(body=body, auth=auth)
-        p.prepare(
-            method=method,
-            url=url,
-            headers=headers,
-            files=files,
-            data=data,
-            params=params,
-            cookies=cookies,
-            json=json
-        )
-        return p
-
-    @property
-    def method(self):
-        return self.prepared.method
-
-    @property
-    def url(self):
-        return self.prepared.url
-
-    @property
-    def body(self):
-        return self.prepared.body
-
-    @property
-    def cookies(self):
-        # can't change cookies here.
-        return self.prepared.cookies
-
-    @property
-    def headers(self):
-        return self.prepared.headers
+    def prepare(self, headers=None, cookies=None, auth=_UNSET):
+        """Build an attempt-local transport snapshot."""
+        if headers is None:
+            headers = self.headers
+        if cookies is None:
+            cookies = self.cookies
+        if auth is _UNSET:
+            auth = self.auth
+        return PreparedRequest.from_request(self, headers=headers, cookies=cookies, auth=auth)
 
     @property
     def proxy(self) -> Proxy:
@@ -361,7 +296,7 @@ class Request:
     def from_curl(cls, curl_command: str, ignore_unknown_options: bool = True, **kwargs):
         """Create a Request object from a string containing a `cURL
         <https://curl.haxx.se/>`_ command. It populates the HTTP method, the
-        URL, the headers, the cookies and the body. It accepts the same
+        URL, the headers, the cookies and the request data. It accepts the same
         arguments as the :class:`Request` class, taking preference and
         overriding the values of the same arguments contained in the cURL
         command.
@@ -401,24 +336,49 @@ class Request:
     def replace(self, *args, **kwargs):
         """Create a new Request with the same attributes except for those given new values"""
         bind_proxy = kwargs.pop('bind_proxy', True)
+        overridden_keys = set(kwargs)
         proxy_keys = ('proxies', 'proxy_schema', 'proxy_params')
         proxy_overridden = any(kwargs.get(x) is not None for x in proxy_keys)
+        proxies_arg = kwargs.get('proxies', _UNSET)
+        proxies_overridden = proxies_arg is not _UNSET and proxies_arg is not None
         for x in proxy_keys:
             if x in kwargs and kwargs[x] is None:
                 kwargs.pop(x)
-        for x in (*self.__dict__.keys(), *self.INTERNAL_ATTRIBUTES):
+        for x in (
+            *self.__dict__.keys(),
+            *self._REQUEST_PARAMS,
+            *self.INTERNAL_ATTRIBUTES,
+        ):
             if x.startswith("_"):
                 continue
             value = getattr(self, x)
             kwargs.setdefault(x, value)
-        prepared = kwargs.pop('prepared', None)
-        if not prepared:
-            prepared = self.prepared
-            request_kwargs = {x: kwargs[x] for x in self._REQUEST_KWARGS if x in kwargs}
-            if request_kwargs:
-                prepared = self.prepared.copy_with(**request_kwargs)
-        kwargs['prepared'] = prepared
-        kwargs['url'] = prepared.url
+
+        # Accessing ``self.proxies`` cannot preserve whether an empty mapping
+        # was explicitly supplied.  Keep implicit proxy-pool requests implicit
+        # when copying/replacing them so ``proxy_schema`` is still resolved by
+        # the explorer.
+        if not proxies_overridden and not self.proxies_explicit:
+            kwargs.pop('proxies', None)
+
+        reset_cookies = (
+            'meta' in overridden_keys
+            and (kwargs.get('meta') or {}).get('merge_cookies') is False
+        )
+        if reset_cookies:
+            if 'cookies' not in overridden_keys:
+                kwargs['cookies'] = {}
+            if 'session_cookies' not in overridden_keys:
+                kwargs['session_cookies'] = {}
+        else:
+            kwargs.setdefault('cookies', self.cookies)
+        payload_replaced = overridden_keys.intersection(('data', 'files', 'json'))
+        if 'headers' not in overridden_keys and payload_replaced:
+            headers = kwargs['headers'].copy()
+            headers.pop('Content-Length', None)
+            headers.pop('Transfer-Encoding', None)
+            headers.pop('Content-Type', None)
+            kwargs['headers'] = headers
         cls = kwargs.pop('cls', self.__class__)
         request = cls(*args, **kwargs)
         if bind_proxy and not proxy_overridden:
@@ -427,8 +387,10 @@ class Request:
         return request
 
     def fingerprint(self, include_headers=None, keep_fragments=False):
-        headers = dict(include_headers or {})
-        headers = tuple(to_bytes(h.lower()) for h in sorted(headers))
+        headers = tuple(
+            (name.decode('ascii') if isinstance(name, bytes) else str(name)).lower()
+            for name in sorted(dict(include_headers or {}))
+        )
 
         cache = _fingerprint_cache.setdefault(self, {})
         cache_key = (headers, keep_fragments)
@@ -436,11 +398,14 @@ class Request:
             fp = hashlib.sha1()
             fp.update(to_bytes(canonicalize_url(self.url, keep_fragments=keep_fragments)))
             for hdr in headers:
-                if hdr not in self.prepared.headers:
+                if hdr not in self.headers:
                     continue
                 fp.update(to_bytes(hdr))
-                fp.update(to_bytes(headers[hdr]))
-            fp.update(to_bytes(self.prepared.body))
+                fp.update(to_bytes(self.headers[hdr]))
+            for name in ('params', 'data', 'files', 'json', 'auth'):
+                value = getattr(self, name)
+                if value:
+                    fp.update(to_bytes(repr(value)))
 
             cache[cache_key] = fp.hexdigest()
         return cache[cache_key]
@@ -452,20 +417,25 @@ class Request:
             "callback": _find_method(spider, self.callback) if callable(self.callback) else self.callback,
             "errback": _find_method(spider, self.errback) if callable(self.errback) else self.errback
         }
-        for attr in (*self.__dict__.keys(), *self.INTERNAL_ATTRIBUTES):
+        for attr in (
+            *self.__dict__.keys(),
+            *self._REQUEST_PARAMS,
+            *self.INTERNAL_ATTRIBUTES,
+        ):
             value = getattr(self, attr)
-            if attr == '_prepared' and value is not None:
-                d.update(value.to_dict())
-            elif attr.startswith("_"):
+            if attr.startswith("_"):
                 continue
             else:
                 if isinstance(value, tuple):
                     value = list(value)
                 elif isinstance(value, RequestsCookieJar):
                     value = value.get_dict()
+                elif isinstance(value, CaseInsensitiveDict):
+                    value = dict(value)
                 d.setdefault(attr, value)
-        if encode_body and isinstance(d.get('body'), bytes):
-            d['body'] = base64.b64encode(d['body']).decode()
+        if not self.proxies_explicit:
+            d.pop('proxies', None)
+        d['cookies'] = self.cookies.get_dict()
         if type(self) is not Request:
             d["_class"] = self.__module__ + '.' + self.__class__.__name__
         return d
@@ -477,8 +447,17 @@ class Request:
 
     def close(self):
         self.unbind_proxy()
+
+        self.params = None
+        self.data = None
+        self.json = None
+        self.files = None
+        self.auth = None
+
+        self.headers.clear()
+        self._cookies.clear()
+
         self._meta = {}
-        self._prepared = None
         # Drop references without mutating callback kwargs shared with promises.
         self.__dict__.pop('callback', None)
         self.__dict__.pop('errback', None)
