@@ -495,7 +495,11 @@ class Explorer:
             response = self._explore(request)
 
         if release_proxy:
+            previous_on_consumed = response.on_consumed
+
             def unbind_proxy(response):
+                if previous_on_consumed is not None:
+                    previous_on_consumed(response=response)
                 response.request.unbind_proxy()
 
             if response._content_consumed:

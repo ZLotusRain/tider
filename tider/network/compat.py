@@ -1095,7 +1095,7 @@ class ConnectionPool:
             conn.deactivate()
 
         if uses_traffic_police:
-            if conn is None or _connection_is_stale(conn):
+            if conn is None or conn.has_expired():
                 if conn is None or pool.is_held(conn):
                     pool.kill_cursor()
                 else:
@@ -1103,7 +1103,9 @@ class ConnectionPool:
                 if pool.bag_only_idle:
                     self.deactivate()
                 return
-        elif _connection_is_stale(conn):
+        elif conn is not None and conn.has_expired():
+            # Do not poll a socket while the completed response body is still
+            # live. Dropped idle connections are discarded before reuse.
             _discard_connection(conn)
             conn = None
 
@@ -1170,12 +1172,14 @@ def close_expired_connections(connectionpool: Union[HTTPConnectionPool, HTTPSCon
     if pool is None:
         return
 
+    # This hook runs in the engine loop. Keep it non-blocking and free of
+    # socket polling; disconnected idle sockets are checked by _get_conn().
     # urllib3.future uses TrafficPolice instead of a queue. Its public idle
     # iterator owns the cursor required by kill_cursor(), so never reach into
     # its registry or lock directly.
     if _uses_traffic_police(pool):
         for conn in pool.iter_idle():
-            if _connection_is_stale(conn):
+            if conn.has_expired():
                 pool.kill_cursor()
         return
 
@@ -1194,27 +1198,25 @@ def close_expired_connections(connectionpool: Union[HTTPConnectionPool, HTTPSCon
         with mutex:
             candidates = tuple(conn for conn in container if conn is not None)
 
-    stale_candidate_ids = {
-        id(conn) for conn in candidates if _connection_is_stale(conn)
-    }
-    if not stale_candidate_ids:
+    expired_candidate_ids = {id(conn) for conn in candidates if conn.has_expired()}
+    if not expired_candidate_ids:
         return
 
     # Keep a None token for every discarded connection. Removing it would make
     # a blocking urllib3 pool look exhausted even though it can open a new one.
-    def discard_stale_entries():
+    def discard_expired_entries():
         discarded_entries = {}
         for idx, entry in enumerate(container):
-            if entry is not None and id(entry) in stale_candidate_ids:
+            if entry is not None and id(entry) in expired_candidate_ids:
                 container[idx] = None
                 discarded_entries[id(entry)] = entry
         return discarded_entries.values()
 
     if mutex is None:
-        connections_to_discard = tuple(discard_stale_entries())
+        connections_to_discard = tuple(discard_expired_entries())
     else:
         with mutex:
-            connections_to_discard = tuple(discard_stale_entries())
+            connections_to_discard = tuple(discard_expired_entries())
 
-    for stale_connection in connections_to_discard:
-        _discard_connection(stale_connection)
+    for expired_connection in connections_to_discard:
+        _discard_connection(expired_connection)

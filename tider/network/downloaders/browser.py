@@ -397,7 +397,7 @@ class BrowserDownloader:
             return False
         return True
 
-    def download_request(self, request: Request, **_):
+    def download_request(self, request: Request, prepared, **_):
         pass
 
     def close_expired_connections(self):
@@ -549,7 +549,7 @@ class PlaywrightDownloader(BrowserDownloader):
                 hook = hooks.pop()
                 self._wait_for_hook(frame=frame, name=hook, timeout=timeout, raise_for_timeout=raise_for_timeout)
 
-    def download_request(self, request: Request, **_):
+    def download_request(self, request: Request, prepared, **_):
         # https://github.com/microsoft/playwright/issues/27997
         browser_type = request.meta.get('browser_type', 'chromium')
         if browser_type not in ('chromium', 'firefox', 'webkit'):
@@ -586,8 +586,8 @@ class PlaywrightDownloader(BrowserDownloader):
             selected_proxy = request.selected_proxy
             if selected_proxy:
                 context_config.update(proxy={'server': selected_proxy})
-            if request.headers.get('User-Agent'):
-                context_config.update(user_agent=request.headers['User-Agent'])
+            if prepared.headers.get('User-Agent'):
+                context_config.update(user_agent=prepared.headers['User-Agent'])
             if device:
                 # device is prior to the default ua.
                 context_config.update(playwright.devices[device])
@@ -604,7 +604,7 @@ class PlaywrightDownloader(BrowserDownloader):
             page.add_init_script(script=INIT_SCRIPT)
             if init_script or init_script_path:
                 page.add_init_script(script=init_script, path=init_script_path)
-            headers = dict(request.headers)
+            headers = dict(prepared.headers)
             headers.pop('Accept-Encoding', None)  # detected spider characteristic.
             headers.pop('Host', None)  # Invalid Argument Error
             page.set_extra_http_headers(headers)
@@ -617,7 +617,7 @@ class PlaywrightDownloader(BrowserDownloader):
 
             start = preferred_clock()
             # automatically dismiss dialogs.
-            browser_response = page.goto(request.url, wait_until='load')
+            browser_response = page.goto(prepared.url, wait_until='load')
             wait_for_init_hook = True
             try:
                 page.add_script_tag(content=DOM_LOAD_HOOK)
@@ -701,7 +701,19 @@ class PlaywrightDownloader(BrowserDownloader):
             if mhtml_path:
                 resp.capture_snapshot(mhtml_path)
             elapsed = preferred_clock() - start
-            response = Response.from_origin_resp(resp=resp, request=request)
+            response_prepared = prepared
+            if page.url and page.url != prepared.url:
+                response_prepared = prepared.copy_with(
+                    url=page.url,
+                    apply_auth=False,
+                )
+            response = Response.from_origin_resp(
+                resp=resp,
+                request=request,
+                prepared=response_prepared,
+            )
+            response.url = response_prepared.url
+            response.cookies.clear()
             response.cookies.update(cookies)
             response.elapsed = elapsed
             return response
