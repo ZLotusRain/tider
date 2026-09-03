@@ -238,7 +238,7 @@ class ExplorerAwarePriorityQueue:
         )
 
     def pop(self):
-        stats = self._explorer_interface.stats(self.pqueues)
+        stats = self._explorer_interface.stats(slot for slot, queue in self.pqueues.items() if len(queue) > 0)
 
         if not stats:
             return None
@@ -268,7 +268,7 @@ class ExplorerAwarePriorityQueue:
         Raises :exc:`NotImplementedError` if the underlying queue class does
         not implement a ``peek`` method, which is optional for queues.
         """
-        stats = self._explorer_interface.stats(self.pqueues)
+        stats = self._explorer_interface.stats(slot for slot, queue in self.pqueues.items() if len(queue) > 0)
         if not stats:
             return None
         slot = min(stats)[1]
