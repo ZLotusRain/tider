@@ -571,12 +571,14 @@ class Response:
         )
 
     def _clear_caches(self):
+        selector, self._cached_selector = self._cached_selector, None
         self._cached_text = None
-        if self._cached_selector:
-            # root created by etree.fromstring
-            self._cached_selector.clear()
-        self._cached_selector = None
-
+        try:
+            if selector is not None:
+                # root created by etree.fromstring
+                selector.clear()
+        except AttributeError:
+            pass
         # break references.
         self.headers = None
         self.cookies = None
@@ -590,8 +592,7 @@ class Response:
                     # also includes HEAD requests.
                     raw.close()  # close connection and http.client.HTTPResponse if exists.
             finally:
-                # drain_conn will read and discard any remaining HTTP response data in the response connection,
-                # if connection pool is closed, the connection will be closed.
+                # Return a consumed connection or detach a closed one from raw.
                 raw.release_conn()  # break refs
         elif getattr(raw, "close", None):
             try:
@@ -603,15 +604,15 @@ class Response:
     def close(self):
         try:
             self._close_raw()
-            self._clear_caches()
-            if self._error:
-                self._error.__traceback__ = None
-            self._error = None
         finally:
             try:
                 # maybe not read when using stream or in some specific case.
                 self.maybe_on_consumed()
             finally:
+                self._clear_caches()
+                error, self._error = self._error, None
+                if error is not None:
+                    error.__traceback__ = None
                 if isinstance(self._content, bytes):
                     self._content = None
                 self.request = None
