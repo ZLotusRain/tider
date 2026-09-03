@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 import inspect
 import io
+import math
 import typing
 import warnings
 import zlib
@@ -21,7 +22,7 @@ except ImportError:
     brotli = None
 
 from http.client import HTTPException as HTTPException
-from urllib3.response import HTTPResponse as _HTTPResponse
+from urllib3 import response as urllib3_response
 from urllib3._collections import RecentlyUsedContainer as _RecentlyUsedContainer
 from urllib3.connection import HTTPConnection, HTTPSConnection, BaseSSLError
 try:
@@ -31,6 +32,7 @@ except ImportError:
 from urllib3.connectionpool import HTTPConnectionPool as _HTTPConnectionPool
 from urllib3.connectionpool import HTTPSConnectionPool as _HTTPSConnectionPool
 from urllib3.exceptions import (
+    BodyNotHttplibCompatible,
     HTTPError,
     ClosedPoolError,
     EmptyPoolError,
@@ -38,10 +40,9 @@ from urllib3.exceptions import (
     DecodeError,
     DependencyWarning,
     IncompleteRead,
-    InvalidChunkLength,
-    ProtocolError,
+    ResponseNotChunked,
 )
-from urllib3.util.response import is_fp_closed
+from urllib3.util.response import is_fp_closed, is_response_to_head
 from urllib3.util.connection import is_connection_dropped
 try:
     from urllib3.util.traffic_police import TrafficPolice
@@ -57,6 +58,32 @@ __all__ = (
 )
 
 urllib3_log = get_logger('urllib3.connectionpool')
+_HTTPResponse = urllib3_response.HTTPResponse
+_MultiDecoder = getattr(urllib3_response, 'MultiDecoder', None)
+
+
+def _has_parameter(callable_obj, parameter):
+    if callable_obj is None:
+        return False
+    try:
+        return parameter in inspect.signature(callable_obj).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+_HTTP_RESPONSE_FP_READ = getattr(_HTTPResponse, '_fp_read', None)
+_HTTP_RESPONSE_DECODE = getattr(_HTTPResponse, '_decode', None)
+_HTTP_RESPONSE_HANDLE_CHUNK = getattr(_HTTPResponse, '_handle_chunk', None)
+_UPSTREAM_MAX_DECODE_LINKS = getattr(_MultiDecoder, 'max_decode_links', None)
+_FP_READ_SUPPORTS_READ1 = _has_parameter(_HTTP_RESPONSE_FP_READ, 'read1')
+_HANDLE_CHUNK_DECODES_CONTENT = _has_parameter(_HTTP_RESPONSE_HANDLE_CHUNK, 'decode_content')
+_HTTP_RESPONSE_HAS_BOUNDED_DECODING = (
+    _has_parameter(_HTTP_RESPONSE_DECODE, 'max_length')
+    and _FP_READ_SUPPORTS_READ1
+    and isinstance(_UPSTREAM_MAX_DECODE_LINKS, int)
+    and 0 < _UPSTREAM_MAX_DECODE_LINKS <= 5
+)
+_STREAM_READ_SIZE = 2 ** 16
 
 
 class RecentlyUsedContainer(_RecentlyUsedContainer):
@@ -79,8 +106,11 @@ class RecentlyUsedContainer(_RecentlyUsedContainer):
     def clean_up(self):
         if not self.clean_func:
             return
-        for key in self.keys():
-            item = self.get(key)
+        # Do not use keys()/get() here. Some urllib3 variants return an
+        # unordered key set, and get() updates the LRU order.
+        with self.lock:
+            items = tuple(self._container.values())
+        for item in items:
             if item is None:
                 continue
             self.clean_func(item)
@@ -93,19 +123,21 @@ class ExpirableConnection:
         self._keepalive_expiry = keepalive_expiry
 
     def activate(self):
-        # don't need lock because the connection
-        # can only be fetched by one request at a time.
+        # Resetting the deadline is idempotent for multiplexed connections.
         self._expire_at = None
 
     def deactivate(self):
-        if not self._keepalive_expiry or self._keepalive_expiry < 0:
+        if self._keepalive_expiry is None or self._keepalive_expiry < 0:
             return
         if hasattr(self, 'is_idle') and not self.is_idle:
             return
         if self._expire_at is not None:
             return
         now = time.monotonic()
-        self._expire_at = now + self._keepalive_expiry
+        last_used_at = getattr(self, 'last_used_at', now)
+        if not isinstance(last_used_at, (int, float)) or not math.isfinite(last_used_at) or last_used_at > now:
+            last_used_at = now
+        self._expire_at = last_used_at + self._keepalive_expiry
 
     def has_expired(self):
         now = time.monotonic()
@@ -231,6 +263,8 @@ class ExpirableSOCKSHTTPSConnection(ExpirableConnection, SOCKSHTTPSConnection):
         ExpirableConnection.__init__(self, keepalive_expiry=keepalive_expiry)
 
 
+# Bounded-decoding backport from urllib3 commit c19571de with later urllib3
+# and urllib3.future decoder fixes. Use upstream when it has the same capabilities.
 class ContentDecoder:
     def decompress(self, data: bytes, max_length: int = -1) -> bytes:
         raise NotImplementedError()
@@ -382,8 +416,11 @@ if brotli is not None:
             self._obj = brotli.Decompressor()
             if hasattr(self._obj, "decompress"):
                 setattr(self, "_decompress", self._obj.decompress)
+                self._lack_output_buffer_limit = False
             else:
                 setattr(self, "_decompress", self._obj.process)
+                self._lack_output_buffer_limit = True
+            self._pending_output = False
 
         # Requires Brotli >= 1.2.0 for `output_buffer_limit`.
         def _decompress(self, data: bytes, output_buffer_limit: int = -1) -> bytes:
@@ -392,9 +429,9 @@ if brotli is not None:
         def decompress(self, data: bytes, max_length: int = -1) -> bytes:
             try:
                 if max_length > 0:
-                    return self._decompress(data, output_buffer_limit=max_length)
+                    decompressed = self._decompress(data, output_buffer_limit=max_length)
                 else:
-                    return self._decompress(data)
+                    decompressed = self._decompress(data)
             except TypeError:
                 # Fallback for Brotli/brotlicffi/brotlipy versions without
                 # the `output_buffer_limit` parameter.
@@ -402,10 +439,14 @@ if brotli is not None:
                     "Brotli >= 1.2.0 is required to prevent decompression bombs.",
                     DependencyWarning,
                 )
-                return self._decompress(data)
+                decompressed = self._decompress(data)
+            self._pending_output = bool(decompressed)
+            return decompressed
 
         @property
         def has_unconsumed_tail(self) -> bool:
+            if self._lack_output_buffer_limit:
+                return self._pending_output
             try:
                 return not self._obj.can_accept_more_data()
             except AttributeError:
@@ -486,8 +527,16 @@ class MultiDecoder(ContentDecoder):
         they were applied.
     """
 
+    max_decode_links = 5
+
     def __init__(self, modes: str) -> None:
-        self._decoders = [_get_decoder(m.strip()) for m in modes.split(",")]
+        encodings = [m.strip() for m in modes.split(",")]
+        if len(encodings) > self.max_decode_links:
+            raise DecodeError(
+                "Too many content encodings in the chain: "
+                f"{len(encodings)} > {self.max_decode_links}"
+            )
+        self._decoders = [_get_decoder(encoding) for encoding in encodings]
 
     def flush(self) -> bytes:
         return self._decoders[0].flush()
@@ -625,8 +674,6 @@ class HTTPResponse(_HTTPResponse):
         CONTENT_DECODERS += ["br"]
     if HAS_ZSTD:
         CONTENT_DECODERS += ["zstd"]
-    REDIRECT_STATUSES = [301, 302, 303, 307, 308]
-
     DECODER_ERROR_CLASSES: tuple[type[Exception], ...] = (IOError, zlib.error)
     if brotli is not None:
         DECODER_ERROR_CLASSES += (brotli.error,)
@@ -636,9 +683,11 @@ class HTTPResponse(_HTTPResponse):
 
     def __init__(self, **kwargs):
         self._has_decoded_content = False
+        self._uncached_read_occurred = False
+        # Older urllib3 may call this subclass's read() during base initialization.
+        self._decoded_buffer = BytesQueueBuffer()
         super().__init__(**kwargs)
-        if not hasattr(self, "_decoded_buffer "):
-            # Used to return the correct amount of bytes for partial read()s
+        if not isinstance(self._decoded_buffer, BytesQueueBuffer):
             self._decoded_buffer = BytesQueueBuffer()
 
     def drain_conn(self) -> None:
@@ -648,13 +697,13 @@ class HTTPResponse(_HTTPResponse):
         Unread data in the HTTPResponse connection blocks the connection from being released back to the pool.
         """
         try:
-            self.read(
-                # Do not spend resources decoding the content unless
-                # decoding has already been initiated.
-                decode_content=self._has_decoded_content,
-            )
+            while self._raw_read(_STREAM_READ_SIZE):
+                pass
         except (HTTPError, OSError, BaseSSLError, HTTPException):
             pass
+        finally:
+            self._decoded_buffer = BytesQueueBuffer()
+            self._decoder = None
 
     def _init_decoder(self) -> None:
         """
@@ -667,12 +716,8 @@ class HTTPResponse(_HTTPResponse):
             if content_encoding in self.CONTENT_DECODERS:
                 self._decoder = _get_decoder(content_encoding)
             elif "," in content_encoding:
-                encodings = [
-                    e.strip()
-                    for e in content_encoding.split(",")
-                    if e.strip() in self.CONTENT_DECODERS
-                ]
-                if encodings:
+                encodings = [e.strip() for e in content_encoding.split(",")]
+                if encodings and all(e in self.CONTENT_DECODERS for e in encodings):
                     self._decoder = _get_decoder(content_encoding)
 
     def _decode(self, data: bytes, decode_content, flush_decoder, max_length=None) -> bytes:
@@ -714,14 +759,31 @@ class HTTPResponse(_HTTPResponse):
             return None  # type: ignore[return-value]
 
         fp_closed = getattr(self._fp, "closed", False)
+        fp_upgraded = getattr(self._fp, "_dsa", None) is not None
 
         with self._error_catcher():
-            signature = inspect.signature(self._fp_read)
-            if 'read1' in signature.parameters:
-                data = self._fp_read(amt, read1=read1) if not fp_closed else b""
+            if fp_closed:
+                data = b""
+            elif read1 and not _FP_READ_SUPPORTS_READ1:
+                reader = getattr(self._fp, 'read1', None)
+                if reader is not None:
+                    data = reader() if amt is None else reader(amt)
+                else:
+                    read_amt = _STREAM_READ_SIZE if amt is None or amt < 0 else amt
+                    data = self._fp_read(read_amt) if _HTTP_RESPONSE_FP_READ is not None else self._fp.read(read_amt)
+            elif _HTTP_RESPONSE_FP_READ is None:
+                data = self._fp.read() if amt is None else self._fp.read(amt)
+            elif _FP_READ_SUPPORTS_READ1:
+                data = self._fp_read(amt, read1=read1)
             else:
-                data = self._fp_read(amt) if not fp_closed else b""
-            if amt is not None and amt != 0 and not data:
+                data = self._fp_read(amt)
+            is_foreign_fp_unclosed = amt is None and not getattr(self._fp, "closed", False) and not fp_upgraded
+            if (amt is not None and amt != 0 and not data) or is_foreign_fp_unclosed:
+                if is_foreign_fp_unclosed:
+                    data_len = len(data)
+                    self._fp_bytes_read += data_len
+                    if self.length_remaining is not None:
+                        self.length_remaining -= data_len
                 # Platform-specific: Buggy versions of Python.
                 # Close the connection when no data is returned
                 #
@@ -732,7 +794,8 @@ class HTTPResponse(_HTTPResponse):
                 # no harm in redundantly calling close.
                 self._fp.close()
                 if (
-                    self.enforce_content_length
+                    not is_foreign_fp_unclosed
+                    and self.enforce_content_length
                     and self.length_remaining is not None
                     and self.length_remaining != 0
                 ):
@@ -751,7 +814,7 @@ class HTTPResponse(_HTTPResponse):
                 # See https://github.com/python/cpython/issues/113199
                 self._fp.close()
 
-        if data:
+        if data and not is_foreign_fp_unclosed:
             self._fp_bytes_read += len(data)
             if self.length_remaining is not None:
                 self.length_remaining -= len(data)
@@ -788,7 +851,11 @@ class HTTPResponse(_HTTPResponse):
         elif amt is not None:
             cache_content = False
 
-            if self._decoder and self._decoder.has_unconsumed_tail:
+            if (
+                self._decoder
+                and self._decoder.has_unconsumed_tail
+                and len(self._decoded_buffer) < amt
+            ):
                 decoded_data = self._decode(
                     b"",
                     decode_content,
@@ -800,6 +867,8 @@ class HTTPResponse(_HTTPResponse):
                 return self._decoded_buffer.get(amt)
 
         data = self._raw_read(amt)
+        if not cache_content:
+            self._uncached_read_occurred = True
 
         flush_decoder = amt is None or (amt != 0 and not data)
 
@@ -812,7 +881,10 @@ class HTTPResponse(_HTTPResponse):
 
         if amt is None:
             data = self._decode(data, decode_content, flush_decoder)
-            if cache_content:
+            if len(self._decoded_buffer):
+                self._decoded_buffer.put(data)
+                data = self._decoded_buffer.get_all()
+            if cache_content and not self._uncached_read_occurred:
                 self._body = data
         else:
             # do not waste memory on buffer when not decoding
@@ -837,6 +909,7 @@ class HTTPResponse(_HTTPResponse):
                 # For example, the GZ file header takes 10 bytes, we don't want to read
                 # it one byte at a time
                 data = self._raw_read(amt)
+                flush_decoder = amt != 0 and not data
                 decoded_data = self._decode(
                     data,
                     decode_content,
@@ -848,7 +921,7 @@ class HTTPResponse(_HTTPResponse):
 
         return data
 
-    def read1(self, amt=None, decode_content=None,) -> bytes:
+    def read1(self, amt=None, decode_content=None) -> bytes:
         """
         Similar to ``http.client.HTTPResponse.read1`` and documented
         in :meth:`io.BufferedReader.read1`, but with an additional parameter:
@@ -863,9 +936,8 @@ class HTTPResponse(_HTTPResponse):
         """
         if decode_content is None:
             decode_content = self.decode_content
-        if amt and amt < 0:
-            # Negative numbers and `None` should be treated the same.
-            amt = None
+        if amt is None or amt < 0:
+            amt = _STREAM_READ_SIZE
         # try and respond without going to the network
         if self._has_decoded_content:
             if not decode_content:
@@ -876,29 +948,28 @@ class HTTPResponse(_HTTPResponse):
             if (
                 self._decoder
                 and self._decoder.has_unconsumed_tail
-                and (amt is None or len(self._decoded_buffer) < amt)
+                and len(self._decoded_buffer) < amt
             ):
                 decoded_data = self._decode(
                     b"",
                     decode_content,
                     flush_decoder=False,
-                    max_length=(
-                        amt - len(self._decoded_buffer) if amt is not None else None
-                    ),
+                    max_length=amt - len(self._decoded_buffer),
                 )
                 self._decoded_buffer.put(decoded_data)
             if len(self._decoded_buffer) > 0:
-                if amt is None:
-                    return self._decoded_buffer.get_all()
                 return self._decoded_buffer.get(amt)
         if amt == 0:
             return b""
 
         data = self._raw_read(amt, read1=True)
+        self._uncached_read_occurred = True
         if not decode_content or data is None:
             return data
 
         self._init_decoder()
+        if self._decoder is None:
+            return data
         while True:
             flush_decoder = not data
             decoded_data = self._decode(
@@ -909,11 +980,9 @@ class HTTPResponse(_HTTPResponse):
                 break
             data = self._raw_read(8192, read1=True)
 
-        if amt is None:
-            return self._decoded_buffer.get_all()
         return self._decoded_buffer.get(amt)
 
-    def stream(self, amt=2 ** 16, decode_content=None) -> typing.Generator[bytes]:
+    def stream(self, amt=_STREAM_READ_SIZE, decode_content=None) -> typing.Generator[bytes]:
         """
         A generator wrapper for the read() method. A call will block until
         ``amt`` bytes have been read from the connection or until the
@@ -929,36 +998,89 @@ class HTTPResponse(_HTTPResponse):
             If True, will attempt to decode the body based on the
             'content-encoding' header.
         """
-        if self.chunked and self.supports_chunked_reads():
+        if amt == 0 or self._fp is None:
+            return
+        if self.chunked and self.supports_chunked_reads() and not _HANDLE_CHUNK_DECODES_CONTENT:
             yield from self.read_chunked(amt, decode_content=decode_content)
-        else:
-            while (
-                not is_fp_closed(self._fp)
-                or len(self._decoded_buffer) > 0
-                or (self._decoder and self._decoder.has_unconsumed_tail)
-            ):
-                data = self.read(amt=amt, decode_content=decode_content)
+            return
+        while (
+            not is_fp_closed(self._fp)
+            or len(self._decoded_buffer) > 0
+            or (self._decoder and self._decoder.has_unconsumed_tail)
+        ):
+            data = self.read1(amt=amt, decode_content=decode_content)
 
+            if data:
+                yield data
+
+    def read_chunked(self, amt=None, decode_content=None):
+        # urllib3.future handles transfer decoding in its chunk reader.
+        if _HANDLE_CHUNK_DECODES_CONTENT:
+            yield from super().read_chunked(amt, decode_content=decode_content)
+            return
+
+        # Classic urllib3 exposes raw chunk framing through the httplib body.
+        self._init_decoder()
+        if not self.chunked:
+            raise ResponseNotChunked(
+                "Response is not chunked. "
+                "Header 'transfer-encoding: chunked' is missing."
+            )
+        if not self.supports_chunked_reads():
+            raise BodyNotHttplibCompatible(
+                "Body should be http.client.HTTPResponse like. "
+                "It should have an fp attribute which returns raw chunks."
+            )
+        if decode_content is None:
+            decode_content = self.decode_content
+        if amt == 0:
+            return
+        if amt is not None and amt < 0:
+            amt = None
+
+        def iter_decoded(data):
+            if amt is None or len(data) <= amt:
                 if data:
                     yield data
+                return
+            for offset in range(0, len(data), amt):
+                yield data[offset:offset + amt]
 
-    def _update_chunk_length(self) -> None:
-        # First, we'll figure out length of a chunk and then
-        # we'll try to read it from socket.
-        if self.chunk_left is not None:
-            return None
-        line = self._fp.fp.readline()  # type: ignore[union-attr]
-        line = line.split(b";", 1)[0]
-        try:
-            self.chunk_left = int(line, 16)
-        except ValueError:
-            self.close()
-            if line:
-                # Invalid chunked protocol response, abort.
-                raise InvalidChunkLength(self, line) from None
-            else:
-                # Truncated at start of next chunk
-                raise ProtocolError("Response ended prematurely") from None
+        with self._error_catcher():
+            if self._original_response and is_response_to_head(self._original_response):
+                self._original_response.close()
+                return
+            if self._fp.fp is None:
+                return
+
+            while True:
+                self._update_chunk_length()
+                if self.chunk_left == 0:
+                    break
+                chunk = self._handle_chunk(amt)
+                decoded = self._decode(
+                    chunk, decode_content=decode_content, flush_decoder=False, max_length=amt
+                )
+                yield from iter_decoded(decoded)
+                while self._decoder and self._decoder.has_unconsumed_tail:
+                    decoded = self._decode(
+                        b"", decode_content=decode_content, flush_decoder=False, max_length=amt
+                    )
+                    if not decoded:
+                        break
+                    yield from iter_decoded(decoded)
+
+            if decode_content:
+                decoded = self._flush_decoder()
+                yield from iter_decoded(decoded)
+
+            while self._fp is not None:
+                line = self._fp.fp.readline()
+                if not line or line == b"\r\n":
+                    break
+
+            if self._original_response:
+                self._original_response.close()
 
 
 class FullPoolError(PoolError):
@@ -969,6 +1091,9 @@ def _connection_is_stale(conn):
     if conn is None:
         return False
     try:
+        deactivate = getattr(conn, "deactivate", None)
+        if deactivate is not None:
+            deactivate()
         has_expired = getattr(conn, "has_expired", None)
         return (
             has_expired is not None and has_expired()
@@ -1001,11 +1126,10 @@ class ConnectionPool:
     # https://github.com/urllib3/urllib3/security/advisories/GHSA-2xpw-w6gg-jr37
     # https://github.com/urllib3/urllib3/commit/c19571de34c47de3a766541b041637ba5f716ed7
     # https://nvd.nist.gov/vuln/detail/CVE-2025-66471
-    ResponseCls = HTTPResponse
+    # Keep the local backport only for urllib3 versions without bounded decoding.
+    ResponseCls = _HTTPResponse if _HTTP_RESPONSE_HAS_BOUNDED_DECODING else HTTPResponse
 
     def activate(self):
-        # don't need lock because the connection
-        # can only be fetched by one request at a time.
         self._expire_at = None
 
     def deactivate(self):
@@ -1013,8 +1137,7 @@ class ConnectionPool:
             return
         if self._expire_at is not None:
             return
-        now = time.monotonic()
-        self._expire_at = now + self._keepalive_expiry
+        self._expire_at = time.monotonic() + self._keepalive_expiry
 
     def has_expired(self):
         now = time.monotonic()
@@ -1116,11 +1239,8 @@ class ConnectionPool:
                     _discard_connection(conn)
                     self.deactivate()
                     return
-                pool_is_idle = (
-                    pool.bag_only_idle if uses_traffic_police else pool.full()
-                )
+                pool_is_idle = pool.bag_only_idle if uses_traffic_police else pool.full()
                 if pool_is_idle:
-                    # maybe not retrieved again.
                     self.deactivate()
                 return  # Everything is dandy, done.
             except queue.Full:
@@ -1172,15 +1292,20 @@ def close_expired_connections(connectionpool: Union[HTTPConnectionPool, HTTPSCon
     if pool is None:
         return
 
-    # This hook runs in the engine loop. Keep it non-blocking and free of
+    # This hook runs in the engine loop. Keep the classic queue path free of
     # socket polling; disconnected idle sockets are checked by _get_conn().
     # urllib3.future uses TrafficPolice instead of a queue. Its public idle
     # iterator owns the cursor required by kill_cursor(), so never reach into
     # its registry or lock directly.
     if _uses_traffic_police(pool):
         for conn in pool.iter_idle():
+            # urllib3.future returns a connection to TrafficPolice before its
+            # response body is consumed. Start its TTL once it is truly idle.
+            conn.deactivate()
             if conn.has_expired():
                 pool.kill_cursor()
+        if pool.bag_only_idle:
+            connectionpool.deactivate()
         return
 
     # stdlib queues expose a mutex, while gevent queues deliberately do not.
