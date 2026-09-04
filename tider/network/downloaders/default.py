@@ -413,7 +413,7 @@ class HTTPDownloader(RedirectMixin):
             self.max_retries = Retry.from_int(max_retries)
         # A urllib3 manager is shared by Proxy objects that resolve to the
         # same endpoint and cleared after the final Proxy owner is collected.
-        self._manager_states = {}
+        self._manager_states = weakref.WeakValueDictionary()
         self._manager_lock = RLock()
 
         self._pool_connections = pool_connections
