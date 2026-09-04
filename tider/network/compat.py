@@ -705,6 +705,39 @@ class HTTPResponse(_HTTPResponse):
             self._decoded_buffer = BytesQueueBuffer()
             self._decoder = None
 
+    def _clear_consumed_state(self) -> None:
+        """Drop response-side buffers after the body no longer owns the socket.
+
+        ``release_conn()`` returns the connection to urllib3's pool but the
+        urllib3 response object can remain reachable for a while through
+        exception/greenlet bookkeeping.  Keeping ``_fp`` and
+        ``_original_response`` on that object retains the stdlib HTTPResponse
+        (and its buffered reader) even though the body has been consumed.  At
+        this point no further reads are valid, so sever those references while
+        leaving the pooled connection itself intact.
+        """
+        fp = getattr(self, "_fp", None)
+        if fp is not None:
+            try:
+                fp_closed = is_fp_closed(fp)
+            except (AttributeError, ValueError):
+                # gevent/http.client wrappers may reject a closed-state query
+                # after the response has detached its underlying file object.
+                fp_closed = self.length_remaining == 0
+            if not fp_closed and self.length_remaining != 0:
+                return
+        self._decoded_buffer = BytesQueueBuffer()
+        self._decoder = None
+        self._body = None
+        self._original_response = None
+        self._fp = None
+
+    def release_conn(self) -> None:
+        try:
+            super().release_conn()
+        finally:
+            self._clear_consumed_state()
+
     def _init_decoder(self) -> None:
         """
         Set-up the _decoder attribute if necessary.
@@ -1004,7 +1037,7 @@ class HTTPResponse(_HTTPResponse):
             yield from self.read_chunked(amt, decode_content=decode_content)
             return
         while (
-            not is_fp_closed(self._fp)
+            self._fp is not None and not is_fp_closed(self._fp)
             or len(self._decoded_buffer) > 0
             or (self._decoder and self._decoder.has_unconsumed_tail)
         ):

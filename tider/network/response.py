@@ -62,6 +62,30 @@ def stream_decode_response_unicode(iterator, encoding=None):
         yield rv
 
 
+def _clear_exception_chain(error):
+    """Break traceback and nested-exception references when a response closes."""
+    pending = [error]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        cause, context = current.__cause__, current.__context__
+        pending.extend(
+            linked for linked in (cause, context)
+            if linked is not None
+        )
+        pending.extend(
+            arg for arg in current.args
+            if isinstance(arg, BaseException)
+        )
+        current.__traceback__ = None
+        current.__cause__ = None
+        current.__context__ = None
+
+
 class Response:
 
     __slots__ = (
@@ -612,7 +636,7 @@ class Response:
                 self._clear_caches()
                 error, self._error = self._error, None
                 if error is not None:
-                    error.__traceback__ = None
+                    _clear_exception_chain(error)
                 if isinstance(self._content, bytes):
                     self._content = None
                 self.request = None
