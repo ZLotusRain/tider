@@ -318,7 +318,6 @@ class Explorer:
         download_func = self.explore
         queue = self.queue
         on_response = self.on_response
-        transferring = self.transferring
         if len(self.transferring) < self.concurrency and len(self.queue) > 0:
             # avoid stuck in threadpool executor when putting work item.
             try:
@@ -326,7 +325,7 @@ class Explorer:
                 self.pool.apply_async(
                     self._transport,
                     (queue, download_func, on_response),
-                    kwargs={'transport_id': transport_id, 'transferring': transferring, 'loop': self.loop},
+                    kwargs={'transport_id': transport_id, 'loop': self.loop},
                 )
             except IndexError:
                 pass
@@ -345,7 +344,6 @@ class Explorer:
         return len(self.queue) >= self.concurrency + 1
 
     def _on_response_consumed(self, response):
-        self.free_slots.append(str(uuid4()))  # release slot to control concurrency.
         transport_id = response.meta.get('transport_id')
         if transport_id:
             try:
@@ -354,25 +352,29 @@ class Explorer:
                 pass
         self._transferring_count -= 1
         self.transferring.discard(response.request)
+        self.free_slots.append(str(uuid4()))  # release slot to control concurrency.
 
-    def _transport(self, queue, download_func, output_handler=_dummy_handler, transport_id=None,
-                   transferring=None, loop=False):
+    def _transport(self, queue, download_func, output_handler=_dummy_handler, transport_id=None, loop=False):
         exc = None
-        if transferring is None:
-            transferring = set()
+        transferring = self.transferring
         if transport_id:
             self.transports.append(transport_id)
+        keep_slot = False
         while self.running:
-            keep_slot = False
             try:
                 request = queue.popleft()
-                self._transferring_count += 1
-                should_free = True
             except IndexError:
                 # avoid catching IndexError raised by output handler.
                 if not loop or state.stop_requested() or state.terminate_requested():
                     break
+                self._crawler.sleep(0.001)
                 continue
+
+            keep_slot = False
+            completed = False
+            response = None
+            self._transferring_count += 1
+            should_free = True
             transferring.add(request)  # thread switch.
             if transport_id:
                 request.meta['transport_id'] = transport_id
@@ -384,11 +386,11 @@ class Explorer:
                     response = download_func(request)
                 if not loop and request.stream and isinstance(response, Response) and not response.failed:
                     response.on_consumed = self._on_response_consumed
-                    keep_slot = True
+                    keep_slot = True  # Response owns the slot until consumed.
                 # don't use thread lock in handler if possible.
                 output_handler(response)
-                del response
-
+                completed = True
+                response = None
                 if keep_slot:
                     should_free = False
                     return  # keep slot due to stream.
@@ -403,17 +405,28 @@ class Explorer:
                 state.should_terminate = EX_FAILURE
                 break
             finally:
-                if should_free:
+                if not completed:
+                    if isinstance(response, Response):
+                        response.close()
+                    elif isinstance(response, Request) and response is not request:
+                        response.close()
+                    if request is not None:
+                        request.close()
+                # Stream responses release transferring through on_consumed.
+                if should_free and not keep_slot:
                     self._transferring_count -= 1
                     transferring and transferring.discard(request)
                 # switch greenlet if using gevent
                 # when the active one can't get the next request
                 # to avoid keeping loop.
                 self._crawler.sleep(0.001)
-        if transport_id:
+        # Stream responses release transport ownership through on_consumed.
+        if transport_id and not keep_slot:
             self.transports.remove(transport_id)
         del download_func, output_handler
-        self.free_slots.append(str(uuid4()))
+        # Stream responses release their slot through on_consumed.
+        if not keep_slot:
+            self.free_slots.append(str(uuid4()))
         if exc is not None:
             raise exc
 
@@ -449,13 +462,12 @@ class Explorer:
         # to free self if nobody else has a reference to it.
         queue = self.queue
         download_func = self.explore
-        transferring = self.transferring
         for _ in range(self.concurrency):
             transport_id = str(uuid4())
             self.pool.apply_async(
                 self._transport,
                 (queue, download_func, on_response),
-                kwargs={'transport_id': transport_id, 'transferring': transferring, 'loop': self.loop},
+                kwargs={'transport_id': transport_id, 'loop': self.loop},
             )
 
     def try_explore(
