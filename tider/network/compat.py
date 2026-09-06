@@ -704,20 +704,19 @@ class HTTPResponse(_HTTPResponse):
         finally:
             self._decoded_buffer = BytesQueueBuffer()
             self._decoder = None
+            self._clear_consumed_state()
 
-    def _clear_consumed_state(self) -> None:
-        """Drop response-side buffers after the body no longer owns the socket.
+    def _clear_consumed_state(self, *, closed=False) -> None:
+        """Drop exhausted read state after decoding, or discard it on close.
 
-        ``release_conn()`` returns the connection to urllib3's pool but the
-        urllib3 response object can remain reachable for a while through
-        exception/greenlet bookkeeping.  Keeping ``_fp`` and
-        ``_original_response`` on that object retains the stdlib HTTPResponse
-        (and its buffered reader) even though the body has been consumed.  At
-        this point no further reads are valid, so sever those references while
-        leaving the pooled connection itself intact.
+        Do not call this from release_conn(): urllib3 can return the socket
+        while the last raw bytes still await decoding. Cached content remains
+        valid until explicit close, independently of connection ownership.
         """
+        if not closed and (len(self._decoded_buffer) or self._decoder and self._decoder.has_unconsumed_tail):
+            return
         fp = getattr(self, "_fp", None)
-        if fp is not None:
+        if not closed and fp is not None:
             try:
                 fp_closed = is_fp_closed(fp)
             except (AttributeError, ValueError):
@@ -728,15 +727,16 @@ class HTTPResponse(_HTTPResponse):
                 return
         self._decoded_buffer = BytesQueueBuffer()
         self._decoder = None
-        self._body = None
+        if closed:
+            self._body = None
         self._original_response = None
         self._fp = None
 
-    def release_conn(self) -> None:
+    def close(self) -> None:
         try:
-            super().release_conn()
+            super().close()
         finally:
-            self._clear_consumed_state()
+            self._clear_consumed_state(closed=True)
 
     def _init_decoder(self) -> None:
         """
@@ -745,7 +745,7 @@ class HTTPResponse(_HTTPResponse):
         # Note: content-encoding value should be case-insensitive, per RFC 7230
         # Section 3.2
         content_encoding = self.headers.get("content-encoding", "").lower()
-        if self._decoder is None:
+        if self._decoder is None and self._fp is not None:
             if content_encoding in self.CONTENT_DECODERS:
                 self._decoder = _get_decoder(content_encoding)
             elif "," in content_encoding:
@@ -908,8 +908,10 @@ class HTTPResponse(_HTTPResponse):
         if (
             not data
             and len(self._decoded_buffer) == 0
-            and not (self._decoder and self._decoder.has_unconsumed_tail)
+            and not self._decoder
         ):
+            if amt != 0:
+                self._clear_consumed_state()
             return data
 
         if amt is None:
@@ -927,6 +929,8 @@ class HTTPResponse(_HTTPResponse):
                         "Calling read(decode_content=False) is not supported after "
                         "read(decode_content=True) was called."
                     )
+                if flush_decoder:
+                    self._clear_consumed_state()
                 return data
 
             decoded_data = self._decode(
@@ -952,6 +956,8 @@ class HTTPResponse(_HTTPResponse):
                 self._decoded_buffer.put(decoded_data)
             data = self._decoded_buffer.get(amt)
 
+        if flush_decoder:
+            self._clear_consumed_state()
         return data
 
     def read1(self, amt=None, decode_content=None) -> bytes:
@@ -998,10 +1004,14 @@ class HTTPResponse(_HTTPResponse):
         data = self._raw_read(amt, read1=True)
         self._uncached_read_occurred = True
         if not decode_content or data is None:
+            if not data:
+                self._clear_consumed_state()
             return data
 
         self._init_decoder()
         if self._decoder is None:
+            if not data:
+                self._clear_consumed_state()
             return data
         while True:
             flush_decoder = not data
@@ -1013,7 +1023,10 @@ class HTTPResponse(_HTTPResponse):
                 break
             data = self._raw_read(8192, read1=True)
 
-        return self._decoded_buffer.get(amt)
+        data = self._decoded_buffer.get(amt)
+        if flush_decoder:
+            self._clear_consumed_state()
+        return data
 
     def stream(self, amt=_STREAM_READ_SIZE, decode_content=None) -> typing.Generator[bytes]:
         """
@@ -1036,8 +1049,10 @@ class HTTPResponse(_HTTPResponse):
         if self.chunked and self.supports_chunked_reads() and not _HANDLE_CHUNK_DECODES_CONTENT:
             yield from self.read_chunked(amt, decode_content=decode_content)
             return
+        # A closed socket may still have decoder output. Read through decoded
+        # EOF so the decoder is flushed before its state is discarded.
         while (
-            self._fp is not None and not is_fp_closed(self._fp)
+            self._fp is not None
             or len(self._decoded_buffer) > 0
             or (self._decoder and self._decoder.has_unconsumed_tail)
         ):
@@ -1050,6 +1065,8 @@ class HTTPResponse(_HTTPResponse):
         # urllib3.future handles transfer decoding in its chunk reader.
         if _HANDLE_CHUNK_DECODES_CONTENT:
             yield from super().read_chunked(amt, decode_content=decode_content)
+            if amt != 0:
+                self._clear_consumed_state()
             return
 
         # Classic urllib3 exposes raw chunk framing through the httplib body.
@@ -1114,6 +1131,8 @@ class HTTPResponse(_HTTPResponse):
 
             if self._original_response:
                 self._original_response.close()
+
+        self._clear_consumed_state()
 
 
 class FullPoolError(PoolError):
