@@ -116,7 +116,7 @@ class HeartEngine:
                     and not self._overload()
                     and self._next_request_from_scheduler() is not None
                 ):
-                    pass
+                    self.crawler.sleep(0)
 
                 if not self.needs_backout() and not self._overload():
                     # noinspection PyBroadException
