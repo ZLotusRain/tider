@@ -12,7 +12,7 @@ from collections import deque, defaultdict
 from typing import Union
 
 from tider import Request
-from tider.network import Session, ProxyPoolManager, Response
+from tider.network import Session, Proxy, ProxyPoolManager, Response
 from tider.exceptions import (
     _InvalidMiddlewareOutput,
     DownloadError,
@@ -437,7 +437,8 @@ class Explorer:
             if request.selected_proxy:
                 return
         except ProxyError:
-            pass
+            # Release the invalid lease before reserving room for its replacement.
+            request.bind_proxy(Proxy())
         proxy = self.proxypool.get_proxy(
             schema=request.proxy_schema,
             proxy_args=request.proxy_params,
@@ -546,6 +547,9 @@ class Explorer:
         result = self.middleware.process_request(request)
         response = None
         if isinstance(result, Request):
+            # Release the superseded owner after middleware returns a replacement.
+            if result is not request:
+                request.close()
             request = result
             if request.url == 'about:blank':
                 response = Response(request)
@@ -563,9 +567,15 @@ class Explorer:
                     response = Response(request)
                     response.fail(e)
             result = self.middleware.process_response(request=request, response=response)
+        elif isinstance(result, Response):
+            response = result
+            result = self.middleware.process_response(request=request, response=response)
         if isinstance(result, Request):
+            # Close the response and old request before handing the replacement to the scheduler.
             if response is not None:
                 response.close()
+            if result is not request:
+                request.close()
             return result
 
         # default procedure

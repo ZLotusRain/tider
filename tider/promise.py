@@ -328,7 +328,8 @@ class Promise:
                     if source_request.selected_proxy:
                         request.inherit_proxy(source_request, proxies_explicit=source_request.proxies_explicit)
                 except ProxyError:
-                    pass
+                    # Only the scheduled copy may keep a lease while awaiting its response.
+                    source_request.unbind_proxy()
                 if not request.meta.get("promise_node"):
                     # avoid parent promise overwrites child promise.
                     request.meta["promise_node"] = node
