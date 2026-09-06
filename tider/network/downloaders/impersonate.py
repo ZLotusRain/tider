@@ -1,9 +1,5 @@
 import _queue
-import ctypes
-import os
 import threading
-import time
-import weakref
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
@@ -20,84 +16,24 @@ except ImportError:
 from tider import Request, Response
 from tider.utils.log import get_logger
 from tider.utils.time import preferred_clock
-from tider.exceptions import ImproperlyConfigured, ProxyError
+from tider.exceptions import (
+    ConnectionError,
+    ConnectTimeout,
+    DownloadError,
+    ImproperlyConfigured,
+    InvalidProxy,
+    ProtocolError,
+    ProxyError,
+    ReadTimeout,
+    SSLError,
+)
 
 logger = get_logger(__name__)
 
 
 _STREAM_END = object()
 _STREAM_QUEUE_MAXSIZE = 16
-
-
-def _env_int(name, default):
-    try:
-        return int(os.environ.get(name, default))
-    except (TypeError, ValueError):
-        return default
-
-
-class _GlibcMemoryReclaimer:
-    """Optional manual malloc diagnostics; never used by the downloader."""
-
-    def __init__(self):
-        self.rss_threshold = max(
-            0, _env_int("TIDER_IMPERSONATE_MALLOC_TRIM_RSS_THRESHOLD", 0),
-        )
-        self.interval = max(
-            0, _env_int("TIDER_IMPERSONATE_MALLOC_TRIM_INTERVAL", 300),
-        )
-        self._lock = threading.Lock()
-        self._next_check = 0.0
-        self._malloc_trim = self._load_malloc_trim() if self.rss_threshold else None
-
-    @staticmethod
-    def _load_malloc_trim():
-        try:
-            malloc_trim = ctypes.CDLL(None).malloc_trim
-        except (AttributeError, OSError):
-            return None
-        malloc_trim.argtypes = [ctypes.c_size_t]
-        malloc_trim.restype = ctypes.c_int
-        return malloc_trim
-
-    @staticmethod
-    def _rss_bytes():
-        try:
-            with open("/proc/self/statm", encoding="ascii") as stream:
-                resident_pages = int(stream.read().split()[1])
-            return resident_pages * os.sysconf("SC_PAGE_SIZE")
-        except (OSError, ValueError, IndexError):
-            return 0
-
-    def maybe_trim(self):
-        """Run malloc_trim only when explicitly called by a diagnostic tool."""
-        if self._malloc_trim is None:
-            return None
-
-        now = preferred_clock()
-        if now < self._next_check or not self._lock.acquire(blocking=False):
-            return None
-        try:
-            if now < self._next_check:
-                return None
-            self._next_check = now + self.interval
-            before_rss = self._rss_bytes()
-            if before_rss < self.rss_threshold:
-                return None
-
-            started = time.perf_counter()
-            trimmed = bool(self._malloc_trim(0))
-            elapsed = (time.perf_counter() - started) * 1000
-            after_rss = self._rss_bytes()
-            return {
-                "trimmed": trimmed,
-                "before": before_rss,
-                "after": after_rss,
-                "released": max(0, before_rss - after_rss),
-                "elapsed": elapsed,
-            }
-        finally:
-            self._lock.release()
+_GEVENT_POLL_INTERVAL = 0.003
 
 
 def _drain_stream_queue(queue_):
@@ -113,10 +49,10 @@ def _drain_stream_queue(queue_):
 class _StreamQueue:
     """Thread-safe bounded queue that is not affected by monkey patching."""
 
-    def __init__(self):
+    def __init__(self, maxsize=_STREAM_QUEUE_MAXSIZE):
         self._queue = _queue.SimpleQueue()
         self._slots = _queue.SimpleQueue()
-        for _ in range(_STREAM_QUEUE_MAXSIZE):
+        for _ in range(max(1, int(maxsize))):
             self._slots.put(None)
         self.quit_now = None
 
@@ -194,10 +130,20 @@ _IMMEDIATE_PROXY_ERROR_CODES = frozenset({
     _curl_code("COULDNT_RESOLVE_PROXY", 5),
     _curl_code("PROXY", 97),
 })
-_SOFT_PROXY_ERROR_CODES = frozenset({
-    _curl_code("COULDNT_CONNECT", 7),
-    _curl_code("OPERATION_TIMEDOUT", 28),
-})
+_SSL_ERROR_CODES = frozenset(_curl_code(name, -1) for name in (
+    "SSL_CACERT_BADFILE", "SSL_CERTPROBLEM", "SSL_CIPHER", "SSL_CLIENTCERT",
+    "SSL_CONNECT_ERROR", "SSL_CRL_BADFILE", "SSL_ENGINE_INITFAILED",
+    "SSL_ENGINE_NOTFOUND", "SSL_ENGINE_SETFAILED", "SSL_INVALIDCERTSTATUS",
+    "SSL_ISSUER_ERROR", "SSL_PINNEDPUBKEYNOTMATCH", "SSL_SHUTDOWN_FAILED",
+    "USE_SSL_FAILED",
+))
+_CONNECTION_ERROR_CODES = frozenset(_curl_code(name, -1) for name in (
+    "COULDNT_RESOLVE_HOST", "COULDNT_CONNECT", "RECV_ERROR", "SEND_ERROR",
+    "NO_CONNECTION_AVAILABLE", "QUIC_CONNECT_ERROR",
+))
+_PROTOCOL_ERROR_CODES = frozenset(_curl_code(name, -1) for name in (
+    "HTTP2", "HTTP2_STREAM", "PARTIAL_FILE", "UNSUPPORTED_PROTOCOL",
+))
 
 
 def _decode_info(value):
@@ -214,6 +160,24 @@ def _curl_error_code(error):
         return int(error.code)
     except (AttributeError, TypeError, ValueError):
         return None
+
+
+def _map_curl_error(error, received_headers=False):
+    """Map curl failures to Tider's retryable download error taxonomy."""
+    if isinstance(error, DownloadError):
+        return error
+    code = _curl_error_code(error)
+    if code in _IMMEDIATE_PROXY_ERROR_CODES:
+        return InvalidProxy(error)
+    if code == _curl_code("OPERATION_TIMEDOUT", 28):
+        return ReadTimeout(error) if received_headers else ConnectTimeout(error)
+    if code in _SSL_ERROR_CODES:
+        return SSLError(error)
+    if code in _PROTOCOL_ERROR_CODES:
+        return ProtocolError(error)
+    if code in _CONNECTION_ERROR_CODES:
+        return ConnectionError(error)
+    return DownloadError(error)
 
 
 def _set_curl_option(curl, name, value):
@@ -509,33 +473,105 @@ class StreamingCurlResponse(CurlResponse):
         super().close()
 
 
+class _CurlExecutor:
+    """Run blocking Curl work without blocking a greenlet hub."""
+
+    def __init__(self, kind=None, max_workers=1):
+        self.kind = kind
+        self.max_workers = max(1, int(max_workers))
+        self._pool = None
+
+    @property
+    def pool(self):
+        if self._pool is None:
+            if self.kind == "gevent":
+                import gevent
+                from gevent.threadpool import ThreadPool
+                self._pool = ThreadPool(self.max_workers, hub=gevent.get_hub())
+            else:
+                self._pool = ThreadPoolExecutor(max_workers=self.max_workers)
+        return self._pool
+
+    def perform(self, func):
+        if self.kind == "eventlet":
+            import eventlet.tpool
+            return eventlet.tpool.execute(func)
+        if self.kind == "gevent":
+            return self.pool.spawn(func).get()
+        if self.kind == "threads":
+            return self.pool.submit(func).result()
+        return func()
+
+    def spawn(self, func):
+        if self.kind == "eventlet":
+            import eventlet
+            import eventlet.tpool
+            return eventlet.spawn(lambda: eventlet.tpool.execute(func))
+        if self.kind == "gevent":
+            return self.pool.spawn(func)
+        return self.pool.submit(func)
+
+    def wait(self, task):
+        if self.kind == "eventlet":
+            return task.wait()
+        if self.kind == "gevent":
+            return task.get()
+        return task.result()
+
+    def wait_event(self, event):
+        if self.kind == "eventlet":
+            import eventlet
+            while not event.is_set():
+                eventlet.sleep(0.001)
+            return
+        if self.kind == "gevent":
+            import gevent
+            while not event.is_set():
+                gevent.sleep(_GEVENT_POLL_INTERVAL)
+            return
+        event.wait()
+
+    def queue_get(self, queue_):
+        if self.kind == "eventlet":
+            import eventlet
+            while True:
+                try:
+                    return queue_.get_nowait()
+                except _queue.Empty:
+                    eventlet.sleep(0.001)
+        if self.kind == "gevent":
+            import gevent
+            while True:
+                try:
+                    return queue_.get_nowait()
+                except _queue.Empty:
+                    gevent.sleep(_GEVENT_POLL_INTERVAL)
+        return queue_.get()
+
+    def close(self):
+        pool, self._pool = self._pool, None
+        if pool is not None:
+            if self.kind == "gevent":
+                with suppress(Exception):
+                    pool.kill()
+            else:
+                pool.shutdown(wait=False, cancel_futures=True)
+
+
 class ImpersonateDownloader:
     """curl_cffi impersonate downloader based on Curl, not Session."""
 
     lazy = True
 
-    def __init__(self, concurrency=None):
-        self._thread = None
+    def __init__(self, concurrency=None, thread=None, stream_queue_maxsize=_STREAM_QUEUE_MAXSIZE):
+        self._thread = thread
         self._concurrency = concurrency
+        self._stream_queue_maxsize = max(1, int(stream_queue_maxsize))
         self._pool_maxsize = max(1, int(concurrency or 10))
         self._idle_ttl = 60
         self._curl_max_lifetime = 600
         self._max_connects = 1
-        self._executor = None
-        self._gevent_threadpool = None
-        self._proxy_failures = weakref.WeakKeyDictionary()
-        self._proxy_failures_lock = threading.RLock()
-        try:
-            import gevent.monkey
-            if gevent.monkey.is_anything_patched():
-                self._thread = "gevent"
-        except ImportError:
-            try:
-                import eventlet.patcher
-                if eventlet.patcher.already_patched:
-                    self._thread = "eventlet"
-            except ImportError:
-                pass
+        self._curl_executor = _CurlExecutor(thread, max_workers=self._pool_maxsize)
         self.curl_pool = CurlPool(
             maxsize=self._pool_maxsize,
             idle_ttl=self._idle_ttl,
@@ -552,32 +588,24 @@ class ImpersonateDownloader:
 
     @classmethod
     def from_crawler(cls, crawler):
-        return cls(crawler.concurrency)
+        pool_cls = crawler.Pool
+        module = pool_cls.__module__
+        thread = "threads" if getattr(pool_cls, "is_green", False) else None
+        if module.endswith(".gevent"):
+            thread = "gevent"
+        elif module.endswith(".eventlet"):
+            thread = "eventlet"
+        return cls(
+            concurrency=crawler.concurrency,
+            thread=thread,
+            stream_queue_maxsize=crawler.settings.getint(
+                "IMPERSONATE_STREAM_QUEUE_MAXSIZE", _STREAM_QUEUE_MAXSIZE,
+            ),
+        )
 
     def close_expired_connections(self):
         if self.curl_pool is not None:
             self.curl_pool.close_expired_connections()
-
-    @property
-    def _threadpool_size(self):
-        return max(1, int(self._concurrency or 10))
-
-    @property
-    def executor(self):
-        if self._executor is None:
-            self._executor = ThreadPoolExecutor(max_workers=self._threadpool_size)
-        return self._executor
-
-    @property
-    def gevent_threadpool(self):
-        if self._gevent_threadpool is None:
-            import gevent
-            from gevent.threadpool import ThreadPool
-            self._gevent_threadpool = ThreadPool(self._threadpool_size, hub=gevent.get_hub())
-        return self._gevent_threadpool
-
-    def _spawn_gevent(self, func):
-        return self.gevent_threadpool.spawn(func)
 
     @staticmethod
     def _safe_perform(curl):
@@ -595,97 +623,29 @@ class ImpersonateDownloader:
         return result
 
     def _perform(self, curl):
-        if self._thread == "eventlet":
-            import eventlet.tpool
-            result = eventlet.tpool.execute(self._safe_perform, curl)
-        elif self._thread == "gevent":
-            result = self._spawn_gevent(lambda: self._safe_perform(curl)).get()
-        else:
-            result = self._safe_perform(curl)
+        result = self._curl_executor.perform(lambda: self._safe_perform(curl))
         return self._raise_if_failed(result)
 
     def _spawn_stream_perform(self, func):
-        if self._thread == "eventlet":
-            import eventlet
-            import eventlet.tpool
-            return eventlet.spawn(lambda: eventlet.tpool.execute(func))
-        if self._thread == "gevent":
-            return self._spawn_gevent(func)
-        return self.executor.submit(func)
+        return self._curl_executor.spawn(func)
 
     def _wait_stream_task(self, task):
-        if self._thread == "eventlet":
-            return task.wait()
-        if self._thread == "gevent":
-            return task.get()
-        return task.result()
+        return self._curl_executor.wait(task)
 
     def _wait_stream_event(self, event):
-        if self._thread == "eventlet":
-            import eventlet
-            while not event.is_set():
-                eventlet.sleep(0.001)
-            return
-        if self._thread == "gevent":
-            import gevent
-            while not event.is_set():
-                gevent.sleep(0.001)
-            return
-        event.wait()
+        self._curl_executor.wait_event(event)
 
     def _stream_queue_get(self, queue_):
-        if self._thread == "eventlet":
-            import eventlet
-            while True:
-                try:
-                    return queue_.get_nowait()
-                except _queue.Empty:
-                    eventlet.sleep(0.001)
-        if self._thread == "gevent":
-            import gevent
-            while True:
-                try:
-                    return queue_.get_nowait()
-                except _queue.Empty:
-                    gevent.sleep(0.001)
-        return queue_.get()
+        return self._curl_executor.queue_get(queue_)
 
-    def _reset_proxy_failures(self, request, selected_proxy):
-        if not selected_proxy:
-            return
-        proxy = getattr(request, "proxy", None)
-        if proxy is None:
-            return
-        with self._proxy_failures_lock:
-            failures = self._proxy_failures.get(proxy)
-            if failures is None:
-                return
-            failures.pop(selected_proxy, None)
-            if not failures:
-                self._proxy_failures.pop(proxy, None)
-
-    def _record_soft_proxy_failure(self, request, selected_proxy):
-        proxy = getattr(request, "proxy", None)
-        if proxy is None:
-            return 0
-        with self._proxy_failures_lock:
-            failures = self._proxy_failures.setdefault(proxy, {})
-            failures[selected_proxy] = failures.get(selected_proxy, 0) + 1
-            return failures[selected_proxy]
-
-    def _should_invalidate_proxy(self, request, selected_proxy, error):
+    def _should_invalidate_proxy(self, selected_proxy, error):
         if isinstance(error, ProxyError):
             return True
-        if not selected_proxy or not isinstance(error, CurlError):
+        if not selected_proxy or CurlError is None or not isinstance(error, CurlError):
             return False
 
         code = _curl_error_code(error)
-        if code in _IMMEDIATE_PROXY_ERROR_CODES:
-            return True
-        if code in _SOFT_PROXY_ERROR_CODES:
-            failures = self._record_soft_proxy_failure(request, selected_proxy)
-            return failures >= 3
-        return False
+        return code in _IMMEDIATE_PROXY_ERROR_CODES
 
     def _build_response(
         self, request, prepared, curl, body_buffer, header_buffer, queue_=None, task=None,
@@ -754,17 +714,17 @@ class ImpersonateDownloader:
         queue_ = quit_now = task = None
         selected_proxy = None
         start = preferred_clock()
+
+        http_version = CurlHttpVersion.NONE if not request.http2 else CurlHttpVersion.V2_0
+        impersonate = request.impersonate if isinstance(request.impersonate, str) else "chrome"
+
+        headers = prepared.headers.copy()
+        headers.pop("Content-Length", None)
+        headers.pop("Cookie", None)
+        headers.pop("Accept-Encoding", None)
+        # Let curl_cffi manage hop-by-hop headers for the impersonated protocol.
+        headers.pop("Connection", None)
         try:
-            http_version = CurlHttpVersion.NONE if not request.http2 else CurlHttpVersion.V2_0
-            impersonate = request.impersonate if isinstance(request.impersonate, str) else "chrome"
-
-            headers = prepared.headers.copy()
-            headers.pop("Content-Length", None)
-            headers.pop("Cookie", None)
-            headers.pop("Accept-Encoding", None)
-            # Let curl_cffi manage hop-by-hop headers for the impersonated protocol.
-            headers.pop("Connection", None)
-
             selected_proxy = request.selected_proxy
             reuse_curl = not request.stream and not selected_proxy
             if reuse_curl:
@@ -801,7 +761,7 @@ class ImpersonateDownloader:
                 stream=request.stream,
                 max_recv_speed=request.meta.get("impersonate_max_recv_speed", 0),
                 curl_options=request.meta.get("impersonate_curl_options"),
-                queue_class=_StreamQueue,
+                queue_class=lambda: _StreamQueue(self._stream_queue_maxsize),
                 event_class=_ThreadEvent,
             )
             if queue_ is not None:
@@ -821,8 +781,9 @@ class ImpersonateDownloader:
                         curl.perform()
                     except Exception as e:
                         e.__traceback__ = None
-                        stream_errors.append(e)
-                        queue_.put_nowait(e)
+                        mapped = _map_curl_error(e, received_headers=header_recved.is_set())
+                        stream_errors.append(mapped)
+                        queue_.put_nowait(mapped)
                     finally:
                         if not header_recved.is_set():
                             header_recved.set()
@@ -833,15 +794,12 @@ class ImpersonateDownloader:
 
                 first_error = stream_errors[0] if stream_errors else None
                 if first_error is not None:
-                    if self._should_invalidate_proxy(request, selected_proxy, first_error):
+                    if self._should_invalidate_proxy(selected_proxy, first_error):
                         request.invalidate_proxy()
                     return self._failed_response(request, first_error, start)
 
-                def on_complete(request=request, selected_proxy=selected_proxy):
-                    self._reset_proxy_failures(request, selected_proxy)
-
-                def on_error(error, request=request, selected_proxy=selected_proxy):
-                    if self._should_invalidate_proxy(request, selected_proxy, error):
+                def on_error(error):
+                    if self._should_invalidate_proxy(selected_proxy, error):
                         request.invalidate_proxy()
 
                 response = self._build_response(
@@ -853,7 +811,6 @@ class ImpersonateDownloader:
                     queue_=queue_,
                     task=task,
                     quit_now=quit_now,
-                    on_complete=on_complete,
                     on_error=on_error,
                 )
                 curl = header_buffer = queue_ = quit_now = task = None
@@ -872,13 +829,11 @@ class ImpersonateDownloader:
                     curl.close()
                 curl = None
             response.elapsed = preferred_clock() - start
-            if not request.stream:
-                self._reset_proxy_failures(request, selected_proxy)
             return response
         except Exception as e:
-            if self._should_invalidate_proxy(request, selected_proxy, e):
+            if self._should_invalidate_proxy(selected_proxy, e):
                 request.invalidate_proxy()
-            return self._failed_response(request, e, start)
+            return self._failed_response(request, _map_curl_error(e), start)
         finally:
             if task is not None:
                 if quit_now is not None:
@@ -904,10 +859,6 @@ class ImpersonateDownloader:
         if self.curl_pool is not None:
             self.curl_pool.close()
             self.curl_pool = None
-        if self._executor is not None:
-            self._executor.shutdown(wait=False, cancel_futures=True)
-            self._executor = None
-        gevent_threadpool, self._gevent_threadpool = self._gevent_threadpool, None
-        if gevent_threadpool is not None:
-            with suppress(Exception):
-                gevent_threadpool.kill()
+        if self._curl_executor is not None:
+            self._curl_executor.close()
+            self._curl_executor = None
