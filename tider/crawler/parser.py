@@ -84,13 +84,26 @@ def _get_spider_outputs(func, response, cb_kwargs):
     return func(response, **accept_kwargs)
 
 
+def _request_snapshot(request, spider):
+    """Return a best-effort error snapshot without hiding the original error."""
+    try:
+        return request.to_dict(spider=spider, encode_body=True)
+    except (AttributeError, ValueError):
+        return {
+            'url': request.url,
+            'method': request.method,
+            'callback': getattr(request.callback, '__qualname__', None),
+            'errback': getattr(request.errback, '__qualname__', None),
+        }
+
+
 class Parser:
 
     def __init__(self, crawler):
         self.crawler = crawler
         # https://github.com/gevent/gevent/issues/1437
         # https://greenlet.readthedocs.io/en/stable/python_threads.html
-        self.concurrency = crawler.concurrency // 3 + 1
+        self.concurrency = crawler.concurrency // 2 + 1
         itemproc_cls = crawler.settings.get('ITEM_PROCESSOR')
         self.itemproc = build_from_crawler(symbol_by_name(itemproc_cls), self.crawler)
         self.max_items = crawler.settings.getint('ITEM_PROCESSOR_MAX_ITEMS', 1)
@@ -201,19 +214,6 @@ class Parser:
         else:
             engine.explorer.on_response(response)
 
-    def _process_promise_outputs(self, outputs, request):
-        for output in iter_generator(outputs, sleep=self.crawler.sleep):
-            # maybe iter node.then() directly.
-            state.maybe_shutdown()
-            if isinstance(output, Request):
-                try:
-                    selected_proxy = output.selected_proxy
-                except ProxyError:
-                    selected_proxy = None
-                if not selected_proxy:
-                    self._inherit_request_proxy(output, request)
-            self._process_spider_output(output, request)
-
     def parse(self, response):
         request = response.request
         callback = request.callback or self.crawler.spider.parse
@@ -221,74 +221,79 @@ class Parser:
         cb_kwargs = request.cb_kwargs
         node = request.meta.pop("promise_node", None)
 
-        spider_outputs_done = False
         try:
             spider_outputs = None
-            if response.failed:
-                if errback:
-                    spider_outputs = _get_spider_outputs(errback, response, cb_kwargs=cb_kwargs)
-                elif request.meta.get('save_unhandled_failure', True):
-                    try:
-                        response.check_error()
-                    except DownloadError as exc:
-                        failure = {
-                            "request": request.to_dict(spider=self.crawler.spider, encode_body=True),
-                            "type": exc.__class__.__name__,
-                            "reason": str(exc),
-                            "time": int(time.time() * 1000)
-                        }
-                        self.crawler.spider.meta['failures'].append(failure)
-                self.crawler.stats.inc_value("request/count/failed")
-            else:
-                spider_outputs = _get_spider_outputs(callback, response, cb_kwargs=cb_kwargs)
+            try:
+                if response.failed:
+                    if errback:
+                        spider_outputs = _get_spider_outputs(errback, response, cb_kwargs=cb_kwargs)
+                    elif request.meta.get('save_unhandled_failure', True):
+                        try:
+                            response.check_error()
+                        except DownloadError as exc:
+                            failure = {
+                                "request": _request_snapshot(request, self.crawler.spider),
+                                "type": exc.__class__.__name__,
+                                "reason": str(exc),
+                                "time": int(time.time() * 1000)
+                            }
+                            self.crawler.spider.meta['failures'].append(failure)
+                    self.crawler.stats.inc_value("request/count/failed")
+                else:
+                    spider_outputs = _get_spider_outputs(callback, response, cb_kwargs=cb_kwargs)
 
-            order = 0
-            # sleep to switch thread
-            for output in iter_generator(spider_outputs, sleep=self.crawler.sleep):
-                # maybe iter spider outputs directly.
-                state.maybe_shutdown()
-                if self._spider_output_filter(output, response):
-                    if isinstance(output, Request):
-                        self._inherit_request_proxy(output, request)
-                    if node and isinstance(output, Request):
-                        if not output.meta.get('promise_order'):
-                            output.meta['promise_order'] = order
-                            order += 1
-                        node.add_child(output)  # already SCHEDULED
-                        if output.meta.get('promise_node'):
+                order = 0
+                # sleep to switch thread
+                for output in iter_generator(spider_outputs, sleep=self.crawler.sleep):
+                    # maybe iter spider outputs directly.
+                    state.maybe_shutdown()
+                    if self._spider_output_filter(output, response):
+                        if isinstance(output, Request):
+                            self._inherit_request_proxy(output, request)
+                        if node and isinstance(output, Request):
+                            if not output.meta.get('promise_order'):
+                                output.meta['promise_order'] = order
+                                order += 1
+                            node.add_child(output)  # already SCHEDULED
+                            if output.meta.get('promise_node'):
+                                self._process_spider_output(output, request)
+                        else:
                             self._process_spider_output(output, request)
-                    else:
-                        self._process_spider_output(output, request)
-            # No Exceptions raised when processed by callback/errback
-            spider_outputs_done = True
-            _success = True  # reserved, merged with spider_outputs_done in the future.
-            if node:
-                node.state = NodeState.EXECUTED if _success else NodeState.REJECTED
-                self._process_promise_outputs(node.then(), request)
-        except (SpiderTerminate, SpiderShutdown):
-            raise
-        except Exception as e:
-            if not spider_outputs_done:
+            except Exception as e:
                 logger.exception(f"Parser bug processing {request}")
                 error = {
-                    "request": request.to_dict(spider=self.crawler.spider, encode_body=True),
+                    "request": _request_snapshot(request, self.crawler.spider),
                     "time": int(time.time() * 1000),
                     "type": e.__class__.__name__,
                     "traceback": traceback.format_exc()
                 }
                 self.crawler.spider.meta['errors'].append(error)
                 self.crawler.stats.inc_value(f"parser/{e.__class__.__name__}/count")
-            else:
+
+            _success = True  # reserved
+            try:
+                if node:
+                    node.state = NodeState.EXECUTED if _success else NodeState.REJECTED
+                    for output in iter_generator(node.then(), sleep=self.crawler.sleep):
+                        # maybe iter node.then() directly.
+                        state.maybe_shutdown()
+                        if isinstance(output, Request):
+                            try:
+                                selected_proxy = output.selected_proxy
+                            except ProxyError:
+                                selected_proxy = None
+                            if not selected_proxy:
+                                self._inherit_request_proxy(output, request)
+                        self._process_spider_output(output, request)
+            except Exception as e:
                 logger.exception(f"Promise bug processing {request}")
                 self.crawler.stats.inc_value(f"promise/{e.__class__.__name__}/count")
+        except (SpiderTerminate, SpiderShutdown):
+            raise
         finally:
-            try:
-                del callback, errback
-            finally:
-                try:
-                    response.close()
-                finally:
-                    request.close()
+            response.close()
+            request.close()
+            del callback, errback
 
     def _proxy_key(self, request):
         proxypool = self.crawler.engine.explorer.proxypool
@@ -320,7 +325,6 @@ class Parser:
         except ProxyError:
             if output.proxy is request.proxy:
                 output.bind_proxy(Proxy())
-            pass
 
     def _spider_output_filter(self, request, response):
         if isinstance(request, Request):
