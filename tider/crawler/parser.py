@@ -206,10 +206,12 @@ class Parser:
 
     def _process_immediate_request(self, request):
         engine = self.crawler.engine
-        # Keep retries in the current parse flow so immediate ordering is preserved.
-        # Parser owns the request until parse() transfers or releases its proxy lease.
-        response = engine.explorer.try_explore(request=request, check_error=False, release_proxy=False)
-        if response.meta.get('immediate_parse', False):
+        response = engine.explorer.try_explore(
+            request=request, check_error=False, release_proxy=False, retry_on_proxy_wait=False)
+        if isinstance(response, Request):
+            # Defer proxy waits so the parent parser can release its lease.
+            engine.schedule_request(response)
+        elif response.meta.get('immediate_parse', False):
             self.parse(response)
         else:
             engine.explorer.on_response(response)

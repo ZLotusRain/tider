@@ -476,9 +476,9 @@ class Explorer:
         files=None, timeout=None, proxies=None, allow_redirects=True, stream=None, verify=None, cert=None,
         raise_for_status=False, proxy_schema=0, proxy_params=None, delay=0, max_retries=0, encoding=None, http2=False,
         ignored_status_codes=(400, 412, 521), downloader=None, impersonate=None, request=None, check_error=True,
-        release_proxy=True, **kwargs
+        release_proxy=True, retry_on_proxy_wait=True, **kwargs
     ):
-        """Simple request api."""
+        """Simple request api. Opt out of proxy waits to return the retry Request to its caller."""
         kwargs.pop('dup_check', None)
         if request is None:
             request = Request(
@@ -490,6 +490,8 @@ class Explorer:
             )
         response = self._explore(request)
         while isinstance(response, Request):
+            if response.meta.pop('_proxy_wait', False) and not retry_on_proxy_wait:
+                return response
             state.maybe_shutdown()
             if response is not request:
                 request.close()
@@ -542,6 +544,8 @@ class Explorer:
             self.climits.release(acquired)
 
     def _explore(self, request):
+        # A proxy wait belongs to one attempt, not to retries that inherit its meta.
+        request.meta.pop('_proxy_wait', None)
         self._crawler.stats.inc_value("request/count")
         # use `request.request_kwargs` directly may lead memory leak on CentOS.
         result = self.middleware.process_request(request)
@@ -572,6 +576,7 @@ class Explorer:
             result = self.middleware.process_response(request=request, response=response)
         if isinstance(result, Request):
             # Close the response and old request before handing the replacement to the scheduler.
+            result.meta.pop('_proxy_wait', None)
             if response is not None:
                 response.close()
             if result is not request:
@@ -620,6 +625,7 @@ class Explorer:
             if response is not None:
                 response.close()
             if isinstance(exc, ExclusiveProxy):
+                request.meta['_proxy_wait'] = True
                 request.meta['explore_after'] = time.monotonic() + (request.delay or 0.1)
                 self._crawler.stats.inc_value("request/count/wait")
             else:
