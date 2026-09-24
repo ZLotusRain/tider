@@ -55,7 +55,7 @@ def _freeze_proxy_params(value):
 class Proxy:
 
     def __init__(self, proxies=None, disposable=False, keepalive_expiry=None, max_used_times=None,
-                 lease_capacity=1, on_discard=None, pool=None):
+                 lease_capacity=1, on_discard=None, pool=None, expires_at=None):
         proxies = dict(proxies) if proxies else {}
         for proxy_key in proxies:
             proxy = proxies[proxy_key]
@@ -77,6 +77,9 @@ class Proxy:
         self._invalid = False
         self._discarded = False
         self._expire_at = None
+        # Provider expiry is independent of idle expiry and is never extended
+        # by binding, transferring or releasing a request lease.
+        self._deadline_at = time.monotonic() + max(0, expires_at - time.time()) if expires_at is not None else None
         self._keepalive_expiry = keepalive_expiry
         self._set_idle_expiry()
         self._used_times = 0
@@ -99,7 +102,11 @@ class Proxy:
 
     @disposable.setter
     def disposable(self, value):
-        self._disposable = value
+        with self._lock:
+            self._disposable = value
+            if value:
+                self._max_used_times = 1
+                self._lease_capacity = 1
 
     @property
     def actives(self):
@@ -276,6 +283,8 @@ class Proxy:
                 now = time.monotonic()
                 # if we don't use lock here, `_expire_at` will be None anytime.
                 valid = valid and now <= (self._expire_at or now)
+            if self._deadline_at is not None:
+                valid = valid and time.monotonic() < self._deadline_at
             if self._max_used_times is not None and self._max_used_times > 0:
                 valid = valid and self._used_times <= self._max_used_times
             return valid
@@ -395,8 +404,11 @@ class ProxyContainer:
                     pool=self, keepalive_expiry=60
                 )
             if isinstance(each, Proxy):
-                each.disposable = disposable
+                if disposable:
+                    each.disposable = True
                 each._pool = self
+                if each._on_discard is None:
+                    each._on_discard = on_discard
                 self.stats and self.stats.inc_value('proxy/count')
                 self.stats and self.stats.inc_value(f'proxy/count/{self.schema}')
                 proxies[idx] = each
