@@ -365,7 +365,8 @@ class Response:
 
                 self._content_consumed = True
             except Exception as e:  # don't catch BaseException to avoid trigger `Exception ignored in xxx`
-                self.fail(ResponseReadError(e))
+                if not self.failed:
+                    self.fail(ResponseReadError(e))
                 self.check_error()
             finally:
                 try:
