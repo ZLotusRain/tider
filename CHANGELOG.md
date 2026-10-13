@@ -5,6 +5,41 @@ All notable changes to Tider are documented in this file.
 版本维护周期使用 `Maintenance:` 标注；每个版本的维护期从该版本发布开始，到下一个版本发布为止。
 
 
+## [3.4.2] - 2026-09-06
+
+Maintenance: 2026/09/06 - now
+
+### Changed
+
+- 完善 PyPI 打包配置，限定 Tider 包范围，包含运行时模板与 emoji 数据，并排除源码包中的 tests、docs 等无关内容。
+- 更新 README，补充安装、可选依赖、单文件爬虫示例、项目模板和开发入口。
+- 将 README 转为 Markdown，规范 GPL-3.0-or-later 授权声明，补充独立商业授权联系渠道及已识别第三方代码、数据的许可文本。
+- 对照上游源码核实第三方来源，将必要版权与许可统一收录至 LICENSE，补齐 HTTPX 声明，并将商业授权说明并入 README。
+- Scheduler 待调度请求达到并发数两倍时暂停读取 start_requests，待队列回落后继续，避免同域并发受限时入口持续积压。
+- ItemProcessor 新增 `ITEM_PROCESSOR_MAX_WAIT`，从批次首条数据开始计算等待期限，并按约 2ms 时间片处理积压。Engine 背压同时考虑待完成的 item。
+- 新增同步 `item_batch_failed` 信号，交由接收方负责失败批次的持久化恢复。
+- 重构请求、代理租约、prepared attempt、连接池和 HTTP/2 资源生命周期，明确 stream 响应的消费所有权和幂等清理路径。
+- 改进 AMQP/Redis 恢复、ack、重连和调度边界处理。
+- `ImpersonateDownloader` 新增 `IMPERSONATE_STREAM_QUEUE_MAXSIZE`，默认每个响应缓冲 16 个 chunk；并统一 gevent 与线程执行 Curl 的适配路径。
+
+### Fixed
+
+- 修复 `tider --version` 固定输出开发提示的问题，改为输出当前安装版本。
+- 修复嵌套 Promise 的输入生成器尚未耗尽时提前收敛、确认消息并丢失剩余任务的问题。
+- 修复 ItemProcessor 将处理中的 `IndexError` 误判为空队列、异常导致消费退出、执行期间误判空闲及关闭时丢弃尾批的问题，并释放空闲消费者对已完成 item 的局部引用。
+- 修复停机后返回的响应及重调度请求在未过载或立即下载模式下仍进入已停止 Parser/Scheduler 的问题，复用既有关闭出口释放资源。
+- 修复 stream transport、代理 manager 状态、scheduler 空槽和响应消费后的 `_content`/异常链引用滞留。
+- 修复 downloader、middleware replacement、redirect、retry 和 shutdown 路径中的 request/response 资源释放问题。
+- 修复 middleware replacement 和 Promise 代理异常路径中的临时租约释放，避免失效代理阻塞后续替换请求。
+
+
+### Compatibility
+
+- 最低 Python 版本提高至 3.11，安装元数据、运行时检查和打包验证环境同步更新。
+- 入口背压直接使用 `len(scheduler)`；自定义 Scheduler 须实现 `__len__`。该阈值只限制入口读取，不是整个采集链路的硬内存上限。
+- 自定义 `ITEM_PROCESSOR` 须实现 `needs_backout()`，供 Engine 判断 item 处理积压。
+
+
 ## [3.4.1] - 2026-06-19
 
 Maintenance: 2026/06/19 - now

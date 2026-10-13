@@ -1,0 +1,53 @@
+name: Packaging check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.13']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '${{ matrix.python-version }}'
+      - name: Build distributions and check metadata
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          python -m twine check --strict dist/*
+      - name: Install wheel in a clean environment
+        run: |
+          python -m venv "$RUNNER_TEMP/tider-install"
+          "$RUNNER_TEMP/tider-install/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/tider-install/bin/python" -m pip install dist/*.whl
+          "$RUNNER_TEMP/tider-install/bin/python" -m pip check
+      - name: Check installed CLI and project template
+        working-directory: '${{ runner.temp }}'
+        run: |
+          "$RUNNER_TEMP/tider-install/bin/python" -I - <<'PY'
+          import subprocess
+          import sys
+          from importlib.metadata import version
+          from pathlib import Path
+
+          import tider.extractors.link_extractor
+          import tider.extractors.article_extractor
+          import tider.spiders.extract
+
+          command = Path(sys.executable).with_name("tider")
+          actual = subprocess.check_output([str(command), "--version"], text=True).strip()
+          assert actual == version("tider"), actual
+          PY
+          "$RUNNER_TEMP/tider-install/bin/tider" --help
+          "$RUNNER_TEMP/tider-install/bin/tider" startproject --project-name packaging_smoke
