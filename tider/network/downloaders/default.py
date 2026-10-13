@@ -3,6 +3,7 @@ import certifi
 import logging
 import urllib3
 import weakref
+from _thread import RLock as NativeRLock
 from base64 import b64encode
 from threading import RLock
 from typing import Dict, Any
@@ -353,7 +354,10 @@ class _ProxyManagerState:
     def __init__(self, manager):
         self.manager = manager
         self.refs = set()
-        self.lock = RLock()
+        # Weakref finalizers can run in native worker threads. This metadata
+        # lock must not bind its wakeups to a gevent hub that is not running.
+        # Keep its critical sections free of I/O and cooperative switches.
+        self.lock = NativeRLock()
 
     def add(self, proxy_ref):
         with self.lock:
