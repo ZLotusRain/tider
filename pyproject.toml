@@ -1,14 +1,15 @@
 [build-system]
-requires = ["setuptools>=69", "wheel"]
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "tider"
 dynamic = ["version", "dependencies", "optional-dependencies"]
 description = "Next-generation web crawling and scraping framework"
-readme = { file = "README.rst", content-type = "text/x-rst" }
-requires-python = ">=3.10"
-license = { file = "LICENSE" }
+readme = "README.md"
+requires-python = ">=3.11"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
 authors = [
   { name = "LotusRain", email = "1161525789@qq.com" },
 ]
@@ -16,11 +17,9 @@ keywords = ["crawler", "scraping", "spider", "distributed", "http2"]
 classifiers = [
   "Development Status :: 5 - Production/Stable",
   "Intended Audience :: Developers",
-  "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
   "Operating System :: OS Independent",
   "Programming Language :: Python",
   "Programming Language :: Python :: 3 :: Only",
-  "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
@@ -41,7 +40,7 @@ tider = "tider.__main__:main"
 include-package-data = true
 
 [tool.setuptools.packages.find]
-exclude = ["tests", "tests.*"]
+include = ["tider", "tider.*"]
 
 [tool.setuptools.package-data]
 tider = ["VERSION"]

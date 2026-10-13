@@ -13,7 +13,7 @@ from click import ParamType
 from click_didyoumean import DYMGroup
 from click_plugins import with_plugins
 
-from tider import Tider
+from tider import Tider, __version__
 from tider.settings import Settings
 from tider.bin.crawl import crawl
 from tider.bin.multi import multi
@@ -165,7 +165,7 @@ def _chdir(_, __, wd):
 def tider(ctx, app, src, proj, settings, schema, spider, workdir, version):
     """Tider command entrypoint."""
     if version:
-        click.echo("In development...")
+        click.echo(__version__)
         ctx.exit()
     elif ctx.invoked_subcommand is None:
         click.echo(ctx.get_help())
