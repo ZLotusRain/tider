@@ -327,7 +327,7 @@ class HeartEngine:
             immediate_download = result.meta.get('immediate_download')
             drain_acquired = False
             try:
-                while not immediate_download and overload():
+                while shutdown_requested() or (not immediate_download and overload()):
                     if shutdown_requested():
                         close_result(result)
                         return
