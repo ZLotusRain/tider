@@ -118,7 +118,7 @@ class HeartEngine:
                 ):
                     self.crawler.sleep(0)
 
-                if not self.needs_backout() and not self._overload():
+                if not self.needs_backout() and not self._overload() and len(self.scheduler) < self.crawler.concurrency * 2:
                     # noinspection PyBroadException
                     try:
                         request = next(start_requests)
