@@ -342,6 +342,8 @@ class Promise:
             # if promise has already resolved, then skip this.
             return
         self.root.update_state()  # avoid misstate
+        if is_executed(self.state) and self.root.source is not None:
+            return
         if (is_executed(self.state) or is_rejected(self.state)) and not self.root.children:
             for result in iter_generator(self.on_resolved()):
                 yield result  # iter self.on_resolved() directly.
