@@ -1196,6 +1196,13 @@ class ConnectionPool:
         keepalive_expired = self._expire_at is not None and now > self._expire_at
         return keepalive_expired
 
+    def urlopen(self, *args, **kwargs):
+        response = super().urlopen(*args, **kwargs)
+        # The response retains its connection mapping after the cursor is released.
+        if _uses_traffic_police(self.pool) and self.pool.busy:
+            self.pool.release()
+        return response
+
     def _get_conn(self, timeout=None, **connection_kwargs):
         """
         Get a connection. Will return a pooled connection if one is available.
@@ -1225,6 +1232,9 @@ class ConnectionPool:
             except AttributeError:  # self.pool is None
                 raise ClosedPoolError(self, "Pool is closed.") from None
             except queue.Empty:
+                # TrafficPolice errors also inherit queue.Empty.
+                if uses_traffic_police:
+                    raise
                 if self.block:
                     raise EmptyPoolError(
                         self,
@@ -1350,6 +1360,8 @@ def close_expired_connections(connectionpool: Union[HTTPConnectionPool, HTTPSCon
     # iterator owns the cursor required by kill_cursor(), so never reach into
     # its registry or lock directly.
     if _uses_traffic_police(pool):
+        if pool.busy:
+            return
         for conn in pool.iter_idle():
             # urllib3.future returns a connection to TrafficPolice before its
             # response body is consumed. Start its TTL once it is truly idle.

@@ -405,24 +405,26 @@ class HTTPDownloader(RedirectMixin):
         pool_maxsize=DEFAULT_POOLSIZE,
         max_retries=DEFAULT_RETRIES,
         pool_block=DEFAULT_POOLBLOCK,
+        isolate_proxy_pools=False,
     ):
         """
         :param pool_connections: The number of connection pools to cache.
         :param pool_maxsize: The maximum number of connections to save in the pool.
         :param pool_block: Block when no free connections are available.
+        :param isolate_proxy_pools: Keep connection pools separate for each Proxy owner.
         """
         if max_retries == DEFAULT_RETRIES:
             self.max_retries = Retry(0, read=False)
         else:
             self.max_retries = Retry.from_int(max_retries)
-        # A urllib3 manager is shared by Proxy objects that resolve to the
-        # same endpoint and cleared after the final Proxy owner is collected.
+        # Managers are cleared after their final Proxy owner is collected.
         self._manager_states = weakref.WeakValueDictionary()
         self._manager_lock = RLock()
 
         self._pool_connections = pool_connections
         self._pool_maxsize = pool_maxsize
         self._pool_block = pool_block
+        self._isolate_proxy_pools = isolate_proxy_pools
 
         # Normally, a different origin(scheme, host, port) will create a new
         # connection pool in urllib3, so we need to use poolmanager here.
@@ -436,6 +438,7 @@ class HTTPDownloader(RedirectMixin):
             pool_maxsize=concurrency,  # avoid flooding requests.
             max_retries=crawler.settings.get('DOWNLOADER_MAX_RETRIES'),
             pool_block=crawler.settings.getbool('DOWNLOADER_CONNECTION_POOL_BLOCK'),
+            isolate_proxy_pools=crawler.settings.getbool('DOWNLOADER_ISOLATE_PROXY_POOLS'),
         )
 
     def proxy_manager_for(self, proxy, selected_proxy, **proxy_kwargs):
@@ -452,12 +455,12 @@ class HTTPDownloader(RedirectMixin):
         if not URLLIB3_SUPPORTS_HTTPS and selected_proxy.lower().startswith('https://'):
             selected_proxy = 'http://' + selected_proxy[len('https://'):]
 
-        # Share a manager by proxy URL and clear it after the final Proxy
-        # owner is collected.
-        manager_key = selected_proxy
+        # Scope reuse by Proxy identity for independent proxy leases.
+        # The weak key lets owner collection reclaim its manager.
+        proxy_ref = proxy.weak()
+        manager_key = (selected_proxy, proxy_ref) if self._isolate_proxy_pools else selected_proxy
         with self._manager_lock:
             state = self._manager_states.get(manager_key)
-            proxy_ref = proxy.weak()
             owner_added = state.add(proxy_ref) if state is not None else None
             manager = state.get_manager() if owner_added is not None else None
             if manager is None or owner_added is None:
