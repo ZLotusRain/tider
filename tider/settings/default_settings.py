@@ -82,6 +82,8 @@ FS_BASEDIR = ""
 
 ITEM_PIPELINES = {}
 ITEM_PROCESSOR = "tider.pipelines.ItemPipelineManager"
+# Batch age limit from its first item, checked between processing calls.
+ITEM_PROCESSOR_MAX_WAIT = 1.0
 
 LOG_BACKUP_COUNT = 2
 LOG_COLORIZE = True

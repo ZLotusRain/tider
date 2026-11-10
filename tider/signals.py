@@ -8,7 +8,7 @@ functions are called whenever a signal is called.
 
 from .utils.signal import Signal
 
-__all__ = ('setup_logging', 'after_setup_logger', 'message_rejected', )
+__all__ = ('setup_logging', 'after_setup_logger', 'message_rejected', 'item_batch_failed')
 
 
 setup_logging = Signal(
@@ -49,4 +49,10 @@ engine_shutdown = Signal(
 
 spider_closed = Signal(
     name='spider_closed',
+)
+
+# The item processor sends this before releasing the failed batch's ownership.
+item_batch_failed = Signal(
+    name='item_batch_failed',
+    providing_args={'crawler', 'items', 'exception'},
 )

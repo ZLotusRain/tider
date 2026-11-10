@@ -281,7 +281,8 @@ class HeartEngine:
             + len(self.parser.queue)
             + len(self.parser.parsing)
         )
-        return inflight >= limit
+        itemproc = self.parser.itemproc
+        return inflight >= limit or itemproc.needs_backout()
 
     def schedule_request(self, request):
         if isinstance(request, Item):
