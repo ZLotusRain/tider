@@ -4,7 +4,8 @@ import json
 import redis
 import socket
 import threading
-from time import time
+from time import time, monotonic
+from random import choice, random, sample
 from functools import partial
 from uuid import uuid4
 from queue import Empty
@@ -12,6 +13,7 @@ from types import MethodType
 from collections.abc import Mapping
 from weakref import WeakValueDictionary
 
+from redis.crc import key_slot
 from redis.exceptions import ResponseError, WatchError
 from kombu import Consumer, Exchange, Queue
 from kombu.transport.virtual.base import Message, Channel
@@ -132,6 +134,7 @@ def _do_restore_message(self, payload, exchange, routing_key,
             pass
         for queue in self._lookup(exchange, routing_key):
             # only push body.
+            queue = self._q_for_pri(queue, self._get_message_priority(payload, reverse=False))
             (pipe.lpush if leftmost else pipe.rpush)(
                 queue, dumps(payload['body']),
             )
@@ -154,6 +157,41 @@ def _get_redis_pop_count(transport_options):
     return count
 
 
+def _redis_brpop_keys(channel, queue):
+    keys = [channel._q_for_pri(queue, pri) for pri in channel.priority_steps]
+    if channel.global_keyprefix:
+        keys = channel.client._prefix_args(['BRPOP', *keys, 0])[1:-1]
+    if len(keys) > 1:
+        encode = channel.client.get_encoder().encode
+        if len({key_slot(encode(key)) for key in keys}) != 1:
+            raise ValueError('cross_slot BRPOP requires priority keys in the same slot; use a shared hash tag')
+    return keys
+
+
+def _redis_brpop_start(self, timeout=None):
+    if self.brpop_mode == 'multi_key' or (len(self.active_queues) <= 1 and self.priority_steps == [0]):
+        self._brpop_queue = None
+        return type(self)._brpop_start(self, timeout)
+    queues = self._queue_cycle.consume(len(self.active_queues))
+    if not queues:
+        return
+    # Select one queue per command; its priority keys must share a slot.
+    # A short empty wait lets the next poll try another shard.
+    now = monotonic()
+    available = [queue for queue in queues if self._empty_queues.get(queue, 0) <= now]
+    candidates = available or queues
+    if len(candidates) > 1 and random() >= 0.1:
+        queue = min(sample(candidates, 2), key=lambda q: round(self._queue_delays.get(q, 0.001), 3))
+    else:
+        queue = choice(candidates)
+    self._brpop_queue = queue
+    self._brpop_started = monotonic()
+    timeout = min(timeout or self.brpop_timeout or 1, 0.1)
+    command = ['BRPOP', *_redis_brpop_keys(self, queue), timeout]
+    self._in_poll = self.client.connection
+    self.client.connection.send_command(*command)
+
+
 def _redis_brpop_read(self, **options):
     try:
         try:
@@ -169,7 +207,16 @@ def _redis_brpop_read(self, **options):
             queue, item = dest__item
             queue = bytes_to_str(queue)
             dest = queue.rsplit(self.sep, 1)[0]
+            selected = self._brpop_queue
+            if selected is not None:
+                elapsed = max(0.001, monotonic() - self._brpop_started)
+                previous = self._queue_delays.get(selected, elapsed)
+                self._queue_delays[selected] = previous * 0.8 + elapsed * 0.2
+            self._empty_queues.pop(dest, None)
             self._queue_cycle.rotate(dest)
+            priority = None
+            if self.priority_steps != [0]:
+                priority = int(queue.rsplit(self.sep, 1)[1]) if queue != dest else 0
 
             def deliver(raw_item):
                 raw_item = bytes_to_str(raw_item)
@@ -177,6 +224,9 @@ def _redis_brpop_read(self, **options):
                     raw_item = loads(raw_item)
                 except json.JSONDecodeError:
                     pass
+                if priority is not None:
+                    raw_item = _raw_message_payload(raw_item, dest)
+                    raw_item['properties']['priority'] = priority
                 self.connection._deliver(raw_item, dest)
 
             # BRPOP itself only returns one item.  Deliver it before removing
@@ -192,12 +242,23 @@ def _redis_brpop_read(self, **options):
                 if count > 0:
                     with self.conn_or_acquire() as client:
                         items = client.rpop(queue, count)
-                    if items is not None and not isinstance(items, (list, tuple)):
-                        items = [items]
-                    for item in items or ():
-                        deliver(item)
+                        if items is not None and not isinstance(items, (list, tuple)):
+                            items = [items]
+                        for index, item in enumerate(items or ()):
+                            try:
+                                deliver(item)
+                            except Exception:
+                                # Reverse the tail to preserve the next RPOP order.
+                                client.rpush(queue, *reversed(items[index:]))
+                                raise
             return True
         else:
+            queue = self._brpop_queue
+            if queue is not None:
+                self._empty_queues[queue] = monotonic() + 0.1
+                # An empty reply spent the blocking wait without producing work.
+                # Keep it from outranking queues that are still delivering.
+                self._queue_delays[queue] = max(self._queue_delays.get(queue, 0), 0.1)
             raise Empty()
     finally:
         self._in_poll = None
@@ -264,7 +325,17 @@ def create_channel(self, connection, raw_create_channel):
     if hasattr(chan, '_do_restore_message'):
         # redis transport
         # Pipelines do not work in cluster mode the same way they do in normal mode.
-        chan.pop_count = _get_redis_pop_count(chan.connection.client.transport_options)
+        options = chan.connection.client.transport_options
+        chan.pop_count = _get_redis_pop_count(options)
+        chan.priority_steps = list(chan.priority_steps)
+        # Default preserves the deployed single-key cross-shard policy.
+        chan.brpop_mode = options.get('brpop_mode', 'cross_slot')
+        if chan.brpop_mode not in ('multi_key', 'cross_slot'):
+            raise ValueError("Redis transport option 'brpop_mode' must be 'multi_key' or 'cross_slot'")
+        if not hasattr(chan, '_empty_queues'):
+            chan._empty_queues = {}
+            chan._queue_delays = {}
+        chan._brpop_start = MethodType(_redis_brpop_start, chan)
         chan._do_restore_message = MethodType(_do_restore_message, chan)
         chan._brpop_read = MethodType(_redis_brpop_read, chan)
         chan.handlers['BRPOP'] = chan._brpop_read
@@ -274,24 +345,27 @@ def create_channel(self, connection, raw_create_channel):
     return chan
 
 
+def _raw_message_payload(payload, queue):
+    if 'body' in payload and 'delivery_tag' in payload.get('properties', {}):
+        return payload
+    message = {
+        'body': payload,
+        'properties': {
+            'delivery_tag': str(uuid4()),
+            'delivery_info': {'exchange': None, 'routing_key': queue},
+        },
+        'content-type': None,
+    }
+    if isinstance(payload, dict) and 'topic' in payload:
+        message['topic'] = payload['topic']
+    return message
+
+
 class RawMessage(Message):
     ack_max_retries = 20
 
     def __init__(self, payload, channel=None, queue=None, **kwargs):
-        if 'body' in payload and 'delivery_tag' in payload.get('properties', {}):
-            payload = payload
-        else:
-            payload = {
-                'body': payload,
-                'properties': {
-                    'delivery_tag': str(uuid4()),
-                    'delivery_info': {'exchange': None, 'routing_key': queue}
-                },
-                'content-type': None,
-            }
-            if 'topic' in payload['body']:
-                payload['topic'] = payload['body']['topic']
-
+        payload = _raw_message_payload(payload, queue)
         self.topic = payload.get('topic')
         super(RawMessage, self).__init__(payload, channel, **kwargs)
 
@@ -360,7 +434,7 @@ class RawMessageChannel(Channel):
         for queue in self._lookup(
             delivery_info['exchange'],
                 delivery_info['routing_key']):
-            self._put(queue, message.body)
+            self._put(queue, message['body'])
 
 
 class Connection(BaseConnection):
@@ -755,6 +829,7 @@ class AMQPBroker(Broker):
                 pass
             for queue in chan._lookup(exchange, routing_key):
                 # only push body.
+                queue = chan._q_for_pri(queue, chan._get_message_priority(payload, reverse=False))
                 (pipe.lpush if leftmost else pipe.rpush)(
                     queue, dumps(payload['body']),
                 )
