@@ -203,8 +203,8 @@ class CurlPool:
     """Small bounded idle pool for curl_cffi Curl handles.
 
     A Curl handle keeps libcurl's connection cache across ``reset()``, so
-    successful direct requests can reuse handles without adding another active
-    concurrency limit beside Tider's explorer pipeline.
+    successful direct requests with matching profiles can reuse handles within
+    Tider's explorer concurrency model.
     """
 
     def __init__(
@@ -244,13 +244,13 @@ class CurlPool:
         kept = deque()
         expired = []
         while self._idle:
-            last_used, created_at, curl = self._idle.popleft()
+            last_used, created_at, curl, profile = self._idle.popleft()
             idle_expired = self.idle_ttl and now - last_used >= self.idle_ttl
             lifetime_expired = self.max_lifetime and now - created_at >= self.max_lifetime
             if idle_expired or lifetime_expired:
                 expired.append(curl)
             else:
-                kept.append((last_used, created_at, curl))
+                kept.append((last_used, created_at, curl, profile))
         self._idle = kept
         return expired
 
@@ -260,9 +260,9 @@ class CurlPool:
             with suppress(Exception):
                 curl.close()
 
-    def acquire(self):
-        """Return an idle Curl handle or create a new one."""
-        expired = []
+    def acquire(self, profile=None):
+        """Return a matching idle Curl handle or create a new one."""
+        discarded = []
         curl = None
         created_at = None
         now = preferred_clock()
@@ -270,21 +270,22 @@ class CurlPool:
             if self._closed:
                 raise RuntimeError("CurlPool is closed")
             while self._idle:
-                last_used, created_at, curl = self._idle.pop()
+                last_used, created_at, curl, previous_profile = self._idle.pop()
                 idle_expired = self.idle_ttl and now - last_used >= self.idle_ttl
                 lifetime_expired = self.max_lifetime and now - created_at >= self.max_lifetime
-                if not (idle_expired or lifetime_expired):
+                # reset() preserves connections established with the previous profile.
+                if not (idle_expired or lifetime_expired or previous_profile != profile):
                     break
-                expired.append(curl)
+                discarded.append(curl)
                 curl = None
 
-        self._close_curls(expired)
+        self._close_curls(discarded)
         if curl is None:
             curl = self.new_curl()
             created_at = preferred_clock()
-        return _CurlHandle(self, curl, created_at=created_at)
+        return _CurlHandle(self, curl, created_at=created_at, profile=profile)
 
-    def release(self, curl, created_at, reusable=True):
+    def release(self, curl, created_at, reusable=True, profile=None):
         if curl is None:
             return
 
@@ -303,7 +304,7 @@ class CurlPool:
         close_curl = True
         with self._lock:
             if reusable and not self._closed and len(self._idle) < self.maxsize:
-                self._idle.append((now, created_at, curl))
+                self._idle.append((now, created_at, curl, profile))
                 close_curl = False
 
         if close_curl:
@@ -318,18 +319,19 @@ class CurlPool:
     def close(self):
         with self._lock:
             self._closed = True
-            idle = [curl for _, _, curl in self._idle]
+            idle = [curl for _, _, curl, _ in self._idle]
             self._idle.clear()
         self._close_curls(idle)
 
 
 class _CurlHandle:
-    __slots__ = ("pool", "curl", "created_at", "_released")
+    __slots__ = ("pool", "curl", "created_at", "profile", "_released")
 
-    def __init__(self, pool, curl, created_at):
+    def __init__(self, pool, curl, created_at, profile=None):
         self.pool = pool
         self.curl = curl
         self.created_at = created_at
+        self.profile = profile
         self._released = False
 
     def release(self, reusable=True):
@@ -337,7 +339,7 @@ class _CurlHandle:
             return
         self._released = True
         curl, self.curl = self.curl, None
-        self.pool.release(curl, created_at=self.created_at, reusable=reusable)
+        self.pool.release(curl, created_at=self.created_at, reusable=reusable, profile=self.profile)
 
     def discard(self):
         self.release(reusable=False)
@@ -726,9 +728,15 @@ class ImpersonateDownloader:
         headers.pop("Connection", None)
         try:
             selected_proxy = request.selected_proxy
-            reuse_curl = not request.stream and not selected_proxy
+            custom_profile = (
+                request.meta.get("impersonate_ja3")
+                or request.meta.get("impersonate_akamai")
+                or request.meta.get("impersonate_extra_fp")
+                or request.meta.get("impersonate_curl_options")
+            )
+            reuse_curl = not request.stream and not selected_proxy and not custom_profile
             if reuse_curl:
-                curl_handle = self.curl_pool.acquire()
+                curl_handle = self.curl_pool.acquire(profile=(impersonate, request.http2))
                 curl = curl_handle.curl
             else:
                 curl = self.curl_pool.new_curl()
